@@ -1,166 +1,94 @@
-# Optional Step05 Rust engine
+# RAS Commander Fast-Map
 
-The branch also provides the experimental `sloping` command and library
-modules `sloping` / `sloping_session`, supplied by engine wheels 0.4.0 or later.
-The earlier 0.3.0 wheels predate this command. `ras2fim-batch method` reports
-`rasmapper-plain-sloping/1` separately from the unchanged Step05 and horizontal
-methods.
+Native Rust 2D flood inundation mapping, distributed as the
+`ras-commander-fast-map` Rust crate and Python wheel. It maps computed hydraulic
+results; it does not run the HEC-RAS hydraulic solver.
 
-```text
-ras2fim-batch sloping request.json new-output-directory
+## Install
+
+```bash
+pip install ras-commander-fast-map
+ras2fim-batch method
 ```
 
-The `ras-commander-sloping-request/1` request supplies immutable binary mesh geometry,
-ordered WKB cell polygons, terrain identity/window, ownership addresses and
-per-mesh little-endian float32 profile files including virtual cells. The
-Commander `map_sloping_profiles` adapter generates this contract from HDF.
-`mesh_files` point to small `ras-commander-sloping-mesh/1` JSON descriptors for
-typed little-endian arrays; coordinates remain float64, elevations float32,
-and incidence tables int32. This avoids per-element JSON conversion/parsing
-and preserves coordinate bits. Array sizes participate in admission checks
-before loading. The numerical component example retains its independent
-captured-reference format for development checks.
-Geometry, terrio ownership and terrain are prepared once. Bounded Rayon workers
-reconstruct hydraulic connections and corner values per profile, then paint
-disjoint pixels. AOIs constrain output without changing mesh connectivity.
-No extra depth cutoff is applied. Defaults retain plain cell-corner sloping.
-The optional `options` select `render_mode="slopingPretty"` and the boolean
-`reduce_shallow_to_horizontal`. Face donation preserves binary32 ring order.
-Shallow cells use a constant cell WSE and bypass polygon-weight evaluation.
-Reports use `rasmapper-sloping-with-faces/1`; plain reports retain
-`rasmapper-plain-sloping/1`. The shallow control requires slopingPretty.
-Unknown option fields are rejected. Engine 0.7.1 retains unweighted face mode
-and shallow selection; plain and horizontal arithmetic are unchanged.
+Python wheels provide the compatible `ras2fim-batch` executable on Windows x64
+and Linux x64 (glibc 2.28+). A wheel requires no Rust compiler or system GDAL.
+Python consumers normally install `ras-commander[fim]`, which adds the public
+`RasFim` APIs and Python preparation/GeoTIFF delivery dependencies. Remove the
+former `ras2fim-engine` package before installing this package if both would
+own the same executable. The command name and JSON contracts remain compatible.
 
-Both shallow-control settings match raw native 7.0.1 bridge Max and Davis
-timestep 54/108 references, including one/four-worker comparisons.
-Large eBFE face-mode coverage remains unqualified.
+Rust users can install the CLI or use the library independently of Python:
 
-Plain-sloping native 7.0.1 raw-mask/float32-bit qualification currently covers
-Davis Max/two timesteps, Bald Eagle bridge/dam Max, and bounded Spring River
-and Spring Creek Max fixtures on Linux, with complete topology reconstruction.
-The same corpus passes on Windows x86-64; full-extent eBFE remains unqualified. Native
-component capture is development-only; production code uses direct HDF inputs
-and Rust geometry calculations. The optional real-fixture pytest contract is
-documented in `tests/test_ras_fim_sloping.py`.
-These comparisons cover physical 2D cells. Standalone storage-area surfaces
-outside those cells are excluded; the dam-break case is not whole-model parity.
-
-Install the matching engine wheel (see the API guide), or build explicitly,
-then pass its path to
-`RasFim.map_profiles(..., engine_path="/path/to/ras2fim-batch")`.
-Python does not build or download the engine.
-
-```sh
-cargo build --release --locked --manifest-path rust/step05/Cargo.toml
-cargo test --locked --manifest-path rust/step05/Cargo.toml --all-targets
-cargo clippy --locked --manifest-path rust/step05/Cargo.toml --all-targets -- -D warnings
+```bash
+cargo install ras-commander-fast-map --locked
+cargo add ras-commander-fast-map
 ```
 
-Platform wheels target Linux x86-64 (glibc 2.28+) and Windows x86-64, built
-with Rust 1.99.1. Build and qualification provenance is retained in `wheels/BUILD.json`.
-The executable is `rust/step05/target/release/ras2fim-batch` (with `.exe` on Windows).
-The crate disables terrio's default features and enables only `geotiff`; it does not
-link GDAL. The Python workflow uses SciPy, rasterio and its raster libraries for
-preparation and output. See [provenance and notices](THIRD_PARTY_NOTICES.md).
-
-```text
-ras2fim-batch terrain-info terrain.tif
-ras2fim-batch step05 request.json new-output-directory
+```rust
+let methods = ras_commander_fast_map::method_record();
+assert!(methods.is_object());
 ```
 
-`step05` accepts `ras2fim-step05-request/1`, generated by
-`ras_commander/fim/_engine.py`.
-It consumes globally ordered samples, SciPy Delaunay topology and transforms,
-exact query axes, the wet-union mask, and the explicit final grid. It retains
-the upstream float32 arithmetic and approximate nearest-neighbor reprojection.
-Exit codes are 0 for completion, 2 for profile failures, and 1 for invalid
-requests or session errors. Callers must check both the exit code and report.
+See [Rust API documentation](https://docs.rs/ras-commander-fast-map) and the
+[RasFim guide](https://rascommander.info/ras/api/fim/) for request contracts and
+end-to-end model preparation. The Rust library consumes prepared geometry,
+profiles and terrain; HDF extraction belongs to `ras-commander-fast-hdf` and
+Commander. The CLI does not read a plan HDF directly.
 
-A bounding box selects a window on the full destination grid. A polygon adds
-a pixel-center mask to that window. Neither changes sample preparation,
-triangulation, query axes or warp chunking. The native lookup evaluates the
-interpolation and terrain only at source pixels required by the selected
-output, while its geometry-only warp still spans the full grid. Degenerate or
-order-dependent interpolation falls back to the complete serial SciPy walk.
-AOI cost therefore includes work that does not shrink with the AOI.
+## Methods and resource controls
 
-Profiles in a request share a decoded terrain cache. The default runs one
-profile at a time; `max_inflight_profiles` allows bounded concurrent profiles.
-Both profile and pixel work use the same configured Rayon thread pool.
-Cache and per-profile limits apply to the native engine's planned allocations,
-not the entire Python process or an operating-system RSS cap. Preparation,
-SciPy triangulation and floodplain polygonization remain Python operations.
+- Horizontal: cell-constant WSE with native float32 visibility.
+- Sloping: reconstructed cell corners; optional cell faces, depth weighting,
+  and shallow-to-horizontal selection.
+- ras2fim-2D Step05: the separate globally prepared SciPy triangulation method.
 
-The `run` command is a lower-level prepared-grid diagnostic with separate
-`ras2fim-batch-session/1` semantics. The application uses `step05`.
-Do not substitute diagnostic arithmetic for the Step05 float32 sequence.
+Terrain decoding and ownership rasterization use terrio with GDAL disabled.
+Rayon workers share immutable terrain/geometry across bounded in-flight profiles.
+Bbox/polygon output masks retain global hydraulic topology. Planned allocation
+admission is not a hard RSS limit. Python delivery may use Rasterio/GDAL;
+the Rust mapping executable does not link it.
 
-Real-data Rust tests are ignored by default. Set `RAS2FIM_STEP05_INPUTS` to
-prepared per-profile input directories and `RAS2FIM_STEP05_TERRAIN` to the
-public fixture terrain, then run `cargo test --release -- --include-ignored`.
-Legacy diagnostic tests additionally require `RAS2FIM_BATCH_INPUTS`.
-No tests execute HEC-RAS. Generated inputs, model data and build products
-do not belong in the repository.
+Production methods and binary32 operation order are unchanged from the qualified
+Commander engine 0.8.0. `MIGRATION.json` binds the extracted source and immutable
+numerical files. Existing request schemas, method identifiers and CLI exit codes
+are preserved. `ras2fim-batch method` adds package/version/source-commit identity.
 
-For application options and supported inputs, see
-[the mapping guide](../../docs/api/fim.md). For complete-call performance
-measurement, see [the benchmark protocol](../../docs/development/fim-mapping-performance.md).
+## Qualification and limits
 
-## Native horizontal ownership
+The retained [five-model comparisons](https://rascommander.info/ras/development/fim-mapping-performance/)
+cover raw Depth/WSE validity masks and float32 bits against native HEC-RAS 7.0.1,
+without an added depth cutoff. Those published timing observations predate this
+packaging extraction; no new speedup is claimed for renaming/distribution.
 
-Engine 0.3 accepts validated cell Polygons as length-framed little-endian 2D WKB.
-It rasterizes integer ownership through terrio 0.4.2 on the exact constrained
-terrain grid, preserving input feature order and pixel-centre inclusion.
-An optional Polygon/MultiPolygon AOI uses the same grid, including holes.
-Rasterization and masking run inside the caller's bounded Rayon pool. The
-native buffers are reused with the decoded terrain for all profiles.
+Mapping covers physical 2D cells. Commander rejects models with 1D river/cross-
+section geometry. Standalone storage-area surfaces are excluded. Cell-face
+matching preserves the original source TIFF grid and 256-square tile layout;
+arbitrary retiled/cropped terrain and multi-source mosaics are unqualified.
+Depth weighting needs stored corner ground elevations. When absent, explicit
+corner preparation still uses Windows/HEC-RAS 7.0.1 through Commander and
+pythonnet; it has not been implemented in Rust. Once prepared, ordinary mapping
+runs on Windows/Linux without HEC-RAS. Source terrain must match the effective
+terrain used by the native reference.
 
-The horizontal request retains `owner_file` compatibility for existing CLI
-callers; choose either `owner_file` or `geometry_file`. `aoi_file` requires
-`geometry_file`. Geometry records have a four-byte little-endian WKB length
-followed by the WKB bytes; cell records follow the WSE table order and an AOI
-file contains exactly one record. The caller validates cell topology and
-rejects overlapping interiors. Rust checks framing, geometry types, finite
-coordinates and planned geometry/array admission before raster allocation.
-The method capability advertises `native_ownership=true`; older binaries
-produce an explicit adapter version error. Step05 numerics are unchanged.
+## Build and verify
 
-### Bounded sloping profile concurrency (0.6)
+```bash
+cargo fmt --check
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings -A clippy::chunks_exact_to_as_chunks
+cargo publish --locked --dry-run
+python scripts/verify_sources.py
+```
 
-Sloping requests accept `max_inflight_profiles` (default 1, range 1–64).
-The effective number is capped by requested threads, profile count and planned
-memory admission. All profiles share one Rayon pool and immutable geometry,
-stencils, terrain and ownership. Bounded batches reconstruct and paint in
-parallel, then emit profiles in request order. Each batch completes before the
-next starts; hydraulic arithmetic inside each profile is unchanged.
+CI builds and smoke-tests Windows/Linux wheels. Tagged releases attach the
+wheels, source distribution, provenance and checksums to GitHub Releases.
+See [release instructions](docs/releasing.md) for PyPI/crates.io publishing.
 
-The method advertises `bounded_profile_concurrency=true`. Reports record
-requested/effective concurrency and the additional per-profile memory plan.
-The serial memory plan is retained, with an additional conservative allowance
-for each admitted slot's arrays and hydraulic state. This is planned admission,
-not an enforced process RSS limit. Python/GDAL allocations are separate.
-Failing or panicking batches abort the session and clean earlier native products.
-The Python adapter additionally removes already delivered GIS products.
+## License and attribution
 
-
-### Native horizontal plotting visibility (0.7)
-
-`horizontal-cell-constant/2` preserves the native binary32 visibility comparison
-`WSE >= float32(terrain + 0.001)` before subtracting depth. A post-subtraction
-0.001 threshold is not equivalent. `min_depth=0` means no additional depth
-cutoff; positive values retain the optional strict float32 depth filter after
-native visibility. Native-valid zero depths can survive when the elevation
-addition rounds back to terrain. Horizontal method /1 engines are rejected by
-the updated Python adapter. Step05 and sloping arithmetic are unchanged.
-
-Engine 0.8 restores optional depth-weighted faces through use_depth_weighted_faces.
-It requires stored corner elevations staged by the Commander adapter and advertises
-depth_weighted_faces. Native corner preparation is a separate explicit operation;
-production mapping remains independent of HEC-RAS.
-
-Cell-face donation also reproduces native scratch retention in fixed 256-point
-geometry ranges. Clipped-weight cells are replayed in source terrain tiles;
-complete perimeters preserve predecessor geometry outside an AOI. The repair
-shares the bounded Rayon pool. Its output and tile transients participate in
-planned admission. Plain cell-corner arithmetic remains independent of donation.
+Our code retains its MIT license. Step05/SciPy reuse retains BSD-3-Clause notices;
+see `LICENSE`, `THIRD_PARTY_NOTICES.md` and `licenses/`. The crate license
+expression is `MIT AND BSD-3-Clause`. Dependency notices accompany distributions.
+HEC-RAS assemblies, decompiled vendor source and model data are not distributed.
+This independent project is not affiliated with or endorsed by HEC/USACE.

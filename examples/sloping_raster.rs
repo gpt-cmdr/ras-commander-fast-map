@@ -2,7 +2,7 @@
 //! Native expected face/corner/pixel values are not read or used for rendering.
 //! Geometry capture remains an oracle dependency; this is not the production HDF adapter.
 
-use ras2fim_stages_r2::sloping::{self, Cell, Corner, Face, Mesh, RasterWindow};
+use ras_commander_fast_map::sloping::{self, Cell, Corner, Face, Mesh, RasterWindow};
 use serde::Deserialize;
 use std::{
     error::Error,

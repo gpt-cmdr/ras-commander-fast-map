@@ -1,0 +1,11 @@
+name: Engine CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  qualified:
+    uses: ./.github/workflows/build.yml

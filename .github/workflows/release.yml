@@ -1,0 +1,108 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish_existing:
+        description: Publish verified assets from an existing tagged GitHub Release
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Qualified tag and synchronized versions
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          python - <<'PY'
+          import os, pathlib, tomllib
+          crate = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
+          wheel = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version']
+          assert crate == wheel
+          assert os.environ['TAG_NAME'] == 'v' + crate
+          assert os.environ['REF_TYPE'] == 'tag'
+          PY
+  qualified:
+    if: ${{ !inputs.publish_existing }}
+    needs: version
+    uses: ./.github/workflows/build.yml
+  sdist:
+    if: ${{ !inputs.publish_existing }}
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: python -m pip install maturin==1.15.0
+      - run: python -m maturin sdist --out dist
+      - run: cargo package --locked
+      - run: cp target/package/*.crate dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-source
+          path: dist/*
+          if-no-files-found: error
+  github-release:
+    if: ${{ !inputs.publish_existing }}
+    needs: [qualified, sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        run: cd dist && sha256sum *.whl *.tar.gz *.crate > SHA256SUMS
+      - name: Attach release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --title "$RELEASE_TAG" --notes 'Standalone native Rust mapping engine. See CHANGELOG.md and the qualification documentation.'
+  pypi:
+    if: ${{ always() && vars.PUBLISH_PYPI == 'true' && needs.version.result == 'success' && (needs.github-release.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.publish_existing)) }}
+    needs: [version, github-release]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Verify tagged release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release download "$RELEASE_TAG" --dir artifacts
+          (cd artifacts && sha256sum --check SHA256SUMS)
+      - run: mkdir dist && cp artifacts/*.whl artifacts/*.tar.gz dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+  crates:
+    if: ${{ always() && vars.PUBLISH_CRATES == 'true' && needs.version.result == 'success' && (needs.github-release.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.publish_existing)) }}
+    needs: [version, github-release]
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
