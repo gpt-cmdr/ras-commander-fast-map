@@ -34,3 +34,9 @@ should be added to Commander's automatic dependency marker.
 Do not retag an immutable published version or silently skip failed artifacts.
 Retain public qualification summaries while keeping external model files,
 computed rasters and native reference caches outside the repositories.
+
+If registry authentication is configured after the GitHub Release exists,
+dispatch release.yml at that tag with `publish_existing=true`. It verifies the
+tag/version and existing release checksums, then publishes to each enabled
+registry without rebuilding or replacing the release assets. Enable only the
+registries that have not yet received this version when retrying publication.
