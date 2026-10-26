@@ -1,4 +1,4 @@
-//! Prepared raster mapping engines for the ras2fim-2D catalog method.
+//! Native 2D flood inundation mapping: horizontal, sloping, and ras2fim-2D Step05.
 //!
 //! Extends the immutable baseline prototype `prototype/kernel` (RasMapper_Stored_Maps_Rust,
 //! 2026-10-22, CLB Engineering): the barycentric evaluation, the `100 * DBL_EPSILON` inclusion
@@ -20,6 +20,11 @@
 //! directly from cell polygons. Plain sloping reconstructs hydraulic connectivity
 //! and corner interpolation rather than using the Step05 SciPy topology.
 #![forbid(unsafe_code)]
+
+/// Version of the standalone crate and Python wheel.
+pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Source revision of an official build, or `unknown` for an unversioned archive.
+pub const ENGINE_COMMIT: &str = env!("FAST_MAP_ENGINE_COMMIT");
 
 pub mod cache;
 pub mod horizontal;

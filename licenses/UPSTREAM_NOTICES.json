@@ -1,0 +1,78 @@
+{
+  "alloc-stdlib-0.2.4": [
+    {
+      "path": "licenses/upstream/alloc-stdlib-0.2.4/LICENSE",
+      "url": "https://raw.githubusercontent.com/dropbox/rust-alloc-no-stdlib/ae42d22078b98549e987d2f03d12df7b984fde47/LICENSE",
+      "sha256": "c0c56f26d9c051cac4d200c34c84e7ae9aaa853e01a982a1df08b09931e518ae"
+    }
+  ],
+  "flatbuffers-24.12.23": [
+    {
+      "path": "licenses/upstream/flatbuffers-24.12.23/LICENSE",
+      "url": "https://raw.githubusercontent.com/google/flatbuffers/a2cd1ea3b6d3fee220106b5fed3f7ce8da9eb757/LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    }
+  ],
+  "rstar-0.13.0": [
+    {
+      "path": "licenses/upstream/rstar-0.13.0/LICENSE-APACHE",
+      "url": "https://raw.githubusercontent.com/georust/rstar/82c969d4677a6f624900056e044d7e7ec8439c18/LICENSE-APACHE",
+      "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+    },
+    {
+      "path": "licenses/upstream/rstar-0.13.0/LICENSE-MIT",
+      "url": "https://raw.githubusercontent.com/georust/rstar/82c969d4677a6f624900056e044d7e7ec8439c18/LICENSE-MIT",
+      "sha256": "9b3a76c27bac8f3e0ff2d1f64f65941c50310ae3ff69318cea230bd4a36822c5"
+    }
+  ],
+  "windows-link-0.2.1": [
+    {
+      "path": "licenses/upstream/windows-link-0.2.1/license-apache-2.0",
+      "url": "https://raw.githubusercontent.com/microsoft/windows-rs/d468916ac27a36fb8a12bafc1bf5c0ec2fe92238/license-apache-2.0",
+      "sha256": "c16f8dcf1a368b83be78d826ea23de4079fe1b4469a0ab9ee20563f37ff3d44b"
+    },
+    {
+      "path": "licenses/upstream/windows-link-0.2.1/license-mit",
+      "url": "https://raw.githubusercontent.com/microsoft/windows-rs/d468916ac27a36fb8a12bafc1bf5c0ec2fe92238/license-mit",
+      "sha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+    }
+  ],
+  "windows-sys-0.61.2": [
+    {
+      "path": "licenses/upstream/windows-sys-0.61.2/license-apache-2.0",
+      "url": "https://raw.githubusercontent.com/microsoft/windows-rs/32c3144490c016fe496a0aed769bce60987a2e9d/license-apache-2.0",
+      "sha256": "c16f8dcf1a368b83be78d826ea23de4079fe1b4469a0ab9ee20563f37ff3d44b"
+    },
+    {
+      "path": "licenses/upstream/windows-sys-0.61.2/license-mit",
+      "url": "https://raw.githubusercontent.com/microsoft/windows-rs/32c3144490c016fe496a0aed769bce60987a2e9d/license-mit",
+      "sha256": "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"
+    }
+  ],
+  "r-efi-6.0.0": [
+    {
+      "path": "licenses/upstream/r-efi-6.0.0/LICENSE-APACHE",
+      "url": "https://github.com/r-efi/r-efi/tree/7e1b0322d31d625f81a5656096330934f9cd835d",
+      "sha256": "c7150ebfb7ccbb4f5246c0ab05eeed3cc74e36d7ce2865ff748defeaa9248a79",
+      "note": "The crate declares Apache-2.0 as a licensing alternative; the source archive omits its license text. Retained standard Apache-2.0 text from the existing notices; this distribution selects that alternative."
+    },
+    {
+      "path": "licenses/upstream/r-efi-6.0.0/UPSTREAM-ATTRIBUTION.txt",
+      "url": "https://raw.githubusercontent.com/r-efi/r-efi/7e1b0322d31d625f81a5656096330934f9cd835d/AUTHORS",
+      "sha256": "d027e91dbc9cdbb2f1190068e498bd6b61cff022b6a032b191021ba658d96111"
+    }
+  ],
+  "wbhdf-0.1.0": [
+    {
+      "path": "licenses/upstream/wbhdf-0.1.0/LICENSE-APACHE",
+      "url": "https://github.com/jblindsay/whitebox_next_gen/tree/9ed3acb4ace2f2ded25ace58cf0157b6d5eacb72",
+      "sha256": "c7150ebfb7ccbb4f5246c0ab05eeed3cc74e36d7ce2865ff748defeaa9248a79",
+      "note": "The crate declares Apache-2.0 as a licensing alternative; the source archive omits its license text. Retained standard Apache-2.0 text from the existing notices; this distribution selects that alternative."
+    },
+    {
+      "path": "licenses/upstream/wbhdf-0.1.0/UPSTREAM-ATTRIBUTION.txt",
+      "url": "https://raw.githubusercontent.com/jblindsay/whitebox_next_gen/9ed3acb4ace2f2ded25ace58cf0157b6d5eacb72/crates/wbhdf/Cargo.toml",
+      "sha256": "277f57fcbbdddb1f19c45caf2f4bf808b20b28205df0efd6b091bf35b852a49a"
+    }
+  ]
+}

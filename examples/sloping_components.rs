@@ -2,7 +2,7 @@
 //! Run with: cargo run --release --example sloping_components -- receipt.json 4
 //! This checks component equality, not complete raster qualification.
 
-use ras2fim_stages_r2::sloping::{
+use ras_commander_fast_map::sloping::{
     Cell, Corner, Face, Mesh, PolygonStencil, WeightScratch, paint_corner_values,
 };
 use serde::Deserialize;

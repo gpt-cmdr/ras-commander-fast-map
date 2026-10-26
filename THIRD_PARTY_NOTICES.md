@@ -25,7 +25,10 @@ continues to use rasterio and its raster stack for preparation and file output.
 
 Other Rust dependencies and their exact resolved versions are recorded in
 `Cargo.lock`. Retain their applicable notices when distributing compiled
-binaries. This provenance describes software reuse; it does not imply
+binaries. Resolved dependency license texts are retained under
+`licenses/dependencies/`; `licenses/UPSTREAM_NOTICES.json` records pinned upstream
+sources or selected Apache-2.0 alternatives for archives that omit license text.
+This provenance describes software reuse; it does not imply
 endorsement by upstream projects.
 
 The separate plain-sloping method is an independent implementation qualified

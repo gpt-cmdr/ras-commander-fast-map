@@ -3,14 +3,19 @@ requires = ["maturin==1.15.0"]
 build-backend = "maturin"
 
 [project]
-name = "ras2fim-engine"
+name = "ras-commander-fast-map"
 version = "0.8.0"
 description = "Optional Rust Step05, horizontal and configurable sloping FIM mapping engine"
 requires-python = ">=3.10"
 readme = "README.md"
-license = "MIT"
+license = "MIT AND BSD-3-Clause"
 
 [tool.maturin]
 bindings = "bin"
 strip = true
-include = ["THIRD_PARTY_NOTICES.md", "licenses/*.txt"]
+include = ["THIRD_PARTY_NOTICES.md", "licenses/**/*"]
+
+[project.urls]
+Repository = "https://github.com/gpt-cmdr/ras-commander-fast-map"
+Documentation = "https://rascommander.info/ras/native-mapping-engine/"
+Issues = "https://github.com/gpt-cmdr/ras-commander-fast-map/issues"

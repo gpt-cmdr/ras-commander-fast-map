@@ -1,10 +1,18 @@
 [package]
-name = "ras2fim-stages-r2"
+name = "ras-commander-fast-map"
 version = "0.8.0"
 edition = "2024"
-license = "MIT"
-publish = false
-description = "Optional ras2fim-2D Step05 raster engine over globally prepared SciPy topology, transforms and wet masks."
+license = "MIT AND BSD-3-Clause"
+description = "Native Rust 2D flood inundation mapping: horizontal and sloping surfaces, bounded timesteps and terrain windows"
+rust-version = "1.99"
+authors = ["CLB Engineering Corporation"]
+repository = "https://github.com/gpt-cmdr/ras-commander-fast-map"
+homepage = "https://rascommander.info/ras/native-mapping-engine/"
+documentation = "https://docs.rs/ras-commander-fast-map"
+readme = "README.md"
+keywords = ["hec-ras", "flood", "raster", "hydraulics", "mapping"]
+categories = ["science", "science::geo"]
+include = ["/src/**/*.rs", "/examples/**/*.rs", "/tests/*.rs", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/CHANGELOG.md", "/THIRD_PARTY_NOTICES.md", "/licenses/**", "/MIGRATION.json", "/SOURCE_MANIFEST.json"]
 
 [[bin]]
 name = "ras2fim-batch"

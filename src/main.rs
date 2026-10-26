@@ -4,7 +4,7 @@
 //! 1 invalid request or session error. When this run created the output directory, a session
 //! error still leaves `report.json` with `status: "aborted"` (best effort, see `session::run`);
 //! no report exists when the request was rejected before the directory was created.
-use ras2fim_stages_r2::{method_record, model::SessionRequest, session, terrain};
+use ras_commander_fast_map::{method_record, model::SessionRequest, session, terrain};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -65,7 +65,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let cmd = args.first().and_then(|a| a.to_str()).unwrap_or("");
     match (cmd, args.len()) {
         ("method", 1) => {
-            let m = serde_json::json!({"batch_session_r1": method_record(), "step05_r2": ras2fim_stages_r2::step05::method_record(), "horizontal": ras2fim_stages_r2::horizontal::method_record(), "sloping":ras2fim_stages_r2::sloping_session::method_record()});
+            let m = serde_json::json!({"engine": {"package": "ras-commander-fast-map", "version": ras_commander_fast_map::ENGINE_VERSION, "source_commit": ras_commander_fast_map::ENGINE_COMMIT}, "batch_session_r1": method_record(), "step05_r2": ras_commander_fast_map::step05::method_record(), "horizontal": ras_commander_fast_map::horizontal::method_record(), "sloping":ras_commander_fast_map::sloping_session::method_record()});
             println!("{}", serde_json::to_string_pretty(&m)?);
             Ok(0)
         }
@@ -92,7 +92,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             let mut report = result?;
             report["os_threads"] = threads.clone();
             report["os_threads"]["expected_max"] = (req.budgets.threads + 2).into();
-            ras2fim_stages_r2::sink::write_json(&out.join("report.json"), &report)?;
+            ras_commander_fast_map::sink::write_json(&out.join("report.json"), &report)?;
             let summary = serde_json::json!({
                 "status": report["status"],
                 "counters": report["counters"],
@@ -109,14 +109,14 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             if out.exists() {
                 return Err("output directory exists; choose a new path".into());
             }
-            let req: ras2fim_stages_r2::sloping_session::Request =
+            let req: ras_commander_fast_map::sloping_session::Request =
                 serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(&path)?))?;
             let base = path
                 .canonicalize()?
                 .parent()
                 .map(PathBuf::from)
                 .ok_or("request has no parent")?;
-            let report = ras2fim_stages_r2::sloping_session::run(&req, &base, &out)?;
+            let report = ras_commander_fast_map::sloping_session::run(&req, &base, &out)?;
             if !req.stream_outputs {
                 println!("{}", serde_json::to_string(&report)?);
             }
@@ -128,14 +128,14 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             if out.exists() {
                 return Err("output directory exists; choose a new path".into());
             }
-            let req: ras2fim_stages_r2::horizontal::Request =
-                ras2fim_stages_r2::model::read_json(&request_path)?;
+            let req: ras_commander_fast_map::horizontal::Request =
+                ras_commander_fast_map::model::read_json(&request_path)?;
             let base = request_path
                 .canonicalize()?
                 .parent()
                 .ok_or("request has no parent")?
                 .to_path_buf();
-            let report = ras2fim_stages_r2::horizontal::run(&req, &base, &out)?;
+            let report = ras_commander_fast_map::horizontal::run(&req, &base, &out)?;
             if !req.stream_outputs {
                 println!(
                     "{}",
@@ -150,14 +150,14 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             if out.exists() {
                 return Err("output directory exists; choose a new path".into());
             }
-            let req = ras2fim_stages_r2::step05::Request::load(&request_path)?;
+            let req = ras_commander_fast_map::step05::Request::load(&request_path)?;
             let base = request_path
                 .canonicalize()?
                 .parent()
                 .map(PathBuf::from)
                 .ok_or("request path has no parent")?;
             let monitor = ThreadMonitor::start();
-            let result = ras2fim_stages_r2::step05::run(&req, &base, &out);
+            let result = ras_commander_fast_map::step05::run(&req, &base, &out);
             let threads = monitor.finish();
             let mut report = match result {
                 Ok(r) => r,
@@ -166,15 +166,17 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
                     if out.is_dir() {
                         let failed = serde_json::json!({"schema": "ras2fim-step05-report/1", "status": "error",
                             "error_kind": e.kind(), "error": e.to_string()});
-                        let _ =
-                            ras2fim_stages_r2::sink::write_json(&out.join("report.json"), &failed);
+                        let _ = ras_commander_fast_map::sink::write_json(
+                            &out.join("report.json"),
+                            &failed,
+                        );
                     }
                     return Err(e.into());
                 }
             };
             report["os_threads"] = threads;
             report["os_threads"]["expected_max"] = (req.budgets.threads + 2).into();
-            ras2fim_stages_r2::sink::write_json(&out.join("report.json"), &report)?;
+            ras_commander_fast_map::sink::write_json(&out.join("report.json"), &report)?;
             let summary = serde_json::json!({"status": report["status"], "lookup_cache": report["lookup_cache"],
                 "total_wall_seconds_diagnostic": report["total_wall_seconds_diagnostic"]});
             println!("{summary}");

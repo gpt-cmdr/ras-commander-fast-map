@@ -705,7 +705,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
-name = "ras2fim-stages-r2"
+name = "ras-commander-fast-map"
 version = "0.8.0"
 dependencies = [
  "rayon",
