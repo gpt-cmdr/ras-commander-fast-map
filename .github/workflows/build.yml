@@ -50,6 +50,7 @@ jobs:
           rust-toolchain: '1.99.1'
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
+          docker-options: --env FAST_MAP_BUILD_COMMIT
           args: --release --locked --out dist
       - name: Installed wheel smoke and source identity
         shell: bash

@@ -34,7 +34,7 @@ def main():
         for path in sorted(paths):
             target = destination / path.name
             if args.check:
-                assert target.read_bytes() == path.read_bytes(), str(target)
+                assert target.read_bytes().replace(b"\r\n", b"\n") == path.read_bytes().replace(b"\r\n", b"\n"), str(target)
             else:
                 destination.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(path, target)
