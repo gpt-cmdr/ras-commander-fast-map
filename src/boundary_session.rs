@@ -370,6 +370,16 @@ fn execute(req: &Request, base: &Path, out: &Path, report: &mut Value) -> Result
             "top-priority-source terrains are not qualified for boundaries".into(),
         ));
     }
+    if m.storage_areas_file.is_some()
+        || m.storage_area_count != 0
+        || m.profiles
+            .iter()
+            .any(|p| p.storage_area_values_file.is_some())
+    {
+        return Err(MapError::Unsupported(
+            "storage-area surfaces are not qualified for boundaries".into(),
+        ));
+    }
     if m.epsg == 0
         || m.threads == 0
         || m.threads > 64

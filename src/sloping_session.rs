@@ -117,6 +117,11 @@ pub struct Request {
     /// Declares `terrain` as the top-priority source of a registered terrain.
     #[serde(default)]
     pub terrain_scope: Option<crate::terrain_scope::TerrainScope>,
+    /// Optional standalone storage-area polygons (framed WKB, one per area).
+    #[serde(default)]
+    pub storage_areas_file: Option<String>,
+    #[serde(default)]
+    pub storage_area_count: usize,
 }
 
 fn one_profile() -> usize {
@@ -176,6 +181,7 @@ fn render(
     normals: Option<&[Vec<crate::velocity::FaceNormal>]>,
     foreign: &[usize],
     hydraulic_cache: Option<&Mutex<Retained<String, Vec<sloping::PreparedProfile>>>>,
+    storage: Option<&crate::storage_area::StorageAreaPixels>,
 ) -> Result<RenderedProfile, MapError> {
     let tick = Instant::now();
     let cache_key = if hydraulic_cache.is_some() && normals.is_none() {
@@ -224,7 +230,21 @@ fn render(
     let (mut depth, mut wse) =
         sloping::render_profile_cached(stencils, &prepared, window, 0.001, pool, weights)?;
     let render_seconds = tick.elapsed().as_secs_f64();
-    let (finite_pixels, flooded_pixels) = crate::finalize::apply(&mut depth, &mut wse, pool);
+    let (mut finite_pixels, mut flooded_pixels) =
+        crate::finalize::apply(&mut depth, &mut wse, pool);
+    if let Some(storage) = storage {
+        let path = profile
+            .storage_area_values_file
+            .as_ref()
+            .ok_or_else(|| MapError::Invalid("storage-area profile values missing".into()))?;
+        let values = crate::storage_area::values(&model::resolve(base, path), storage.count)?;
+        finite_pixels += crate::storage_area::apply(storage, &values, 0.0, &mut depth, &mut wse)?;
+        flooded_pixels += storage
+            .pixels
+            .iter()
+            .filter(|&&p| depth[p] > 0.0 && depth[p] <= 10000.0)
+            .count();
+    }
     let velocity = match (normals, &profile.face_velocity_files) {
         (Some(normals), Some(files)) => {
             let mut face_velocity = Vec::new();
@@ -274,6 +294,9 @@ pub struct Profile {
     /// Per mesh: HDF-ordered float32 face-normal velocities of this profile.
     #[serde(default)]
     pub face_velocity_files: Option<Vec<String>>,
+    /// Storage-area WSE for this profile (f32 per area), required with storage areas.
+    #[serde(default)]
+    pub storage_area_values_file: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -396,13 +419,13 @@ pub fn method_record() -> Value {
         "bounded_profile_concurrency":true,
         "persistent_session":true,"multi_window_cache":true,"hydraulic_cache":true,"native_geotiff_outputs":true,"bounded_pixel_weights":true,
         "velocity":crate::velocity::METHOD_ID,
-
         "terrain_scope":crate::terrain_scope::METHOD_ID,
+        "storage_area_surfaces":crate::storage_area::METHOD_ID,
         "options":{"CellRenderMode":"Sloping","CellStencilMode":"JustFacepoints",
             "FacepointAdjustmentMode":"None","ShallowBehaviorMode":"None",
             "UseDepthWeightedFaces":false,"FaceWSMode":"Adjusted"},
         "native_plot_tolerance":0.001_f32,"extra_depth_cutoff":null,
-        "scope":"2D cells; plain cell-corner sloping; no 1D, slopingPretty or additional rendering options",
+        "scope":"2D cells; plain cell-corner sloping; optional storage-area level pools; no 1D, slopingPretty or additional rendering options",
         "reuse":"geometry, terrio ownership and terrain prepared once; bounded Rayon pixel and reconstruction workers"})
 }
 
@@ -418,7 +441,7 @@ fn selected_method(options: sloping::Options) -> Value {
         }
         .into();
         record["options"]["UseDepthWeightedFaces"] = options.use_depth_weighted_faces.into();
-        record["scope"] = "physical 2D cells; cell-corner and face sloping; no 1D or standalone storage-area surfaces".into();
+        record["scope"] = "physical 2D cells; cell-corner and face sloping; optional storage-area level pools; no 1D".into();
     }
     record
 }
@@ -506,6 +529,18 @@ pub fn run_with_session(
             "velocity_normals_files and every profile's face_velocity_files (one per mesh) go together".into(),
         ));
     }
+    let storage = crate::horizontal::validate_storage_fields(
+        req.storage_areas_file.as_ref(),
+        req.storage_area_count,
+        req.profiles
+            .iter()
+            .map(|p| p.storage_area_values_file.as_ref()),
+    )?;
+    if storage && req.velocity_normals_files.is_some() {
+        return Err(MapError::Unsupported(
+            "velocity is not qualified with storage-area surfaces".into(),
+        ));
+    }
     let mut ids = HashSet::new();
     for profile in &req.profiles {
         model::validate_id(&profile.id)?;
@@ -522,6 +557,7 @@ pub fn run_with_session(
         .iter()
         .chain(std::iter::once(&req.geometry_file))
         .chain(req.aoi_file.iter())
+        .chain(req.storage_areas_file.iter())
         .try_fold(0_u64, |sum, p| {
             sum.checked_add(fs::metadata(model::resolve(base, p))?.len())
                 .ok_or_else(|| MapError::Budget("sloping geometry size overflow".into()))
@@ -590,6 +626,8 @@ pub fn run_with_session(
                 0
             })
         })
+        // Storage areas: forward/reverse label burns, the AOI mask and sparse pixel lists.
+        .and_then(|v| v.checked_add(if storage { count as u64 * 28 } else { 0 }))
         .ok_or_else(|| MapError::Budget("sloping array plan overflow".into()))?;
     if planned > req.max_working_bytes {
         return Err(MapError::Budget("sloping array plan exceeds budget".into()));
@@ -996,6 +1034,40 @@ pub fn run_with_session(
                 terrain: &data.ground,
                 owner_cells: &req.owner_cells,
             };
+            let storage = req
+                .storage_areas_file
+                .as_ref()
+                .map(|file| -> Result<_, MapError> {
+                    let tick = Instant::now();
+                    // The window cache retains the AOI-masked ownership only; the
+                    // storage-area pixels use the same global-lattice mask.
+                    let aoi = req
+                        .aoi_file
+                        .as_ref()
+                        .map(|p| {
+                            pool.install(|| {
+                                crate::aoi::mask(&model::resolve(base, p), terrain.gt, req.window)
+                            })
+                        })
+                        .transpose()?;
+                    let mut pixels = crate::storage_area::prepare(
+                        &model::resolve(base, file),
+                        req.storage_area_count,
+                        &grid,
+                        &data.owner,
+                        aoi.as_deref(),
+                        &pool,
+                    )?;
+                    crate::storage_area::read_ground(&mut pixels, &terrain, req.window)?;
+                    report["storage_areas"] = json!({
+                        "method": crate::storage_area::method_record(),
+                        "count": req.storage_area_count,
+                        "pixels": pixels.pixels.len(),
+                        "prepare_seconds": tick.elapsed().as_secs_f64(),
+                    });
+                    Ok(pixels)
+                })
+                .transpose()?;
             let foreign = match &req.terrain_scope {
                 Some(scope) => {
                     let scoped = crate::terrain_scope::check(
@@ -1004,6 +1076,7 @@ pub fn run_with_session(
                         &terrain,
                         req.window,
                         &data.owner,
+                        storage.as_ref().map_or(&[], |s| &s.pixels),
                     )?;
                     report["terrain_scope"] = scoped.record;
                     scoped.foreign
@@ -1027,6 +1100,7 @@ pub fn run_with_session(
                             .as_ref()
                             .filter(|_| hydraulic_bytes > 0)
                             .map(|s| &s.hydraulics),
+                        storage.as_ref(),
                     )
                 })?;
                 // Indexed collection and ordered emission preserve the pipe/report
