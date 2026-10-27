@@ -49,10 +49,29 @@ Bbox/polygon output masks retain global hydraulic topology. Planned allocation
 admission is not a hard RSS limit. Python delivery may use Rasterio/GDAL;
 the Rust mapping executable does not link it.
 
-Production methods and binary32 operation order are unchanged from the qualified
-Commander engine 0.8.0. `MIGRATION.json` binds the extracted source and immutable
-numerical files. Existing request schemas, method identifiers and CLI exit codes
-are preserved. `ras2fim-batch method` adds package/version/source-commit identity.
+Binary32 operation order and method identifiers are preserved. `MIGRATION.json`
+retains the immutable 0.8.0 extraction receipt; `SOURCE_MANIFEST.json` binds this
+version's current sources. `ras2fim-batch method` reports package/build identity
+and capabilities.
+
+## Persistent reach sessions (0.9)
+
+`sloping-server` accepts serialized JSON-line commands with absolute `request`
+and `output` paths. Each request uses the existing sloping schema and streams
+the same profile headers/binary arrays, followed by a single
+`{"command_status":"complete"}` line. The process retains terrain blocks,
+mesh/stencils and one Rayon pool. Send `{"close":true}` or close stdin to release
+the session. Failed commands terminate the process; callers must reject partial
+products. Commander owns process lifetime and timeouts through prepared models.
+
+At most the last small window's owner/terrain arrays, exact geometry/AOI key
+and plain-sloping weights are retained within a separate 64 MiB payload bound.
+Weights use at most 32 MiB; pixels beyond the bounded prefix keep their original
+evaluation path. Cell-face/donor-history weights are not cached. Large windows
+still share terrain blocks and geometry, without retaining their output arrays.
+Plans include the retained payload budget and the original 64 MiB decoded tile
+cache; this is allocation admission, not a hard process RSS limit. Native
+`PreparedSession` objects provide the same reuse without the CLI.
 
 ## Qualification and limits
 

@@ -64,6 +64,44 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let cmd = args.first().and_then(|a| a.to_str()).unwrap_or("");
     match (cmd, args.len()) {
+        ("sloping-server", 1) => {
+            use std::io::{BufRead, Read, Write};
+            let mut session = ras_commander_fast_map::sloping_session::PreparedSession::default();
+            let mut input = std::io::BufReader::new(std::io::stdin().lock());
+            loop {
+                let mut line = String::new();
+                if input.by_ref().take(65537).read_line(&mut line)? == 0 {
+                    break;
+                }
+                if line.len() > 65536 || !line.ends_with('\n') {
+                    return Err("invalid session command".into());
+                }
+                let command: serde_json::Value = serde_json::from_str(&line)?;
+                if command["close"] == true {
+                    break;
+                }
+                let path = PathBuf::from(command["request"].as_str().ok_or("missing request")?);
+                let out = PathBuf::from(command["output"].as_str().ok_or("missing output")?);
+                let req = serde_json::from_reader(std::fs::File::open(&path)?)?;
+                let base = path
+                    .canonicalize()?
+                    .parent()
+                    .ok_or("missing base")?
+                    .to_path_buf();
+                let result = ras_commander_fast_map::sloping_session::run_with_session(
+                    &req,
+                    &base,
+                    &out,
+                    Some(&mut session),
+                )?;
+                println!("{}", serde_json::json!({"command_status":result["status"]}));
+                std::io::stdout().flush()?;
+                if result["status"] != "complete" {
+                    return Ok(2);
+                }
+            }
+            Ok(0)
+        }
         ("method", 1) => {
             let m = serde_json::json!({"engine": {"package": "ras-commander-fast-map", "version": ras_commander_fast_map::ENGINE_VERSION, "source_commit": ras_commander_fast_map::ENGINE_COMMIT}, "batch_session_r1": method_record(), "step05_r2": ras_commander_fast_map::step05::method_record(), "horizontal": ras_commander_fast_map::horizontal::method_record(), "sloping":ras_commander_fast_map::sloping_session::method_record()});
             println!("{}", serde_json::to_string_pretty(&m)?);
