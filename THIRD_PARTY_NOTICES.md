@@ -23,6 +23,16 @@ data; their MIT/Apache notices are retained in `licenses/`.
 The engine does not link GDAL. The surrounding Python workflow
 continues to use rasterio and its raster stack for preparation and file output.
 
+Deterministic inundation-boundary integer union and AOI clipping use the
+unmodified [`clipper2-rust` 1.2.0](https://github.com/larsbrubaker/clipper2-rust)
+crate under the Boost Software License 1.0 (`BSL-1.0`). Its source-distributed
+license is retained in
+[`licenses/dependencies/clipper2-rust-1.2.0/LICENSE`](licenses/dependencies/clipper2-rust-1.2.0/LICENSE).
+`Cargo.lock` pins the crates.io archive and checksum; the distribution source
+manifest binds the retained license. This pure Rust dependency introduces no
+GDAL or HEC-RAS runtime requirement. Its integer intersections and union behavior
+are not claimed to reproduce RASMapper vector output.
+
 Other Rust dependencies and their exact resolved versions are recorded in
 `Cargo.lock`. Retain their applicable notices when distributing compiled
 binaries. Resolved dependency license texts are retained under
@@ -33,5 +43,4 @@ endorsement by upstream projects.
 
 The separate plain-sloping method is an independent implementation qualified
 against HEC-RAS 7.0.1 stored-map output and native intermediate values. HEC-RAS
-assemblies and decompiled vendor source are not included in the engine or
-wheels. This comparison does not imply HEC or USACE endorsement or support.
+assemblies are not included in the engine or wheels. This comparison does not imply HEC or USACE endorsement or support.

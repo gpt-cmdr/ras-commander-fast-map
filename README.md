@@ -73,6 +73,64 @@ Plans include the retained payload budget and the original 64 MiB decoded tile
 cache; this is allocation admission, not a hard process RSS limit. Native
 `PreparedSession` objects provide the same reuse without the CLI.
 
+## Deterministic inundation boundaries (0.10)
+
+Generate projected-CRS inundation polygons from signed depths with the separate
+`deterministic-zero-depth-contours/1` method:
+
+```bash
+ras2fim-batch boundary boundary-request.json new-boundary-output
+```
+
+Commander prepares the model and terrain metadata for this command. Rust callers
+can use `boundary_session::Request` and `boundary_session::run` directly. The
+request schema is `ras-commander-boundary-request/1`:
+
+| Field | Contract |
+|---|---|
+| `schema` | `ras-commander-boundary-request/1` |
+| `interpolation` | `horizontal` or `sloping` |
+| `model` | Existing `ras-commander-sloping-request/1` model, global physical-cell polygons, full hydraulic meshes, profile files, CRS, AOI and resource controls |
+| `terrain_metadata` | Original terrain shape/transform, 256 × 256 tile grid, selected global tile IDs, mask/perimeter numeric descriptors, and optional paired stitch-point/triangle descriptors |
+
+Boundary generation supports physical 2D cells with horizontal or plain corner
+sloping surfaces. Cell-face interpolation, shallow-to-horizontal controls and
+face depth weighting are rejected. Supply one original, unmodified float32
+terrain TIFF and its matching terrain HDF metadata. Retiled/cropped TIFFs,
+terrain modifications and multi-source mosaics are outside this boundary scope.
+Commander rejects models containing 1D elements; standalone storage-area surfaces
+are excluded.
+
+The method retains valid negative depths to locate the zero-depth crossings.
+The intrinsic cell-wet gate uses float32 `WSE > minimum_elevation + 0.001`;
+there is no added pixel-depth cutoff or 0.5-foot postprocessing. Masks/perimeters
+and stitch triangles come from the terrain HDF; the TIFF alone is insufficient.
+Bbox/polygon selection limits terrain tiles, while hydraulic topology stays
+global. AOI clipping follows contour construction, preserving edge samples.
+
+Quantized integer clipping produces coordinates at 0.001 **projected CRS units**.
+Tile/profile results are combined in stable order, independent of worker order.
+Each profile produces one GeoJSON FeatureCollection containing a MultiPolygon;
+its explicit legacy GeoJSON `crs` member identifies projected coordinates. These
+coordinates are not reprojected to RFC 7946 longitude/latitude. The report uses
+`ras-commander-boundary-report/1` and includes profile status, polygon/hole/vertex
+counts, area in squared CRS units, timings and effective concurrency. Empty
+boundaries are explicit. Output requires a new or empty directory; a failed
+batch removes delivered profile polygons and records an aborted report.
+
+Profiles share geometry, terrain blocks, ownership and stencils. `model.threads`
+and `model.max_inflight_profiles` bound work in one Rayon pool; tile workers
+also share that pool. Planned admission covers prepared data and per-profile
+contour allowances before payload reads. It is not a hard process RSS limit.
+
+These deterministic polygons are **not an exact reproduction of RASMapper
+vectors**. Stable all-subject integer union and quantized intersections can
+produce different holes and boundary vertices. Repeated native Max exports can
+also vary with unchanged inputs. Use the native stored-map API when its vector
+output is required, and retain comparison evidence for the intended model.
+This separate polygon layer does not change the existing Depth/WSE raster
+methods, their float32 arithmetic or their qualification claims.
+
 ## Qualification and limits
 
 The retained [five-model comparisons](https://rascommander.info/ras/development/fim-mapping-performance/)
@@ -108,6 +166,7 @@ See [release instructions](docs/releasing.md) for PyPI/crates.io publishing.
 
 Our code retains its MIT license. Step05/SciPy reuse retains BSD-3-Clause notices;
 see `LICENSE`, `THIRD_PARTY_NOTICES.md` and `licenses/`. The crate license
-expression is `MIT AND BSD-3-Clause`. Dependency notices accompany distributions.
-HEC-RAS assemblies, decompiled vendor source and model data are not distributed.
+expression is `MIT AND BSD-3-Clause`. The unmodified Clipper2 dependency retains
+its Boost Software License 1.0 notice. Dependency notices accompany distributions.
+HEC-RAS assemblies and model data are not distributed.
 This independent project is not affiliated with or endorsed by HEC/USACE.

@@ -977,6 +977,64 @@ impl WeightScratch {
     }
 }
 
+/// Internal signed-depth surface path. Raster plot tolerance is deliberately
+/// not applied here: zero-contour interpolation needs valid dry-side samples.
+/// The caller subtracts valid terrain from the returned water-surface value.
+/// The resulting depth uses Option, so a numeric depth of -9999 is not missing.
+pub(crate) fn boundary_surface_value(
+    stencils: &[Vec<Option<CellStencil>>],
+    profiles: &[PreparedProfile],
+    mesh: usize,
+    cell: usize,
+    point: [f64; 2],
+    scratch: &mut WeightScratch,
+) -> Result<Option<f32>, MapError> {
+    let profile = profiles
+        .get(mesh)
+        .ok_or_else(|| MapError::Invalid("boundary surface mesh out of range".into()))?;
+    if profile.options.render_mode != RenderMode::Corners {
+        return Err(MapError::Unsupported(
+            "boundary contours currently require plain corner sloping; face options are not qualified".into(),
+        ));
+    }
+    if point.iter().any(|v| !v.is_finite()) {
+        return Err(MapError::Invalid("nonfinite boundary surface query".into()));
+    }
+    let wet = *profile
+        .wet
+        .get(cell)
+        .ok_or_else(|| MapError::Invalid("boundary surface cell out of range".into()))?;
+    if !wet {
+        return Ok(None);
+    }
+    let cells = stencils
+        .get(mesh)
+        .ok_or_else(|| MapError::Invalid("boundary stencil mesh out of range".into()))?;
+    let stencil = cells
+        .get(cell)
+        .ok_or_else(|| MapError::Invalid("boundary stencil cell out of range".into()))?;
+    let Some(stencil) = stencil else {
+        return Ok(None);
+    };
+    if let Some(value) = profile.horizontal[cell] {
+        return Ok((value != NODATA).then_some(value));
+    }
+    let values = &profile.local_values[cell];
+    scratch.resize(values.len());
+    let weights = if let Some(bounds) = stencil.square {
+        stencil.polygon.square_weights(bounds, point, scratch)
+    } else {
+        stencil.polygon.weights(point, scratch)?
+    };
+    let value = paint_corner_values(weights, values)?;
+    if !value.is_finite() {
+        return Err(MapError::Invalid(
+            "nonfinite boundary surface interpolation".into(),
+        ));
+    }
+    Ok((value != NODATA).then_some(value))
+}
+
 /// Geometry and terrain belong to the caller and can be reused across timesteps.
 /// Labels index `owner_cells` plus one; zero is outside the physical 2D footprint.
 pub struct RasterWindow<'a> {
@@ -1520,5 +1578,57 @@ mod tests {
     fn invalid_face_geometry_is_rejected() {
         assert!(face_application(&[[0.0, f64::NAN], [1.0, 1.0]], [[0.0; 2]; 2]).is_err());
         assert!(face_application(&[[0.0; 2]], [[0.0; 2]; 2]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod boundary_surface_tests {
+    use super::*;
+    fn fixture() -> (Vec<Vec<Option<CellStencil>>>, Vec<PreparedProfile>) {
+        let points = vec![[0., 0.], [1., 0.], [1., 1.], [0., 1.]];
+        let polygon = PolygonStencil::new(points.clone()).unwrap();
+        let stencil = CellStencil {
+            physical_ring: points,
+            polygon,
+            square: Some([0., 0., 1., 1.]),
+            corners: vec![[0, 0]; 4],
+            faces: vec![],
+            elevations: None,
+        };
+        let profile = PreparedProfile {
+            local_values: vec![vec![2.; 4]],
+            face_values: vec![vec![]],
+            depth_weights: vec![vec![]],
+            horizontal: vec![None],
+            wet: vec![true],
+            options: Options::default(),
+        };
+        (vec![vec![Some(stencil)]], vec![profile])
+    }
+    #[test]
+    fn signed_boundary_surface_preserves_dry_side_without_changing_raster_visibility() {
+        let (stencils, profiles) = fixture();
+        let mut scratch = WeightScratch::new(0);
+        let surface = boundary_surface_value(&stencils, &profiles, 0, 0, [0.5, 0.5], &mut scratch)
+            .unwrap()
+            .unwrap();
+        assert_eq!(surface.to_bits(), 2f32.to_bits());
+        assert_eq!(Some(surface - 10001.), Some(-9999.));
+        assert!(deliver_pixel(surface, 10001., 0.001).is_none());
+    }
+    #[test]
+    fn boundary_surface_rejects_faces_and_retains_explicit_missing_cells() {
+        let (stencils, mut profiles) = fixture();
+        let mut scratch = WeightScratch::new(0);
+        profiles[0].wet[0] = false;
+        assert_eq!(
+            boundary_surface_value(&stencils, &profiles, 0, 0, [0.5, 0.5], &mut scratch).unwrap(),
+            None
+        );
+        profiles[0].options.render_mode = RenderMode::WithFaces;
+        assert!(matches!(
+            boundary_surface_value(&stencils, &profiles, 0, 0, [0.5, 0.5], &mut scratch),
+            Err(MapError::Unsupported(_))
+        ));
     }
 }
