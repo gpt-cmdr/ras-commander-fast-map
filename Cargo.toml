@@ -1,6 +1,6 @@
 [package]
 name = "ras-commander-fast-map"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 license = "MIT AND BSD-3-Clause"
 description = "Native Rust 2D flood inundation mapping: horizontal and sloping surfaces, bounded timesteps and terrain windows"
@@ -23,6 +23,7 @@ path = "src/main.rs"
 terrio = { version = "=0.4.2", default-features = false, features = ["geotiff"] }
 wbvector = "=0.1.6"
 wbraster = "=0.2.1"
+clipper2-rust = "=1.2.0"
 rayon = "1.10"
 rstar = "=0.13.0"
 serde = { version = "1", features = ["derive"] }
