@@ -91,7 +91,7 @@ request schema is `ras-commander-boundary-request/1`:
 | `schema` | `ras-commander-boundary-request/1` |
 | `interpolation` | `horizontal` or `sloping` |
 | `model` | Existing `ras-commander-sloping-request/1` model, global physical-cell polygons, full hydraulic meshes, profile files, CRS, AOI and resource controls |
-| `terrain_metadata` | Original terrain shape/transform, 256 × 256 tile grid, selected global tile IDs, mask/perimeter numeric descriptors, and optional paired stitch-point/triangle descriptors |
+| `terrain_metadata` | Original terrain shape/transform, 256 Ã— 256 tile grid, selected global tile IDs, mask/perimeter numeric descriptors, and optional paired stitch-point/triangle descriptors |
 
 Boundary generation supports physical 2D cells with horizontal or plain corner
 sloping surfaces. Cell-face interpolation, shallow-to-horizontal controls and
