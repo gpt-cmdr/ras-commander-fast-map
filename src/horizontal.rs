@@ -41,12 +41,20 @@ pub struct Request {
     pub max_working_bytes: u64,
     #[serde(default)]
     pub stream_outputs: bool,
+    /// Optional standalone storage-area polygons (framed WKB, one per area).
+    #[serde(default)]
+    pub storage_areas_file: Option<String>,
+    #[serde(default)]
+    pub storage_area_count: usize,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     pub id: String,
     pub values_file: String,
+    /// Storage-area WSE for this profile (f32 per area), required with storage areas.
+    #[serde(default)]
+    pub storage_area_values_file: Option<String>,
 }
 
 pub fn method_record() -> Value {
@@ -57,7 +65,8 @@ pub fn method_record() -> Value {
         "native_ownership":true,
         "terrain":"same-CRS north-up square float32 GeoTIFF; native terrio block reads once per window",
         "reuse":"terrain and ownership shared across all profiles; pixel parallelism inside bounded Rayon pool",
-        "scope":"2D horizontal cells only; no native sloping, 1D or structure renderer"})
+        "storage_area_surfaces":crate::storage_area::METHOD_ID,
+        "scope":"2D horizontal cells; optional storage-area level pools; no native sloping, 1D or structure renderer"})
 }
 fn bytes(count: usize, width: usize) -> Result<u64, MapError> {
     count
@@ -169,6 +178,18 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
         .checked_mul(height)
         .filter(|n| *n > 0 && *n <= model::MAX_PROFILE_PIXELS as usize)
         .ok_or_else(|| MapError::Budget("horizontal window empty or too large".into()))?;
+    let storage = req.storage_areas_file.is_some();
+    if storage != (req.storage_area_count > 0)
+        || req.storage_area_count >= u32::MAX as usize
+        || req
+            .profiles
+            .iter()
+            .any(|p| p.storage_area_values_file.is_some() != storage)
+    {
+        return Err(MapError::Invalid(
+            "storage_areas_file, storage_area_count and every profile's storage_area_values_file go together".into(),
+        ));
+    }
     let mut ids = HashSet::new();
     for p in &req.profiles {
         model::validate_id(&p.id)?;
@@ -179,7 +200,7 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
     // Fixed resident cache plus conservative array/IO-copy admission. Decoder transients are
     // included separately after inspecting the terrain layout; this is not an OS RSS cap.
     let cache = 64_u64 << 20;
-    let planned = bytes(count, 40)?
+    let planned = bytes(count, if storage { 68 } else { 40 })?
         .checked_add(bytes(req.cell_count, 64)?)
         .and_then(|v| v.checked_add(cache))
         .ok_or_else(|| MapError::Budget("size overflow".into()))?;
@@ -214,13 +235,17 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
             "terrain block exceeds 64 MiB; export tiled terrain".into(),
         ));
     }
-    let geometry_bytes = [req.geometry_file.as_ref(), req.aoi_file.as_ref()]
-        .into_iter()
-        .flatten()
-        .try_fold(0_u64, |sum, name| -> Result<u64, MapError> {
-            sum.checked_add(fs::metadata(model::resolve(base, name))?.len())
-                .ok_or_else(|| MapError::Budget("geometry size overflow".into()))
-        })?;
+    let geometry_bytes = [
+        req.geometry_file.as_ref(),
+        req.aoi_file.as_ref(),
+        req.storage_areas_file.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .try_fold(0_u64, |sum, name| -> Result<u64, MapError> {
+        sum.checked_add(fs::metadata(model::resolve(base, name))?.len())
+            .ok_or_else(|| MapError::Budget("geometry size overflow".into()))
+    })?;
     let geometry_plan = geometry_bytes
         .checked_mul(12)
         .ok_or_else(|| MapError::Budget("geometry size overflow".into()))?;
@@ -339,6 +364,45 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
                 }
             }
             report["terrain_prepare_seconds"] = terrain_started.elapsed().as_secs_f64().into();
+            let storage = req
+                .storage_areas_file
+                .as_ref()
+                .map(|file| -> Result<_, MapError> {
+                    let tick = Instant::now();
+                    let grid = terrio::ops::rasterize::Grid {
+                        geo_transform: [
+                            terrain.gt[0] + col as f64 * terrain.gt[1],
+                            terrain.gt[1],
+                            0.,
+                            terrain.gt[3] + row as f64 * terrain.gt[5],
+                            0.,
+                            terrain.gt[5],
+                        ],
+                        cols: width,
+                        rows: height,
+                        crs: Default::default(),
+                    };
+                    let aoi = req.aoi_file.as_ref().map(|p| model::resolve(base, p));
+                    let mut pixels = crate::storage_area::prepare(
+                        &model::resolve(base, file),
+                        req.storage_area_count,
+                        &grid,
+                        &owner,
+                        aoi.as_deref(),
+                        &pool,
+                    )?;
+                    for (g, &p) in pixels.ground.iter_mut().zip(&pixels.pixels) {
+                        *g = ground[p];
+                    }
+                    report["storage_areas"] = json!({
+                        "method": crate::storage_area::method_record(),
+                        "count": req.storage_area_count,
+                        "pixels": pixels.pixels.len(),
+                        "prepare_seconds": tick.elapsed().as_secs_f64(),
+                    });
+                    Ok(pixels)
+                })
+                .transpose()?;
             for p in &req.profiles {
                 let tick = Instant::now();
                 let dir = out.join(&p.id);
@@ -358,6 +422,16 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
                             &mut wse,
                         )
                     })?;
+                    if let Some(storage) = &storage {
+                        let path = p.storage_area_values_file.as_ref().ok_or_else(|| {
+                            MapError::Invalid("storage-area profile values missing".into())
+                        })?;
+                        let values = crate::storage_area::values(
+                            &model::resolve(base, path),
+                            storage.count,
+                        )?;
+                        crate::storage_area::apply(storage, &values, &mut depth, &mut wse)?;
+                    }
                     if req.stream_outputs {
                         let stdout = std::io::stdout();
                         let mut stream = BufWriter::with_capacity(65536, stdout.lock());

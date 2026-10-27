@@ -90,6 +90,11 @@ pub struct Request {
     pub max_working_bytes: u64,
     #[serde(default)]
     pub stream_outputs: bool,
+    /// Optional standalone storage-area polygons (framed WKB, one per area).
+    #[serde(default)]
+    pub storage_areas_file: Option<String>,
+    #[serde(default)]
+    pub storage_area_count: usize,
 }
 
 fn one_profile() -> usize {
@@ -139,6 +144,7 @@ fn render(
     pool: &rayon::ThreadPool,
     options: sloping::Options,
     weights: Option<&sloping::PixelWeights>,
+    storage: Option<&crate::storage_area::StorageAreaPixels>,
 ) -> Result<RenderedProfile, MapError> {
     let tick = Instant::now();
     let mut prepared = Vec::new();
@@ -168,6 +174,14 @@ fn render(
                 }
             })
     });
+    if let Some(storage) = storage {
+        let path = profile
+            .storage_area_values_file
+            .as_ref()
+            .ok_or_else(|| MapError::Invalid("storage-area profile values missing".into()))?;
+        let values = crate::storage_area::values(&model::resolve(base, path), storage.count)?;
+        crate::storage_area::apply(storage, &values, &mut depth, &mut wse)?;
+    }
     Ok(RenderedProfile {
         depth,
         wse,
@@ -181,6 +195,9 @@ fn render(
 pub struct Profile {
     pub id: String,
     pub values_files: Vec<String>,
+    /// Storage-area WSE for this profile (f32 per area), required with storage areas.
+    #[serde(default)]
+    pub storage_area_values_file: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -302,11 +319,12 @@ pub fn method_record() -> Value {
         "native_donation_history":true,
         "bounded_profile_concurrency":true,
         "persistent_session":true,"bounded_pixel_weights":true,
+        "storage_area_surfaces":crate::storage_area::METHOD_ID,
         "options":{"CellRenderMode":"Sloping","CellStencilMode":"JustFacepoints",
             "FacepointAdjustmentMode":"None","ShallowBehaviorMode":"None",
             "UseDepthWeightedFaces":false,"FaceWSMode":"Adjusted"},
         "native_plot_tolerance":0.001_f32,"extra_depth_cutoff":null,
-        "scope":"2D cells; plain cell-corner sloping; no 1D, slopingPretty or additional rendering options",
+        "scope":"2D cells; plain cell-corner sloping; optional storage-area level pools; no 1D, slopingPretty or additional rendering options",
         "reuse":"geometry, terrio ownership and terrain prepared once; bounded Rayon pixel and reconstruction workers"})
 }
 
@@ -322,7 +340,7 @@ fn selected_method(options: sloping::Options) -> Value {
         }
         .into();
         record["options"]["UseDepthWeightedFaces"] = options.use_depth_weighted_faces.into();
-        record["scope"] = "physical 2D cells; cell-corner and face sloping; no 1D or standalone storage-area surfaces".into();
+        record["scope"] = "physical 2D cells; cell-corner and face sloping; optional storage-area level pools; no 1D".into();
     }
     record
 }
@@ -380,6 +398,18 @@ pub fn run_with_session(
     {
         return Err(MapError::Invalid("invalid sloping request".into()));
     }
+    let storage = req.storage_areas_file.is_some();
+    if storage != (req.storage_area_count > 0)
+        || req.storage_area_count >= u32::MAX as usize
+        || req
+            .profiles
+            .iter()
+            .any(|p| p.storage_area_values_file.is_some() != storage)
+    {
+        return Err(MapError::Invalid(
+            "storage_areas_file, storage_area_count and every profile's storage_area_values_file go together".into(),
+        ));
+    }
     let mut ids = HashSet::new();
     for profile in &req.profiles {
         model::validate_id(&profile.id)?;
@@ -396,6 +426,7 @@ pub fn run_with_session(
         .iter()
         .chain(std::iter::once(&req.geometry_file))
         .chain(req.aoi_file.iter())
+        .chain(req.storage_areas_file.iter())
         .try_fold(0_u64, |sum, p| {
             sum.checked_add(fs::metadata(model::resolve(base, p))?.len())
                 .ok_or_else(|| MapError::Budget("sloping geometry size overflow".into()))
@@ -434,6 +465,8 @@ pub fn run_with_session(
         })
         .and_then(|v| v.checked_add(cache))
         .and_then(|v| v.checked_add(persistent_bytes))
+        // Storage areas: forward/reverse/AOI label burns plus sparse pixel lists.
+        .and_then(|v| v.checked_add(if storage { count as u64 * 28 } else { 0 }))
         .ok_or_else(|| MapError::Budget("sloping array plan overflow".into()))?;
     if planned > req.max_working_bytes {
         return Err(MapError::Budget("sloping array plan exceeds budget".into()));
@@ -823,6 +856,36 @@ pub fn run_with_session(
                 terrain: &data.ground,
                 owner_cells: &req.owner_cells,
             };
+            let storage = req
+                .storage_areas_file
+                .as_ref()
+                .map(|file| -> Result<_, MapError> {
+                    let tick = Instant::now();
+                    let grid = terrio::ops::rasterize::Grid {
+                        geo_transform: transform,
+                        cols: width,
+                        rows: height,
+                        crs: Default::default(),
+                    };
+                    let aoi = req.aoi_file.as_ref().map(|p| model::resolve(base, p));
+                    let mut pixels = crate::storage_area::prepare(
+                        &model::resolve(base, file),
+                        req.storage_area_count,
+                        &grid,
+                        &data.owner,
+                        aoi.as_deref(),
+                        &pool,
+                    )?;
+                    crate::storage_area::read_ground(&mut pixels, &terrain, req.window)?;
+                    report["storage_areas"] = json!({
+                        "method": crate::storage_area::method_record(),
+                        "count": req.storage_area_count,
+                        "pixels": pixels.pixels.len(),
+                        "prepare_seconds": tick.elapsed().as_secs_f64(),
+                    });
+                    Ok(pixels)
+                })
+                .transpose()?;
             for batch in req.profiles.chunks(effective) {
                 let results = map_batch(batch, &pool, |profile| {
                     render(
@@ -834,6 +897,7 @@ pub fn run_with_session(
                         &pool,
                         req.options,
                         data.weights.as_ref(),
+                        storage.as_ref(),
                     )
                 })?;
                 // Indexed collection and ordered emission preserve the pipe/report

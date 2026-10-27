@@ -40,6 +40,7 @@ pub mod sloping;
 mod sloping_binary;
 pub mod sloping_session;
 pub mod step05;
+pub mod storage_area;
 pub mod terrain;
 
 use std::fmt;

@@ -133,6 +133,29 @@ output is required, and retain comparison evidence for the intended model.
 This separate polygon layer does not change the existing Depth/WSE raster
 methods, their float32 arithmetic or their qualification claims.
 
+## Storage-area surfaces
+
+`sloping` and `horizontal` requests can also render standalone storage areas as
+level pools (method `storage-area-level-pool/1`, advertised as
+`storage_area_surfaces` in `ras2fim-batch method`). Supply all three together:
+
+| Field | Contract |
+|---|---|
+| `storage_areas_file` | Framed little-endian WKB Polygons/MultiPolygons, one per storage area (same framing as `geometry_file`) |
+| `storage_area_count` | Number of storage areas in that file |
+| `profiles[].storage_area_values_file` | Little-endian float32 storage-area WSE for that profile (Max or one output time), one per area, finite |
+
+Each storage-area pixel (pixel centre inside the polygon, on the request window)
+gets the area's WSE; it is visible when float32 `wse >= terrain + 0.001`, with
+depth `wse - terrain`. The caller must size `window` to cover the storage areas
+as well as the 2D cells. Pixels owned by both a 2D cell and a storage area, or
+by two storage areas, are refused: RAS Mapper's ordering for those layouts is
+not qualified. Boundary requests refuse storage areas.
+
+Qualification: BaldEagleCrkMulti2D p07 against native HEC-RAS 7.0.1 sloping
+stored maps, Max (466,912 storage-area plus 878,779 2D pixels) and
+02JAN1999 13:00 (422,515 plus 256,323): identical valid masks and float32 bits.
+
 ## Qualification and limits
 
 The retained [five-model comparisons](https://rascommander.info/ras/development/fim-mapping-performance/)
@@ -140,8 +163,9 @@ cover raw Depth/WSE validity masks and float32 bits against native HEC-RAS 7.0.1
 without an added depth cutoff. Those published timing observations predate this
 packaging extraction; no new speedup is claimed for renaming/distribution.
 
-Mapping covers physical 2D cells. Commander rejects models with 1D river/cross-
-section geometry. Standalone storage-area surfaces are excluded. Cell-face
+Mapping covers physical 2D cells, plus storage-area level pools when the
+request supplies them. Commander rejects models with 1D river/cross-section
+geometry. Cell-face
 matching preserves the original source TIFF grid and 256-square tile layout;
 arbitrary retiled/cropped terrain and multi-source mosaics are unqualified.
 Depth weighting needs stored corner ground elevations. When absent, explicit

@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+Render standalone storage-area water surfaces as level pools
+(`storage-area-level-pool/1`) in the `sloping` and `horizontal` requests.
+Optional `storage_areas_file` (framed little-endian WKB polygons),
+`storage_area_count` and per-profile `storage_area_values_file` (one float32
+WSE per area) are all-or-nothing; requests without them are unchanged. Pixel
+ownership uses the 2D terrio pixel-centre burn on the same window; visibility is
+the native float32 `wse >= terrain + 0.001` test. Storage-area pixels also owned
+by a 2D cell, pixels inside two storage areas and nonfinite storage-area WSE are
+refused. Boundary requests refuse storage areas. On BaldEagleCrkMulti2D p07, Max
+and one output time match native HEC-RAS 7.0.1 sloping stored maps in every
+valid-mask pixel and float32 bit, including all storage-area pixels.
+
 ## 0.10.0
 
 Add the separate `boundary` CLI and Rust boundary API with method ID
