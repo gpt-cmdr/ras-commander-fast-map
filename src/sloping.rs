@@ -977,6 +977,64 @@ impl WeightScratch {
     }
 }
 
+/// Internal signed-depth surface path. Raster plot tolerance is deliberately
+/// not applied here: zero-contour interpolation needs valid dry-side samples.
+/// The caller subtracts valid terrain from the returned water-surface value.
+/// The resulting depth uses Option, so a numeric depth of -9999 is not missing.
+pub(crate) fn boundary_surface_value(
+    stencils: &[Vec<Option<CellStencil>>],
+    profiles: &[PreparedProfile],
+    mesh: usize,
+    cell: usize,
+    point: [f64; 2],
+    scratch: &mut WeightScratch,
+) -> Result<Option<f32>, MapError> {
+    let profile = profiles
+        .get(mesh)
+        .ok_or_else(|| MapError::Invalid("boundary surface mesh out of range".into()))?;
+    if profile.options.render_mode != RenderMode::Corners {
+        return Err(MapError::Unsupported(
+            "boundary contours currently require plain corner sloping; face options are not qualified".into(),
+        ));
+    }
+    if point.iter().any(|v| !v.is_finite()) {
+        return Err(MapError::Invalid("nonfinite boundary surface query".into()));
+    }
+    let wet = *profile
+        .wet
+        .get(cell)
+        .ok_or_else(|| MapError::Invalid("boundary surface cell out of range".into()))?;
+    if !wet {
+        return Ok(None);
+    }
+    let cells = stencils
+        .get(mesh)
+        .ok_or_else(|| MapError::Invalid("boundary stencil mesh out of range".into()))?;
+    let stencil = cells
+        .get(cell)
+        .ok_or_else(|| MapError::Invalid("boundary stencil cell out of range".into()))?;
+    let Some(stencil) = stencil else {
+        return Ok(None);
+    };
+    if let Some(value) = profile.horizontal[cell] {
+        return Ok((value != NODATA).then_some(value));
+    }
+    let values = &profile.local_values[cell];
+    scratch.resize(values.len());
+    let weights = if let Some(bounds) = stencil.square {
+        stencil.polygon.square_weights(bounds, point, scratch)
+    } else {
+        stencil.polygon.weights(point, scratch)?
+    };
+    let value = paint_corner_values(weights, values)?;
+    if !value.is_finite() {
+        return Err(MapError::Invalid(
+            "nonfinite boundary surface interpolation".into(),
+        ));
+    }
+    Ok((value != NODATA).then_some(value))
+}
+
 /// Geometry and terrain belong to the caller and can be reused across timesteps.
 /// Labels index `owner_cells` plus one; zero is outside the physical 2D footprint.
 pub struct RasterWindow<'a> {
@@ -990,12 +1048,99 @@ pub struct RasterWindow<'a> {
     pub owner_cells: &'a [[usize; 2]], // mesh, local cell
 }
 
+/// Bounded immutable geometry-only weights for a prefix of one output window.
+/// Face rendering keeps its original scratch/history path.
+pub(crate) struct PixelWeights {
+    stride: usize,
+    values: Vec<f32>,
+}
+
+impl PixelWeights {
+    pub(crate) fn prepare(
+        stencils: &[Vec<Option<CellStencil>>],
+        window: &RasterWindow<'_>,
+        budget: usize,
+        pool: &rayon::ThreadPool,
+    ) -> Result<Self, MapError> {
+        let stride = stencils
+            .iter()
+            .flatten()
+            .filter_map(|s| s.as_ref())
+            .map(|s| s.polygon.points.len())
+            .max()
+            .unwrap_or(1);
+        if window.width == 0
+            || window
+                .owner
+                .iter()
+                .any(|&label| label as usize > window.owner_cells.len())
+            || window
+                .owner_cells
+                .iter()
+                .any(|&[mesh, cell]| mesh >= stencils.len() || cell >= stencils[mesh].len())
+        {
+            return Err(MapError::Invalid("invalid cached pixel addresses".into()));
+        }
+        let row_bytes = stride
+            .checked_mul(4)
+            .ok_or_else(|| MapError::Budget("weight cache stride overflow".into()))?;
+        let count = window.owner.len().min(budget / row_bytes);
+        let mut values = vec![0.0; count * stride];
+        pool.install(|| {
+            values.par_chunks_mut(stride).enumerate().try_for_each_init(
+                || WeightScratch::new(0),
+                |scratch, (i, row)| {
+                    let label = window.owner[i] as usize;
+                    if label != 0 {
+                        let [mesh, cell] = window.owner_cells[label - 1];
+                        if let Some(stencil) = &stencils[mesh][cell] {
+                            scratch.resize(stencil.polygon.points.len());
+                            let point = [
+                                window.transform[0]
+                                    + ((i % window.width) as f64 + 0.5) * window.transform[1],
+                                window.transform[3]
+                                    + ((i / window.width) as f64 + 0.5) * window.transform[5],
+                            ];
+                            let weights = if let Some(bounds) = stencil.square {
+                                stencil.polygon.square_weights(bounds, point, scratch)
+                            } else {
+                                stencil.polygon.weights(point, scratch)?
+                            };
+                            row[..weights.len()].copy_from_slice(weights);
+                        }
+                    }
+                    Ok::<_, MapError>(())
+                },
+            )
+        })?;
+        Ok(Self { stride, values })
+    }
+    pub fn bytes(&self) -> usize {
+        self.values.len() * 4
+    }
+    fn get(&self, index: usize, len: usize) -> Option<&[f32]> {
+        (index < self.values.len() / self.stride && len <= self.stride)
+            .then(|| &self.values[index * self.stride..index * self.stride + len])
+    }
+}
+
 pub fn render_profile(
     stencils: &[Vec<Option<CellStencil>>],
     profiles: &[PreparedProfile],
     window: &RasterWindow<'_>,
     tolerance: f32,
     pool: &rayon::ThreadPool,
+) -> Result<(Vec<f32>, Vec<f32>), MapError> {
+    render_profile_cached(stencils, profiles, window, tolerance, pool, None)
+}
+
+pub(crate) fn render_profile_cached(
+    stencils: &[Vec<Option<CellStencil>>],
+    profiles: &[PreparedProfile],
+    window: &RasterWindow<'_>,
+    tolerance: f32,
+    pool: &rayon::ThreadPool,
+    cache: Option<&PixelWeights>,
 ) -> Result<(Vec<f32>, Vec<f32>), MapError> {
     let count = window
         .width
@@ -1077,7 +1222,12 @@ pub fn render_profile(
                             window.transform[0] + (col as f64 + 0.5) * window.transform[1],
                             window.transform[3] + (row as f64 + 0.5) * window.transform[5],
                         ];
-                        let weights = if let Some(bounds) = stencil.square {
+                        let weights = if let Some(weights) = cache
+                            .filter(|_| profiles[mesh].options.render_mode != RenderMode::WithFaces)
+                            .and_then(|c| c.get(i, values.len()))
+                        {
+                            weights
+                        } else if let Some(bounds) = stencil.square {
                             stencil.polygon.square_weights(bounds, point, scratch)
                         } else {
                             stencil.polygon.weights(point, scratch)?
@@ -1345,6 +1495,58 @@ mod tests {
     }
 
     #[test]
+    fn bounded_pixel_weights_preserve_square_bits_and_fall_back_outside_prefix() {
+        let polygon = PolygonStencil::new(vec![[0., 0.], [0., 2.], [2., 2.], [2., 0.]]).unwrap();
+        let square = polygon.square_bounds();
+        let stencil = CellStencil {
+            physical_ring: polygon.points.clone(),
+            polygon,
+            square,
+            corners: vec![],
+            faces: vec![],
+            elevations: None,
+        };
+        let stencils = vec![vec![Some(stencil)]];
+        let window = RasterWindow {
+            source_transform: [0., 1., 0., 2., 0., -1.],
+            source_tile: [2, 2],
+            width: 2,
+            height: 2,
+            transform: [0., 1., 0., 2., 0., -1.],
+            owner: &[1, 1, 1, 1],
+            terrain: &[0.; 4],
+            owner_cells: &[[0, 0]],
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let weights = PixelWeights::prepare(&stencils, &window, 32, &pool).unwrap();
+        assert_eq!(weights.bytes(), 32);
+        let stencil = stencils[0][0].as_ref().unwrap();
+        let mut scratch = WeightScratch::new(4);
+        for i in 0..2 {
+            let point = [i as f64 + 0.5, 1.5];
+            let expected = stencil
+                .polygon
+                .square_weights(square.unwrap(), point, &mut scratch);
+            assert_eq!(
+                weights
+                    .get(i, 4)
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        assert!(weights.get(2, 4).is_none());
+        let empty = PixelWeights::prepare(&stencils, &window, 0, &pool).unwrap();
+        assert_eq!(empty.bytes(), 0);
+        assert!(empty.get(0, 4).is_none());
+    }
+
+    #[test]
     fn davis_endpoint_intersection_uses_polyline_midpoint() {
         let point = face_application(
             &[
@@ -1376,5 +1578,57 @@ mod tests {
     fn invalid_face_geometry_is_rejected() {
         assert!(face_application(&[[0.0, f64::NAN], [1.0, 1.0]], [[0.0; 2]; 2]).is_err());
         assert!(face_application(&[[0.0; 2]], [[0.0; 2]; 2]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod boundary_surface_tests {
+    use super::*;
+    fn fixture() -> (Vec<Vec<Option<CellStencil>>>, Vec<PreparedProfile>) {
+        let points = vec![[0., 0.], [1., 0.], [1., 1.], [0., 1.]];
+        let polygon = PolygonStencil::new(points.clone()).unwrap();
+        let stencil = CellStencil {
+            physical_ring: points,
+            polygon,
+            square: Some([0., 0., 1., 1.]),
+            corners: vec![[0, 0]; 4],
+            faces: vec![],
+            elevations: None,
+        };
+        let profile = PreparedProfile {
+            local_values: vec![vec![2.; 4]],
+            face_values: vec![vec![]],
+            depth_weights: vec![vec![]],
+            horizontal: vec![None],
+            wet: vec![true],
+            options: Options::default(),
+        };
+        (vec![vec![Some(stencil)]], vec![profile])
+    }
+    #[test]
+    fn signed_boundary_surface_preserves_dry_side_without_changing_raster_visibility() {
+        let (stencils, profiles) = fixture();
+        let mut scratch = WeightScratch::new(0);
+        let surface = boundary_surface_value(&stencils, &profiles, 0, 0, [0.5, 0.5], &mut scratch)
+            .unwrap()
+            .unwrap();
+        assert_eq!(surface.to_bits(), 2f32.to_bits());
+        assert_eq!(Some(surface - 10001.), Some(-9999.));
+        assert!(deliver_pixel(surface, 10001., 0.001).is_none());
+    }
+    #[test]
+    fn boundary_surface_rejects_faces_and_retains_explicit_missing_cells() {
+        let (stencils, mut profiles) = fixture();
+        let mut scratch = WeightScratch::new(0);
+        profiles[0].wet[0] = false;
+        assert_eq!(
+            boundary_surface_value(&stencils, &profiles, 0, 0, [0.5, 0.5], &mut scratch).unwrap(),
+            None
+        );
+        profiles[0].options.render_mode = RenderMode::WithFaces;
+        assert!(matches!(
+            boundary_surface_value(&stencils, &profiles, 0, 0, [0.5, 0.5], &mut scratch),
+            Err(MapError::Unsupported(_))
+        ));
     }
 }
