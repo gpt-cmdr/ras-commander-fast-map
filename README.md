@@ -1,5 +1,7 @@
 # RAS Commander Fast-Map
 
+<p align="center"><img src="docs/images/logo/ras-commander-fast-map_logo.svg" alt="RAS Commander Fast-Map: Native Rust Mapping Engine" width="450"></p>
+
 Native Rust 2D flood inundation mapping, distributed as the
 `ras-commander-fast-map` Rust crate and Python wheel. It maps computed hydraulic
 results; it does not run the HEC-RAS hydraulic solver.
