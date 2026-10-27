@@ -438,6 +438,18 @@ pub fn run_with_session(
     if planned > req.max_working_bytes {
         return Err(MapError::Budget("sloping array plan exceeds budget".into()));
     }
+    let key = if session.is_some() {
+        geometry_key(req, base)?
+    } else {
+        String::new()
+    };
+    // Release an incompatible previous model before opening/loading this one.
+    if let Some(s) = session.as_mut()
+        && s.geometry.as_ref().is_some_and(|(old, _)| old != &key)
+    {
+        s.geometry = None;
+        s.window = None;
+    }
     let terrain_path = model::resolve(base, &req.terrain);
     let terrain_key = if session.is_some() {
         format!(
@@ -581,11 +593,6 @@ pub fn run_with_session(
                 s.pool = Some((req.threads, pool.clone()));
             }
             let tick = Instant::now();
-            let key = if session.is_some() {
-                geometry_key(req, base)?
-            } else {
-                String::new()
-            };
             let geometry_reused = session
                 .as_ref()
                 .is_some_and(|s| s.geometry.as_ref().is_some_and(|(old, _)| old == &key));
