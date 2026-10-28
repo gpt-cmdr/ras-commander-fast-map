@@ -133,6 +133,34 @@ output is required, and retain comparison evidence for the intended model.
 This separate polygon layer does not change the existing Depth/WSE raster
 methods, their float32 arithmetic or their qualification claims.
 
+## Top-priority source terrain (no RAS Mapper export)
+
+RAS Mapper writes stored maps per terrain source, on each source's own grid.
+`sloping` (plain) and `horizontal` requests may map directly on the original
+TIFF of the highest-priority source of a multi-source terrain, instead of a
+RAS Mapper terrain export, by adding:
+
+```json
+"terrain_scope": {"kind": "top_priority_source", "source_count": 2,
+  "mask": {"path": "mask.u1", "dtype": "|u1", "shape": [513, 65536]}}
+```
+
+`mask` is the source's full level-0 tile mask from the terrain HDF
+(`Terrain/<source>/0/Mask`, tiles row-major); bit 0 is the source footprint.
+Owned pixels outside the footprint are refused unless the result cannot
+depend on their terrain: sloping pixels of cells that fail the native wet gate
+are never drawn. Foreign pixels of wet cells, foreign pixels in horizontal
+rendering and cell-face sloping are refused (method
+`top-priority-source-footprint/1`). Boundary requests refuse it.
+
+Qualification (plain sloping, native HEC-RAS 7.0.1, two-source Terrain50):
+BaldEagleCrkMulti2D bridges p05 Max on the priority-1 `dtm_20ft` TIFF matches
+in all 973,902 valid pixels and float32 bits, with 28 foreign 2D pixels all in
+dry cells; the dam-break p07 2D cells also match for Max and one output time.
+Lower-priority sources are not mosaicked: RAS Mapper's export resamples them
+with a rule close to, but not, pixel-centre bilinear (84% of float32 values
+reproduced), so a native mosaic is unqualified.
+
 ## Qualification and limits
 
 The retained [five-model comparisons](https://rascommander.info/ras/development/fim-mapping-performance/)
