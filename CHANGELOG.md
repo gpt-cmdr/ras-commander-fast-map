@@ -12,6 +12,14 @@ products are identical). Duration is opt-in and unqualified. Irregular output in
 allowed. The horizontal runner gains an internal profile-consumer hook;
 horizontal products are unchanged.
 
+Map on the original TIFF of a multi-source terrain's highest-priority source
+without a RAS Mapper export (`terrain_scope`, method
+`top-priority-source-footprint/1`). The footprint is bit 0 of the source's
+level-0 terrain-HDF tile mask. Owned pixels outside it are allowed only in
+sloping cells that fail the native wet gate; everything else outside it is
+refused. BaldEagleCrkMulti2D bridges p05 Max (plain sloping, two sources)
+matches native HEC-RAS 7.0.1 bit for bit without HEC-RAS.
+
 ## 0.10.0
 
 Add the separate `boundary` CLI and Rust boundary API with method ID
