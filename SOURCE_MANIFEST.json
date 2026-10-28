@@ -4,7 +4,7 @@
     "build.rs": "8d7facd37ac576f55b3758a67033185d5ff6cb19c2430d8d25edf72b2fca7510",
     "Cargo.lock": "01151d47713795657bee3f846bd7e9c55d9014746c0b44cfdb17f82a1eb448b6",
     "Cargo.toml": "4e2db8606631f47c75dd5cd5064bcdfa5b7c0f49bdc81d24222bd85f0c42ee70",
-    "CHANGELOG.md": "db25626735527a46c505fa490ce0b95f79a49f8784fec5eb1ff5bbd02fa60ad4",
+    "CHANGELOG.md": "978180fde22aaa246fca3af165680b654d80b62e24ab0c8bbdf7a86adaa17f35",
     "examples/sloping_components.rs": "e740ab3577215e345abd04cb0e39dc54019e5d757c56745384fdb8bb6912e876",
     "examples/sloping_raster.rs": "f022e78cba9d7755f2091e0b246660b4456c324a525484b8b86f77623ca7ca98",
     "examples/velocity_probe.rs": "6646260458ba946b4fbe8869c68b87e3fb66ba6526d5340af157a0621578b0ba",
