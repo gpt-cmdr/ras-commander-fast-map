@@ -41,6 +41,9 @@ pub struct Request {
     pub max_working_bytes: u64,
     #[serde(default)]
     pub stream_outputs: bool,
+    /// Declares `terrain` as the top-priority source of a registered terrain.
+    #[serde(default)]
+    pub terrain_scope: Option<crate::terrain_scope::TerrainScope>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +60,7 @@ pub fn method_record() -> Value {
         "native_ownership":true,
         "terrain":"same-CRS north-up square float32 GeoTIFF; native terrio block reads once per window",
         "reuse":"terrain and ownership shared across all profiles; pixel parallelism inside bounded Rayon pool",
+        "terrain_scope":crate::terrain_scope::METHOD_ID,
         "scope":"2D horizontal cells only; no native sloping, 1D or structure renderer"})
 }
 fn bytes(count: usize, width: usize) -> Result<u64, MapError> {
@@ -169,6 +173,9 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
         .checked_mul(height)
         .filter(|n| *n > 0 && *n <= model::MAX_PROFILE_PIXELS as usize)
         .ok_or_else(|| MapError::Budget("horizontal window empty or too large".into()))?;
+    if let Some(scope) = &req.terrain_scope {
+        scope.validate()?;
+    }
     let mut ids = HashSet::new();
     for p in &req.profiles {
         model::validate_id(&p.id)?;
@@ -179,7 +186,14 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
     // Fixed resident cache plus conservative array/IO-copy admission. Decoder transients are
     // included separately after inspecting the terrain layout; this is not an OS RSS cap.
     let cache = 64_u64 << 20;
+    let scope_bytes = if req.terrain_scope.is_some() {
+        bytes(width + 2, height + 2)?
+    } else {
+        0
+    };
     let planned = bytes(count, 40)?
+        .checked_add(scope_bytes)
+        .ok_or_else(|| MapError::Budget("size overflow".into()))?
         .checked_add(bytes(req.cell_count, 64)?)
         .and_then(|v| v.checked_add(cache))
         .ok_or_else(|| MapError::Budget("size overflow".into()))?;
@@ -339,6 +353,19 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
                 }
             }
             report["terrain_prepare_seconds"] = terrain_started.elapsed().as_secs_f64().into();
+            if let Some(scope) = &req.terrain_scope {
+                let scoped =
+                    crate::terrain_scope::check(scope, base, &terrain, req.window, &owner)?;
+                report["terrain_scope"] = scoped.record;
+                // Horizontal requests carry no cell minimum, so a foreign pixel's
+                // visibility cannot be bounded without its terrain: refuse.
+                if !scoped.foreign.is_empty() {
+                    return Err(MapError::Unsupported(format!(
+                        "{} mapped pixels need terrain outside the top-priority source's interior; lower-priority sources and stitches are not qualified",
+                        scoped.foreign.len()
+                    )));
+                }
+            }
             for p in &req.profiles {
                 let tick = Instant::now();
                 let dir = out.join(&p.id);
