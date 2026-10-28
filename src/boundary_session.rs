@@ -358,6 +358,13 @@ fn execute(req: &Request, base: &Path, out: &Path, report: &mut Value) -> Result
     {
         return Err(invalid("unsupported boundary schema/interpolation/options"));
     }
+    if m.velocity_normals_files.is_some()
+        || m.profiles.iter().any(|p| p.face_velocity_files.is_some())
+    {
+        return Err(MapError::Unsupported(
+            "velocity products are not part of boundary requests".into(),
+        ));
+    }
     if m.epsg == 0
         || m.threads == 0
         || m.threads > 64

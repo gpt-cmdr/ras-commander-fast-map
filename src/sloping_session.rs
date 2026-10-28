@@ -90,6 +90,11 @@ pub struct Request {
     pub max_working_bytes: u64,
     #[serde(default)]
     pub stream_outputs: bool,
+    /// Per mesh: HDF-ordered float32 (x, y, polyline length) face normals.
+    /// With it, every profile supplies `face_velocity_files` and a velocity
+    /// magnitude product is rendered (method `rasmapper-sloping-velocity/0`).
+    #[serde(default)]
+    pub velocity_normals_files: Option<Vec<String>>,
 }
 
 fn one_profile() -> usize {
@@ -125,6 +130,7 @@ fn map_batch<T: Sync, R: Send>(
 struct RenderedProfile {
     depth: Vec<f32>,
     wse: Vec<f32>,
+    velocity: Option<Vec<f32>>,
     hydraulic_seconds: f64,
     render_seconds: f64,
 }
@@ -139,18 +145,19 @@ fn render(
     pool: &rayon::ThreadPool,
     options: sloping::Options,
     weights: Option<&sloping::PixelWeights>,
+    normals: Option<&[Vec<crate::velocity::FaceNormal>]>,
 ) -> Result<RenderedProfile, MapError> {
     let tick = Instant::now();
     let mut prepared = Vec::new();
+    let mut cell_values = Vec::new();
     for ((mesh, stencil), filename) in meshes.iter().zip(stencils).zip(&profile.values_files) {
+        let wse = values(&model::resolve(base, filename), mesh.cells.len())?;
         prepared.push(sloping::prepare_profile_with_options(
-            mesh,
-            stencil,
-            &values(&model::resolve(base, filename), mesh.cells.len())?,
-            0.001,
-            pool,
-            options,
+            mesh, stencil, &wse, 0.001, pool, options,
         )?);
+        if normals.is_some() {
+            cell_values.push(wse);
+        }
     }
     let hydraulic_seconds = tick.elapsed().as_secs_f64();
     let tick = Instant::now();
@@ -168,9 +175,39 @@ fn render(
                 }
             })
     });
+    let velocity = match (normals, &profile.face_velocity_files) {
+        (Some(normals), Some(files)) => {
+            let mut face_velocity = Vec::new();
+            for (mesh, file) in meshes.iter().zip(files) {
+                face_velocity.push(crate::velocity::read_face_velocity(
+                    &model::resolve(base, file),
+                    mesh.faces.len(),
+                )?);
+            }
+            let inputs: Vec<_> = meshes
+                .iter()
+                .zip(stencils)
+                .zip(&cell_values)
+                .zip(normals)
+                .zip(&face_velocity)
+                .map(|((((mesh, stencil), wse), normal), velocity)| {
+                    (
+                        mesh,
+                        stencil.as_slice(),
+                        wse.as_slice(),
+                        normal.as_slice(),
+                        velocity.as_slice(),
+                    )
+                })
+                .collect();
+            Some(crate::velocity::render(&inputs, window, &depth, pool)?)
+        }
+        _ => None,
+    };
     Ok(RenderedProfile {
         depth,
         wse,
+        velocity,
         hydraulic_seconds,
         render_seconds,
     })
@@ -181,6 +218,9 @@ fn render(
 pub struct Profile {
     pub id: String,
     pub values_files: Vec<String>,
+    /// Per mesh: HDF-ordered float32 face-normal velocities of this profile.
+    #[serde(default)]
+    pub face_velocity_files: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -302,6 +342,7 @@ pub fn method_record() -> Value {
         "native_donation_history":true,
         "bounded_profile_concurrency":true,
         "persistent_session":true,"bounded_pixel_weights":true,
+        "velocity":crate::velocity::METHOD_ID,
         "options":{"CellRenderMode":"Sloping","CellStencilMode":"JustFacepoints",
             "FacepointAdjustmentMode":"None","ShallowBehaviorMode":"None",
             "UseDepthWeightedFaces":false,"FaceWSMode":"Adjusted"},
@@ -379,6 +420,23 @@ pub fn run_with_session(
         || req.profiles.is_empty()
     {
         return Err(MapError::Invalid("invalid sloping request".into()));
+    }
+    if let Some(files) = &req.velocity_normals_files
+        && files.len() != req.mesh_files.len()
+    {
+        return Err(MapError::Invalid(
+            "velocity_normals_files needs one file per mesh".into(),
+        ));
+    }
+    if req.profiles.iter().any(|p| {
+        p.face_velocity_files.is_some() != req.velocity_normals_files.is_some()
+            || p.face_velocity_files
+                .as_ref()
+                .is_some_and(|f| f.len() != req.mesh_files.len())
+    }) {
+        return Err(MapError::Invalid(
+            "velocity_normals_files and every profile's face_velocity_files (one per mesh) go together".into(),
+        ));
     }
     let mut ids = HashSet::new();
     for profile in &req.profiles {
@@ -624,6 +682,25 @@ pub fn run_with_session(
                 s.geometry = Some((key.clone(), geometry.clone()));
             }
             let (meshes, stencils) = &*geometry;
+            let velocity_normals = req
+                .velocity_normals_files
+                .as_ref()
+                .map(|files| -> Result<Vec<_>, MapError> {
+                    files
+                        .iter()
+                        .zip(meshes)
+                        .map(|(file, mesh)| {
+                            crate::velocity::read_normals(
+                                &model::resolve(base, file),
+                                mesh.faces.len(),
+                            )
+                        })
+                        .collect()
+                })
+                .transpose()?;
+            if velocity_normals.is_some() {
+                report["velocity"] = json!({"method": crate::velocity::method_record()});
+            }
             report["session"] = json!({"terrain_reused":terrain_reused,"geometry_reused":geometry_reused,"retained_window_budget_bytes":persistent_bytes});
             for &[mesh, cell] in &req.owner_cells {
                 if mesh >= meshes.len()
@@ -834,6 +911,7 @@ pub fn run_with_session(
                         &pool,
                         req.options,
                         data.weights.as_ref(),
+                        velocity_normals.as_deref(),
                     )
                 })?;
                 // Indexed collection and ordered emission preserve the pipe/report
@@ -842,6 +920,7 @@ pub fn run_with_session(
                     let RenderedProfile {
                         depth,
                         wse,
+                        velocity,
                         hydraulic_seconds,
                         render_seconds,
                     } = rendered;
@@ -850,17 +929,24 @@ pub fn run_with_session(
                     if req.stream_outputs {
                         let mut stream =
                             std::io::BufWriter::with_capacity(65536, std::io::stdout().lock());
-                        writeln!(
-                            stream,
-                            "{}",
-                            json!({"id":profile.id,"status":"complete","pixels":count})
-                        )?;
+                        let mut header =
+                            json!({"id":profile.id,"status":"complete","pixels":count});
+                        if velocity.is_some() {
+                            header["velocity"] = true.into();
+                        }
+                        writeln!(stream, "{header}")?;
                         crate::horizontal::write_f32(&mut stream, &depth)?;
                         crate::horizontal::write_f32(&mut stream, &wse)?;
+                        if let Some(velocity) = &velocity {
+                            crate::horizontal::write_f32(&mut stream, velocity)?;
+                        }
                         stream.flush()?;
                     } else {
                         crate::horizontal::write_values(&dir.join("depth.bin"), &depth)?;
                         crate::horizontal::write_values(&dir.join("wse.bin"), &wse)?;
+                        if let Some(velocity) = &velocity {
+                            crate::horizontal::write_values(&dir.join("velocity.bin"), velocity)?;
+                        }
                     }
                     let unit = json!({"id":profile.id,"status":"complete","hydraulic_seconds":hydraulic_seconds,"render_seconds":render_seconds});
                     sink::write_json(&dir.join("unit.json"), &unit)?;

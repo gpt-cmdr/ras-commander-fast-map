@@ -490,6 +490,12 @@ fn cross(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> f64 {
 }
 
 impl WeightScratch {
+    /// Clears the retained donation scratch (native: every 256 points).
+    pub(crate) fn clear_donation_history(&mut self) {
+        self.clockwise.fill(0.);
+        self.counterclockwise.fill(0.);
+    }
+
     pub fn new(vertices: usize) -> Self {
         Self {
             clipped: false,
@@ -758,6 +764,76 @@ pub fn prepare_stencils(
             }))
         })
         .collect()
+}
+
+impl CellStencil {
+    /// Corner (vertex, incident-face slot) pairs in ring order.
+    pub(crate) fn corner_slots(&self) -> impl Iterator<Item = [usize; 2]> + '_ {
+        self.corners.iter().copied()
+    }
+    /// Face ids in ring order (face i joins corner i and corner i + 1).
+    pub(crate) fn face_ids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.faces.iter().map(|f| f[0])
+    }
+    /// Native face-donation node weights at `point`: `n` corner weights then
+    /// `n` face weights, binary32, as used by cell-face sloping painting.
+    pub(crate) fn donated_weights(
+        &self,
+        point: [f64; 2],
+        scratch: &mut WeightScratch,
+    ) -> Result<Vec<f32>, MapError> {
+        self.donated_weights_with_history(point, scratch, false)
+    }
+
+    /// True when the last weights were clipped such that a corner's neighbours
+    /// both carry zero weight: native donation then depends on scratch history.
+    pub(crate) fn history_sensitive(&self, scratch: &WeightScratch) -> bool {
+        let n = self.corners.len();
+        scratch.clipped
+            && (0..n)
+                .any(|k| scratch.weights[(k + n - 1) % n] + scratch.weights[(k + 1) % n] == 0.0)
+    }
+
+    /// As `donated_weights`; with `retain`, clockwise/counter-clockwise
+    /// donations of corners with zero-weight neighbours keep the previous
+    /// pixel's values (native scratch history).
+    pub(crate) fn donated_weights_with_history(
+        &self,
+        point: [f64; 2],
+        scratch: &mut WeightScratch,
+        retain: bool,
+    ) -> Result<Vec<f32>, MapError> {
+        let n = self.corners.len();
+        scratch.resize(n);
+        if let Some(bounds) = self.square {
+            self.polygon.square_weights(bounds, point, scratch);
+        } else {
+            self.polygon.weights(point, scratch)?;
+        }
+        for i in 0..n {
+            let previous = (i + n - 1) % n;
+            let next = (i + 1) % n;
+            let adjacent = scratch.weights[previous] + scratch.weights[next];
+            if !retain {
+                scratch.clockwise[i] = 0.0;
+                scratch.counterclockwise[i] = 0.0;
+            }
+            if adjacent != 0.0 {
+                let fraction = scratch.weights[i] / adjacent;
+                scratch.clockwise[i] = fraction * scratch.weights[previous];
+                scratch.counterclockwise[i] = fraction * scratch.weights[next];
+            }
+            scratch.donated[i] = scratch.weights[i];
+        }
+        for i in 0..n {
+            let next = (i + 1) % n;
+            let donation = scratch.counterclockwise[i].min(scratch.clockwise[next]);
+            scratch.donated[i] -= donation;
+            scratch.donated[next] -= donation;
+            scratch.donated[n + i] = donation * 2.0;
+        }
+        Ok(scratch.donated[..2 * n].to_vec())
+    }
 }
 
 /// Optional native stored corner elevations, required only for depth weighting.

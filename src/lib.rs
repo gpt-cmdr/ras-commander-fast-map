@@ -41,6 +41,7 @@ mod sloping_binary;
 pub mod sloping_session;
 pub mod step05;
 pub mod terrain;
+pub mod velocity;
 
 use std::fmt;
 
