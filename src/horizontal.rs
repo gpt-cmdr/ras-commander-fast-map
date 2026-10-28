@@ -19,7 +19,7 @@ use std::{
 };
 
 pub const SCHEMA: &str = "ras2fim-horizontal-request/1";
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub schema: String,
@@ -42,7 +42,7 @@ pub struct Request {
     #[serde(default)]
     pub stream_outputs: bool,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     pub id: String,
@@ -77,6 +77,10 @@ fn read_bytes(path: &Path, expected: u64) -> Result<Vec<u8>, MapError> {
         return Err(MapError::Invalid("input size changed".into()));
     }
     Ok(data)
+}
+/// One little-endian float32 per cell; NaN allowed, infinities rejected.
+pub(crate) fn read_cell_values(path: &Path, count: usize) -> Result<Vec<f32>, MapError> {
+    read_values(path, count)
 }
 fn read_values(path: &Path, count: usize) -> Result<Vec<f32>, MapError> {
     let raw = read_bytes(path, bytes(count, 4)?)?;
@@ -149,7 +153,54 @@ fn evaluate(
             Ok(())
         })
 }
+/// One pixel of [`evaluate`] without an added cutoff: the native float32 plot
+/// test, then subtraction. Returns the depth of a visible pixel.
+#[inline]
+pub(crate) fn plot(value: f32, ground: f32) -> Result<Option<f32>, MapError> {
+    if !ground.is_finite() || value.is_nan() {
+        return Ok(None);
+    }
+    let delta = value - ground;
+    if delta.is_infinite() {
+        return Err(MapError::Invalid("float32 depth overflow".into()));
+    }
+    Ok((value >= ground + 0.001_f32).then_some(delta))
+}
+
 pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
+    run_with(req, base, out, None)
+}
+
+#[cfg(test)]
+pub(crate) fn evaluate_for_test(
+    owner: &[u32],
+    ground: &[f32],
+    values: &[f32],
+    depth: &mut [f32],
+    wse: &mut [f32],
+) {
+    evaluate(owner, ground, values, 0.0, depth, wse).unwrap();
+}
+
+/// Receives the prepared window once, then each profile's raw values in
+/// request order, instead of rendered products being delivered.
+pub(crate) trait Consumer: Send {
+    /// Window ownership (0 = none, else cell position + 1) and terrain
+    /// (NaN = nodata), after AOI masking.
+    fn prepare(&mut self, owner: &[u32], ground: &[f32]) -> Result<(), MapError>;
+    /// Cell WSE (NaN = dry) of one profile.
+    fn profile(&mut self, position: usize, values: &[f32]) -> Result<(), MapError>;
+}
+
+/// Runs the horizontal pipeline. With a consumer, profiles are handed to it in
+/// request order instead of being delivered as products; any profile failure
+/// then aborts the whole run.
+pub(crate) fn run_with(
+    req: &Request,
+    base: &Path,
+    out: &Path,
+    mut consumer: Option<&mut dyn Consumer>,
+) -> Result<Value, MapError> {
     let started = Instant::now();
     if req.schema != SCHEMA
         || !(1..=64).contains(&req.threads)
@@ -339,9 +390,21 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
                 }
             }
             report["terrain_prepare_seconds"] = terrain_started.elapsed().as_secs_f64().into();
-            for p in &req.profiles {
+            for (position, p) in req.profiles.iter().enumerate() {
                 let tick = Instant::now();
                 let dir = out.join(&p.id);
+                if let Some(consume) = consumer.as_mut() {
+                    if position == 0 {
+                        pool.install(|| consume.prepare(&owner, &ground))?;
+                    }
+                    let values =
+                        read_values(&model::resolve(base, &p.values_file), req.cell_count)?;
+                    pool.install(|| consume.profile(position, &values))?;
+                    report["profiles"].as_array_mut().unwrap().push(
+                        json!({"id":p.id,"status":"complete","seconds":tick.elapsed().as_secs_f64()}),
+                    );
+                    continue;
+                }
                 fs::create_dir(&dir)?;
                 let result = (|| -> Result<(), MapError> {
                     let values =
