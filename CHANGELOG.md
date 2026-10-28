@@ -15,6 +15,24 @@ Davis p02 Max differs in 5 of 20,560 pixels by at most 2 ulp. D x V, D x V^2
 and Froude helpers are added; shear stress and Max derived products are not.
 The `velocity_probe` example renders velocity for research comparisons.
 
+Add `whole-simulation` (`native-whole-simulation-horizontal/1`): arrival time,
+duration and percent time inundated from every stored output time, through the
+horizontal renderer over physical 2D cells, in bounded memory.
+It uses RAS Mapper's thresholded cell gate, its duration end rule and float32
+times. Davis p02 and BaldEagleCrkMulti2D bridges p05 match native HEC-RAS 7.0.1
+in every valid pixel, arrival and percent value (horizontal and sloping native
+products are identical). Duration is opt-in and unqualified. Irregular output intervals are refused unless explicitly
+allowed. The horizontal runner gains an internal profile-consumer hook;
+horizontal products are unchanged.
+
+Map on the original TIFF of a multi-source terrain's highest-priority source
+without a RAS Mapper export (`terrain_scope`, method
+`top-priority-source-footprint/1`). The footprint is bit 0 of the source's
+level-0 terrain-HDF tile mask. Owned pixels outside it are allowed only in
+sloping cells that fail the native wet gate; everything else outside it is
+refused. BaldEagleCrkMulti2D bridges p05 Max (plain sloping, two sources)
+matches native HEC-RAS 7.0.1 bit for bit without HEC-RAS.
+
 ## 0.10.0
 
 Add the separate `boundary` CLI and Rust boundary API with method ID

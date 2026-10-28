@@ -95,6 +95,10 @@ pub struct Request {
     /// magnitude product is rendered (method `rasmapper-sloping-velocity/0`).
     #[serde(default)]
     pub velocity_normals_files: Option<Vec<String>>,
+
+    /// Declares `terrain` as the top-priority source of a registered terrain.
+    #[serde(default)]
+    pub terrain_scope: Option<crate::terrain_scope::TerrainScope>,
 }
 
 fn one_profile() -> usize {
@@ -146,6 +150,7 @@ fn render(
     options: sloping::Options,
     weights: Option<&sloping::PixelWeights>,
     normals: Option<&[Vec<crate::velocity::FaceNormal>]>,
+    foreign: &[usize],
 ) -> Result<RenderedProfile, MapError> {
     let tick = Instant::now();
     let mut prepared = Vec::new();
@@ -159,6 +164,9 @@ fn render(
             cell_values.push(wse);
         }
     }
+    crate::terrain_scope::deny_wet_foreign(foreign, window.owner, window.owner_cells, |m, c| {
+        prepared[m].is_wet(c)
+    })?;
     let hydraulic_seconds = tick.elapsed().as_secs_f64();
     let tick = Instant::now();
     let (mut depth, mut wse) =
@@ -343,6 +351,8 @@ pub fn method_record() -> Value {
         "bounded_profile_concurrency":true,
         "persistent_session":true,"bounded_pixel_weights":true,
         "velocity":crate::velocity::METHOD_ID,
+
+        "terrain_scope":crate::terrain_scope::METHOD_ID,
         "options":{"CellRenderMode":"Sloping","CellStencilMode":"JustFacepoints",
             "FacepointAdjustmentMode":"None","ShallowBehaviorMode":"None",
             "UseDepthWeightedFaces":false,"FaceWSMode":"Adjusted"},
@@ -404,6 +414,14 @@ pub fn run_with_session(
     mut session: Option<&mut PreparedSession>,
 ) -> Result<Value, MapError> {
     req.options.validate()?;
+    if let Some(scope) = &req.terrain_scope {
+        scope.validate()?;
+        if req.options.render_mode == sloping::RenderMode::WithFaces {
+            return Err(MapError::Unsupported(
+                "terrain_scope is qualified for plain sloping only".into(),
+            ));
+        }
+    }
     let started = Instant::now();
     let [col, row, width, height] = req.window;
     let count = width
@@ -492,6 +510,14 @@ pub fn run_with_session(
         })
         .and_then(|v| v.checked_add(cache))
         .and_then(|v| v.checked_add(persistent_bytes))
+        // Terrain scope: one validity byte per expanded-window pixel.
+        .and_then(|v| {
+            v.checked_add(if req.terrain_scope.is_some() {
+                (width as u64 + 2) * (height as u64 + 2)
+            } else {
+                0
+            })
+        })
         .ok_or_else(|| MapError::Budget("sloping array plan overflow".into()))?;
     if planned > req.max_working_bytes {
         return Err(MapError::Budget("sloping array plan exceeds budget".into()));
@@ -900,6 +926,20 @@ pub fn run_with_session(
                 terrain: &data.ground,
                 owner_cells: &req.owner_cells,
             };
+            let foreign = match &req.terrain_scope {
+                Some(scope) => {
+                    let scoped = crate::terrain_scope::check(
+                        scope,
+                        base,
+                        &terrain,
+                        req.window,
+                        &data.owner,
+                    )?;
+                    report["terrain_scope"] = scoped.record;
+                    scoped.foreign
+                }
+                None => Vec::new(),
+            };
             for batch in req.profiles.chunks(effective) {
                 let results = map_batch(batch, &pool, |profile| {
                     render(
@@ -912,6 +952,7 @@ pub fn run_with_session(
                         req.options,
                         data.weights.as_ref(),
                         velocity_normals.as_deref(),
+                        &foreign,
                     )
                 })?;
                 // Indexed collection and ordered emission preserve the pipe/report

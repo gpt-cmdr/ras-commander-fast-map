@@ -365,6 +365,11 @@ fn execute(req: &Request, base: &Path, out: &Path, report: &mut Value) -> Result
             "velocity products are not part of boundary requests".into(),
         ));
     }
+    if m.terrain_scope.is_some() {
+        return Err(MapError::Unsupported(
+            "top-priority-source terrains are not qualified for boundaries".into(),
+        ));
+    }
     if m.epsg == 0
         || m.threads == 0
         || m.threads > 64

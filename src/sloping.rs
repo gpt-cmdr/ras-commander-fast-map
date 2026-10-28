@@ -868,6 +868,13 @@ pub struct PreparedProfile {
     options: Options,
 }
 
+impl PreparedProfile {
+    /// Native wet gate of a cell: WSE above its minimum plus the plot tolerance.
+    pub fn is_wet(&self, cell: usize) -> bool {
+        self.wet[cell]
+    }
+}
+
 pub fn prepare_profile(
     mesh: &Mesh,
     stencils: &[Option<CellStencil>],
