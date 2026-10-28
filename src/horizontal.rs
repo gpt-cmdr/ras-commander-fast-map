@@ -57,7 +57,7 @@ pub fn method_record() -> Value {
         "arithmetic":"native float32 WSE >= terrain + plot tolerance; float32 subtraction; optional strict positive depth cutoff",
         "native_plot_tolerance":0.001_f32,
         "ownership":"terrio pixel-centre polygons or supplied u32 labels; 0 dry; cell position + 1",
-        "native_ownership":true,
+        "native_ownership":true,"aoi_mask":crate::aoi::METHOD,
         "terrain":"same-CRS north-up square float32 GeoTIFF; native terrio block reads once per window",
         "reuse":"terrain and ownership shared across all profiles; pixel parallelism inside bounded Rayon pool",
         "terrain_scope":crate::terrain_scope::METHOD_ID,
@@ -292,6 +292,14 @@ pub(crate) fn run_with(
     let admitted = planned
         .checked_add(geometry_plan)
         .ok_or_else(|| MapError::Budget("geometry plan overflow".into()))?
+        .checked_add(crate::aoi::scratch_bytes(
+            req.aoi_file
+                .as_ref()
+                .map(|p| model::resolve(base, p))
+                .as_deref(),
+            req.threads,
+        )?)
+        .ok_or_else(|| MapError::Budget("AOI plan overflow".into()))?
         .checked_add(terrain.decoder_transient_bytes_per_load())
         .ok_or_else(|| MapError::Budget("terrain transient size overflow".into()))?;
     if admitted > req.max_working_bytes {
@@ -349,8 +357,9 @@ pub(crate) fn run_with(
                     crate::ownership::load(&model::resolve(base, name), req.cell_count, false)?;
                 let mut labels = pool.install(|| crate::ownership::burn(cells, grid.clone()))?;
                 if let Some(mask) = &req.aoi_file {
-                    let layer = crate::ownership::load(&model::resolve(base, mask), 1, true)?;
-                    let mask = pool.install(|| crate::ownership::burn(layer, grid))?;
+                    let mask = pool.install(|| {
+                        crate::aoi::mask(&model::resolve(base, mask), terrain.gt, req.window)
+                    })?;
                     pool.install(|| {
                         labels
                             .par_iter_mut()
