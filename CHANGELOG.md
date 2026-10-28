@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### 0.10.1 — global terrain-lattice AOI masks
+
+Horizontal and sloping polygon AOIs use `global-terrain-lattice/1` coverage.
+AOI vertices are converted once to source pixel units. Scanline crossings and
+pixel centers remain in global coordinates; integer output windows only select
+which pixels are emitted. Lower-y endpoints and left span endpoints are
+included, upper-y and right endpoints excluded; y increases northward. There
+is no geometric epsilon. This removes crop-origin rounding differences when an
+edge passes through pixel centers. Holes, multipart polygons, ring reversal and
+bounded Rayon workers are supported. Worker scratch is admitted before reads.
+
+This intentionally changes AOI edge inclusion relative to legacy GDAL/terrio
+masks at numerical boundary ties. Hydraulic cell ownership still uses terrio;
+surface reconstruction, intrinsic visibility tolerance and float32 arithmetic
+are unchanged. Method records advertise `aoi_mask`; no request schema changed.
+
 Add the `velocity` method (`rasmapper-sloping-velocity/0`) to `sloping`
 requests: optional per-mesh `velocity_normals_files` (HDF face normals with
 polyline face lengths) and per-profile `face_velocity_files` render a velocity

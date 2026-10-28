@@ -40,6 +40,24 @@ Commander. The CLI does not read a plan HDF directly.
 
 ## Methods and resource controls
 
+### Polygon AOI edge rule (0.10.1)
+
+Horizontal/sloping method records advertise `aoi_mask="global-terrain-lattice/1"`.
+AOI coverage is computed in source terrain pixel units, at global pixel centers,
+with y increasing northward. Even-odd scanlines include lower-y/exclude upper-y
+endpoints; filled spans include the left endpoint and exclude the right.
+For a rectangle this includes its minimum x/y edges and excludes its maximum
+x/y edges. Holes and disjoint polygon parts retain the same rule. No epsilon
+is added, and ring reversal does not change coverage. A cropped mask equals
+the corresponding crop of a full-grid mask, including pixel-center edge ties.
+
+The rule deliberately replaces origin-dependent legacy AOI masking. It need
+not reproduce legacy GDAL edge ties. Cell ownership and hydraulic interpolation
+are unchanged. AOI rows use the request's bounded Rayon pool; planned geometry
+and per-worker crossing scratch are admitted before payload reads. The pure
+Rust `aoi::mask` function accepts a framed Polygon/MultiPolygon WKB path, full
+source geotransform and integer source window.
+
 - Horizontal: cell-constant WSE with native float32 visibility.
 - Sloping: reconstructed cell corners; optional cell faces, depth weighting,
   and shallow-to-horizontal selection.

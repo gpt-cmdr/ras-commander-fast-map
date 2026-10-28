@@ -26,6 +26,7 @@ pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Source revision of an official build, or `unknown` for an unversioned archive.
 pub const ENGINE_COMMIT: &str = env!("FAST_MAP_ENGINE_COMMIT");
 
+pub mod aoi;
 pub mod boundary_contour;
 pub mod boundary_session;
 pub mod cache;

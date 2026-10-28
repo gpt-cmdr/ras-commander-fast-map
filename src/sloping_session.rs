@@ -344,7 +344,7 @@ impl Geometry {
 
 pub fn method_record() -> Value {
     json!({"method_id":"rasmapper-plain-sloping/1", "backend":"rust", "experimental":true,
-        "native_version_qualified":"7.0.1", "stream_outputs":true, "native_ownership":true,
+        "native_version_qualified":"7.0.1", "stream_outputs":true, "native_ownership":true,"aoi_mask":crate::aoi::METHOD,
         "enhanced_options":true,"enhanced_method_id":"rasmapper-sloping-with-faces/1",
         "depth_weighted_faces":true,
         "native_donation_history":true,
@@ -489,6 +489,13 @@ pub fn run_with_session(
     // JSON parsing, topology, stencils, one hydraulic profile and IO copies are
     // conservatively admitted, rather than claiming an OS-enforced RSS limit.
     let persistent_bytes = if session.is_some() { 64_u64 << 20 } else { 0 };
+    let aoi_scratch = crate::aoi::scratch_bytes(
+        req.aoi_file
+            .as_ref()
+            .map(|p| model::resolve(base, p))
+            .as_deref(),
+        req.threads,
+    )?;
     let planned = (count as u64)
         .checked_mul(
             if req.options.render_mode == sloping::RenderMode::WithFaces {
@@ -510,6 +517,7 @@ pub fn run_with_session(
         })
         .and_then(|v| v.checked_add(cache))
         .and_then(|v| v.checked_add(persistent_bytes))
+        .and_then(|v| v.checked_add(aoi_scratch))
         // Terrain scope: one validity byte per expanded-window pixel.
         .and_then(|v| {
             v.checked_add(if req.terrain_scope.is_some() {
@@ -794,8 +802,9 @@ pub fn run_with_session(
                 )?;
                 let mut owner = pool.install(|| crate::ownership::burn(cells, grid.clone()))?;
                 if let Some(filename) = &req.aoi_file {
-                    let aoi = crate::ownership::load(&model::resolve(base, filename), 1, true)?;
-                    let mask = pool.install(|| crate::ownership::burn(aoi, grid))?;
+                    let mask = pool.install(|| {
+                        crate::aoi::mask(&model::resolve(base, filename), terrain.gt, req.window)
+                    })?;
                     pool.install(|| {
                         owner
                             .par_iter_mut()
