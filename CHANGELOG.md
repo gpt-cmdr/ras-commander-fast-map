@@ -1,8 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.10.1 — 2026-10-28
 
-### 0.10.1 — global terrain-lattice AOI masks
+First published release since 0.8.0. It includes every change listed under
+0.10.1, 0.10.0 and 0.9.0 below; 0.9.0 and 0.10.0 were never published to
+PyPI or crates.io.
+
+### Global terrain-lattice AOI masks
 
 Horizontal and sloping polygon AOIs use `global-terrain-lattice/1` coverage.
 AOI vertices are converted once to source pixel units. Scanline crossings and
@@ -17,6 +21,8 @@ This intentionally changes AOI edge inclusion relative to legacy GDAL/terrio
 masks at numerical boundary ties. Hydraulic cell ownership still uses terrio;
 surface reconstruction, intrinsic visibility tolerance and float32 arithmetic
 are unchanged. Method records advertise `aoi_mask`; no request schema changed.
+
+### Velocity, whole-simulation products and top-priority terrain
 
 Add the `velocity` method (`rasmapper-sloping-velocity/0`) to `sloping`
 requests: optional per-mesh `velocity_normals_files` (HDF face normals with
