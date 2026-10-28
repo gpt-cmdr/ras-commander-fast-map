@@ -133,6 +133,24 @@ output is required, and retain comparison evidence for the intended model.
 This separate polygon layer does not change the existing Depth/WSE raster
 methods, their float32 arithmetic or their qualification claims.
 
+## Velocity (sloping requests)
+
+Add per-mesh `velocity_normals_files` (HDF `Faces NormalUnitVector and Length`
+as float32 x, y, length, with **length replaced by the face polyline length**)
+and per-profile `face_velocity_files` (float32 face-normal velocities; for Max,
+the summary `Maximum Face Velocity` with Max WSE as the profile values) to a
+`sloping` request. Velocity magnitude is written as `velocity.bin`, or as a
+third streamed array when the stream header has `"velocity": true`. It is drawn
+where rendered depth > 0 and does not depend on the WSE render mode (method
+`rasmapper-sloping-velocity/0`).
+
+Native HEC-RAS 7.0.1 comparison: BaldEagleCrkMulti2D bridges p05 (973,532 Max
+and 402,500 output-time pixels), dam-break p07 2D cells (Max and one output
+time, valid masks equal to depth) and a 2,500 x 2,500 Spring Creek eBFE AOI
+(1,101,529 pixels) match bit for bit; Davis p02 Max differs in 5 of 20,560
+pixels by at most 2 ulp. Storage areas, boundary requests, shear stress and Max
+derived products are outside this method.
+
 ## Whole-simulation products (arrival time, duration, percent inundated)
 
 ```bash

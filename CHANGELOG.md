@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+Add the `velocity` method (`rasmapper-sloping-velocity/0`) to `sloping`
+requests: optional per-mesh `velocity_normals_files` (HDF face normals with
+polyline face lengths) and per-profile `face_velocity_files` render a velocity
+magnitude product (`velocity.bin`, or a third streamed array when the header
+says `"velocity": true`). It reproduces RAS Mapper's stored-map reconstruction:
+C-stencil face vectors, inverse polyline-length weighted corner arcs, cell-face
+donated weights with native donation history replay, drawn where depth > 0.
+Native HEC-RAS 7.0.1: BaldEagleCrkMulti2D bridges p05 and dam-break p07 2D
+(Max and one output time each) and a Spring Creek eBFE AOI match bit for bit;
+Davis p02 Max differs in 5 of 20,560 pixels by at most 2 ulp. D x V, D x V^2
+and Froude helpers are added; shear stress and Max derived products are not.
+The `velocity_probe` example renders velocity for research comparisons.
+
 Add `whole-simulation` (`native-whole-simulation-horizontal/1`): arrival time,
 duration and percent time inundated from every stored output time, through the
 horizontal renderer over physical 2D cells, in bounded memory.
