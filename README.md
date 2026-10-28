@@ -133,6 +133,41 @@ output is required, and retain comparison evidence for the intended model.
 This separate polygon layer does not change the existing Depth/WSE raster
 methods, their float32 arithmetic or their qualification claims.
 
+## Whole-simulation products (arrival time, duration, percent inundated)
+
+```bash
+ras2fim-batch whole-simulation whole-request.json new-output-dir
+```
+
+Schema `ras-commander-whole-simulation-request/1` embeds a non-streaming
+horizontal request whose profiles are the stored output times in order, plus
+`times_hours` (one per profile, strictly increasing), `threshold`,
+`cell_minimum_file` (float32 cell minimum elevations in cell order), optional
+`products` (default `arrival_time`, `percent_inundated`) and
+`allow_unqualified` (required for `duration` and irregular intervals). Output times are evaluated sequentially over
+the mapped 2D-owned pixels only, in parallel, with 32
+bytes per mapped pixel. Products are written to `whole_simulation/<product>.bin`
+(float32, NaN = never wet).
+
+A pixel is wet when its horizontal depth is `> threshold` and its cell passes
+RAS Mapper's thresholded gate `wse > minimum + threshold`. Storage areas are
+not rendered; Commander refuses plans that contain them. Arrival is the first wet time and percent is
+`100 * wet / n`. Duration runs from arrival to the first dry time after the last
+wet one, or to the last wet time when that dry time would be the final output
+or there is none. Times are float32 hours. Irregular output intervals are
+refused unless `allow_unqualified` is set. Initially wet pixels, multi-period
+pixels and threshold-equal samples are reported.
+
+Qualification (native HEC-RAS 7.0.1, threshold 0.5 ft, storage-area-free
+models): Davis pipes/conduits p02 (217 output times, 4,879 valid pixels) and
+BaldEagleCrkMulti2D bridges p05 (433 times, 959,043 pixels) match in every
+valid-mask pixel and every arrival and percent value bit for bit, including
+initially wet, multi-period and threshold-equal samples. RAS Mapper gives the
+same products in horizontal and sloping render modes on both models, so this
+horizontal pass covers sloping maps too. Duration is opt-in and unqualified:
+103 (Davis) and 11 (bridges) native durations are one output interval shorter.
+Bridges runs in 8.9 s at 383 MiB peak against about 25 s for the native call.
+
 ## Top-priority source terrain (no RAS Mapper export)
 
 RAS Mapper writes stored maps per terrain source, on each source's own grid.
