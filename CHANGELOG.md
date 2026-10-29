@@ -28,6 +28,17 @@ slopingPretty with shallow reduction, and whole-simulation arrival time and
 percent inundated (0.5 ft), match in every valid-mask pixel and float32 bit,
 including all storage-area pixels (p07 Max 466,912; p04 Max 461,639).
 
+### Effective terrain without HEC-RAS
+
+- Add `ras2fim-batch effective-terrain` (`rasmapper-effective-terrain/1`,
+  advertised as `effective_terrain` by `ras2fim-batch method`): RAS Mapper's
+  effective terrain of an unmodified multi-source terrain from its source
+  TIFFs, level-0 tile masks and stitch TIN, without HEC-RAS. Qualified against
+  HEC-RAS 7.0.1 `export_rasmapper_terrain` on BaldEagleCrkMulti2D Terrain50
+  (197,179,058 valid px: identical mask, 8 stitch-TIN corner values differ) and
+  five synthetic HEC-RAS terrains (four bit-identical, 5 px on the fifth).
+  Terrain modifications are refused.
+
 ## 0.11.0 — 2026-10-29
 
 - Add byte-admitted LRU retention of reconstructed sloping timesteps across
