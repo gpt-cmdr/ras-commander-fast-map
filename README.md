@@ -69,7 +69,37 @@ Bbox/polygon output masks retain global hydraulic topology. Planned allocation
 admission is not a hard RSS limit. Python delivery may use Rasterio/GDAL;
 the Rust mapping executable does not link it.
 
-### Retained reach state (development)
+### Multi-polygon/timestep catalogs
+
+Use RAS Commander's `RasFim.map_catalog()` to map multiple watershed/time
+groups from computed 2D models. Give each job one selected polygon or bbox,
+the complete source HDF and qualified mapping TIFF, and an ordered list of
+saved timestep indices or `"Max"`. The Python supervisor stages native HDF
+inputs and schedules this Rust engine; the Rust crate does not read model HDF
+directly. See the [agent-ready catalog recipe](https://rascommander.info/ras/api/fim/#build-jobs-from-a-watershed-layer)
+and [throughput policy](https://rascommander.info/ras/api/fim/#choose-a-throughput-policy).
+
+Start with one reuse worker for overlapping time lists on one model/terrain.
+Bound preparation waves with `max_profiles_per_batch`. Test independent
+workers for different models or low-sharing workloads within one global
+CPU/RAM allowance. Native in-flight timesteps share the same Rayon pool;
+additional processes can duplicate geometry, staged data and caches.
+
+Fast-Map 0.11.0 provides retained hydraulic/multiple-window caches and optional
+native terrio LZW output. Commander retains Rasterio as its default writer;
+select `product_writer="native"` for supported sloping catalogs and inspect
+`RasFim.get_engine_info()` capability flags. Native cache ceilings count inside
+working-memory admission. The supervisor's per-worker prepared/headroom
+reservations and sampled memory guard also apply. Inspect total catalog wall
+time, cache reports and peak tree memory before increasing concurrency/caches.
+
+AOIs constrain raster reads and output pixels, while hydraulic dependencies
+remain global. A watershed occupying 1% of the terrain does not imply a 100x
+speedup. Keep the qualified source TIFF layout; do not crop hydraulic arrays
+or retile cell-face terrain per reach. Inspect both overall and per-row
+statuses, preserve partial receipts and use a fresh output folder for retries.
+
+### Retained reach state (0.11)
 
 The persistent sloping server additionally advertises `hydraulic_cache`,
 `multi_window_cache` and `native_geotiff_outputs`. Requests can set
@@ -93,8 +123,8 @@ completion records instead of arrays. Records include pixel counts and native
 write timing. terrio owns encoding; no GDAL/Python dependency is added to the
 engine. This route requires an EPSG-identifiable CRS and excludes velocity.
 Commander validates output metadata before delivery. Ordinary array streams
-and binary-file output remain compatible. These are development capabilities;
-use an explicit qualified build until the next release is published.
+and binary-file output remain compatible. These capabilities are included
+in 0.11.0; inspect advertised flags when integrating older binaries.
 
 Binary32 operation order and method identifiers are preserved. `MIGRATION.json`
 retains the immutable 0.8.0 extraction receipt; `SOURCE_MANIFEST.json` binds this

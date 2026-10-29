@@ -69,6 +69,7 @@ fn run(d: &Path, name: &str, s: &Value) -> (i32, Value, PathBuf) {
     (o.status.code().unwrap_or(-1), rep, out)
 }
 
+#[cfg(target_os = "linux")]
 fn files(root: &Path) -> Vec<String> {
     let mut v = Vec::new();
     let mut stack = vec![root.to_path_buf()];
