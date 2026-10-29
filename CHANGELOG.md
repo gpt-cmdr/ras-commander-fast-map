@@ -95,3 +95,12 @@ depth weighting, shallow-to-horizontal, bounded timestep concurrency, terrain
 windows, polygon masks and the separate Step05 method. The ras2fim-batch CLI,
 method IDs and request formats remain compatible. Adds package/build identity,
 crates.io metadata, wheel/release workflows and extraction source fingerprints.
+# Unreleased
+
+- Add byte-admitted LRU retention of reconstructed sloping timesteps across
+  reach windows, keyed by complete staged values and rendering options.
+- Retain multiple ownership/terrain windows under one configurable ceiling;
+  use bounded plain pixel-weight prefixes when space remains.
+- Add opt-in direct terrio LZW GeoTIFF delivery with completion records and
+  unchanged float32 raster arithmetic.
+

@@ -869,6 +869,19 @@ pub struct PreparedProfile {
 }
 
 impl PreparedProfile {
+    /// Retained heap allocation including nested vector headers/capacities.
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        fn nested(v: &Vec<Vec<f32>>) -> usize {
+            v.capacity() * std::mem::size_of::<Vec<f32>>()
+                + v.iter().map(|v| v.capacity() * 4).sum::<usize>()
+        }
+        (std::mem::size_of::<Self>()
+            + nested(&self.local_values)
+            + nested(&self.face_values)
+            + nested(&self.depth_weights)
+            + self.horizontal.capacity() * std::mem::size_of::<Option<f32>>()
+            + self.wet.capacity()) as u64
+    }
     /// Native wet gate of a cell: WSE above its minimum plus the plot tolerance.
     pub fn is_wet(&self, cell: usize) -> bool {
         self.wet[cell]

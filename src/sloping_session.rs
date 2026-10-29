@@ -1,5 +1,6 @@
 //! Explicit sloping batch path with independently selected native rendering controls. Geometry, terrain and ownership are shared
 //! across profiles; hydraulic connectivity is reconstructed for every profile.
+use crate::retained::Retained;
 use crate::{
     MapError,
     model::{self, CrsIdentity, NodataPolicy, QueryConvention},
@@ -10,7 +11,14 @@ use crate::{
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{collections::HashSet, fs, io::Write, path::Path, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    fs,
+    io::Write,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 type CachedGeometry = (Vec<Mesh>, Vec<Vec<Option<sloping::CellStencil>>>);
 type WindowKey = (
@@ -27,13 +35,14 @@ struct WindowData {
     weights: Option<sloping::PixelWeights>,
 }
 
-/// One explicitly owned, serialized native session. At most one geometry,
-/// terrain and bounded output window are retained. Dropping it releases all.
+/// One explicitly owned, serialized native session. One complete geometry and
+/// terrain share bounded LRU window and hydraulic caches. Dropping releases all.
 #[derive(Default)]
 pub struct PreparedSession {
     terrain: Option<(String, Arc<NativeTerrain>)>,
     geometry: Option<(String, Arc<CachedGeometry>)>,
-    window: Option<(WindowKey, Arc<WindowData>)>,
+    windows: Retained<WindowKey, WindowData>,
+    hydraulics: Mutex<Retained<String, Vec<sloping::PreparedProfile>>>,
     pool: Option<(usize, Arc<rayon::ThreadPool>)>,
 }
 
@@ -90,6 +99,15 @@ pub struct Request {
     pub max_working_bytes: u64,
     #[serde(default)]
     pub stream_outputs: bool,
+    /// Retained multi-window ownership/terrain/weight ceiling. Zero disables it.
+    #[serde(default = "window_budget")]
+    pub window_cache_bytes: u64,
+    /// Retained reconstructed timestep ceiling. Zero disables it.
+    #[serde(default)]
+    pub hydraulic_cache_bytes: u64,
+    /// Write native LZW GeoTIFF products and stream only their completion records.
+    #[serde(default)]
+    pub geotiff_outputs: bool,
     /// Per mesh: HDF-ordered float32 (x, y, polyline length) face normals.
     /// With it, every profile supplies `face_velocity_files` and a velocity
     /// magnitude product is rendered (method `rasmapper-sloping-velocity/0`).
@@ -103,6 +121,9 @@ pub struct Request {
 
 fn one_profile() -> usize {
     1
+}
+fn window_budget() -> u64 {
+    64 << 20
 }
 
 fn admit_profiles(
@@ -137,6 +158,9 @@ struct RenderedProfile {
     velocity: Option<Vec<f32>>,
     hydraulic_seconds: f64,
     render_seconds: f64,
+    hydraulic_reused: bool,
+    finite_pixels: usize,
+    flooded_pixels: usize,
 }
 
 #[allow(clippy::too_many_arguments)] // Explicit immutable geometry/window/cache borrows.
@@ -151,18 +175,46 @@ fn render(
     weights: Option<&sloping::PixelWeights>,
     normals: Option<&[Vec<crate::velocity::FaceNormal>]>,
     foreign: &[usize],
+    hydraulic_cache: Option<&Mutex<Retained<String, Vec<sloping::PreparedProfile>>>>,
 ) -> Result<RenderedProfile, MapError> {
     let tick = Instant::now();
-    let mut prepared = Vec::new();
-    let mut cell_values = Vec::new();
-    for ((mesh, stencil), filename) in meshes.iter().zip(stencils).zip(&profile.values_files) {
-        let wse = values(&model::resolve(base, filename), mesh.cells.len())?;
-        prepared.push(sloping::prepare_profile_with_options(
-            mesh, stencil, &wse, 0.001, pool, options,
-        )?);
-        if normals.is_some() {
-            cell_values.push(wse);
+    let cache_key = if hydraulic_cache.is_some() && normals.is_none() {
+        let mut key =
+            serde_json::to_string(&options).map_err(|e| MapError::Invalid(e.to_string()))?;
+        for file in &profile.values_files {
+            key.push_str(&identity(&model::resolve(base, file))?);
         }
+        Some(key)
+    } else {
+        None
+    };
+    let cached = match (&cache_key, hydraulic_cache) {
+        (Some(key), Some(cache)) => cache.lock().unwrap().get(key),
+        _ => None,
+    };
+    let hydraulic_reused = cached.is_some();
+    let mut new_prepared = Vec::new();
+    let mut cell_values = Vec::new();
+    if !hydraulic_reused {
+        for ((mesh, stencil), filename) in meshes.iter().zip(stencils).zip(&profile.values_files) {
+            let wse = values(&model::resolve(base, filename), mesh.cells.len())?;
+            new_prepared.push(sloping::prepare_profile_with_options(
+                mesh, stencil, &wse, 0.001, pool, options,
+            )?);
+            if normals.is_some() {
+                cell_values.push(wse);
+            }
+        }
+    }
+    let prepared = cached.unwrap_or_else(|| Arc::new(new_prepared));
+    if !hydraulic_reused && let (Some(key), Some(cache)) = (cache_key, hydraulic_cache) {
+        let bytes = prepared.iter().map(|p| p.retained_bytes()).sum::<u64>()
+            + (prepared.capacity() * std::mem::size_of::<sloping::PreparedProfile>()) as u64
+            + key.capacity() as u64
+            + (2 * std::mem::size_of::<(String, Arc<Vec<sloping::PreparedProfile>>, u64)>()
+                + std::mem::size_of::<Vec<sloping::PreparedProfile>>()
+                + 2 * std::mem::size_of::<usize>()) as u64;
+        cache.lock().unwrap().insert(key, prepared.clone(), bytes);
     }
     crate::terrain_scope::deny_wet_foreign(foreign, window.owner, window.owner_cells, |m, c| {
         prepared[m].is_wet(c)
@@ -172,17 +224,7 @@ fn render(
     let (mut depth, mut wse) =
         sloping::render_profile_cached(stencils, &prepared, window, 0.001, pool, weights)?;
     let render_seconds = tick.elapsed().as_secs_f64();
-    pool.install(|| {
-        depth
-            .par_iter_mut()
-            .zip(wse.par_iter_mut())
-            .for_each(|(d, w)| {
-                if *d == sloping::NODATA {
-                    *d = f32::NAN;
-                    *w = f32::NAN;
-                }
-            })
-    });
+    let (finite_pixels, flooded_pixels) = crate::finalize::apply(&mut depth, &mut wse, pool);
     let velocity = match (normals, &profile.face_velocity_files) {
         (Some(normals), Some(files)) => {
             let mut face_velocity = Vec::new();
@@ -218,6 +260,9 @@ fn render(
         velocity,
         hydraulic_seconds,
         render_seconds,
+        hydraulic_reused,
+        finite_pixels,
+        flooded_pixels,
     })
 }
 
@@ -349,7 +394,7 @@ pub fn method_record() -> Value {
         "depth_weighted_faces":true,
         "native_donation_history":true,
         "bounded_profile_concurrency":true,
-        "persistent_session":true,"bounded_pixel_weights":true,
+        "persistent_session":true,"multi_window_cache":true,"hydraulic_cache":true,"native_geotiff_outputs":true,"bounded_pixel_weights":true,
         "velocity":crate::velocity::METHOD_ID,
 
         "terrain_scope":crate::terrain_scope::METHOD_ID,
@@ -414,6 +459,11 @@ pub fn run_with_session(
     mut session: Option<&mut PreparedSession>,
 ) -> Result<Value, MapError> {
     req.options.validate()?;
+    if req.geotiff_outputs && (!req.stream_outputs || req.velocity_normals_files.is_some()) {
+        return Err(MapError::Unsupported(
+            "native GeoTIFF requires stream_outputs and no velocity".into(),
+        ));
+    }
     if let Some(scope) = &req.terrain_scope {
         scope.validate()?;
         if req.options.render_mode == sloping::RenderMode::WithFaces {
@@ -488,7 +538,20 @@ pub fn run_with_session(
     let cache = 64_u64 << 20;
     // JSON parsing, topology, stencils, one hydraulic profile and IO copies are
     // conservatively admitted, rather than claiming an OS-enforced RSS limit.
-    let persistent_bytes = if session.is_some() { 64_u64 << 20 } else { 0 };
+    let persistent_bytes = if session.is_some() {
+        req.window_cache_bytes
+    } else {
+        0
+    };
+    let hydraulic_bytes = if session.is_some() {
+        req.hydraulic_cache_bytes
+    } else {
+        0
+    };
+    if let Some(s) = session.as_mut() {
+        s.windows.resize(persistent_bytes);
+        s.hydraulics.lock().unwrap().resize(hydraulic_bytes);
+    }
     let aoi_scratch = crate::aoi::scratch_bytes(
         req.aoi_file
             .as_ref()
@@ -517,6 +580,7 @@ pub fn run_with_session(
         })
         .and_then(|v| v.checked_add(cache))
         .and_then(|v| v.checked_add(persistent_bytes))
+        .and_then(|v| v.checked_add(hydraulic_bytes))
         .and_then(|v| v.checked_add(aoi_scratch))
         // Terrain scope: one validity byte per expanded-window pixel.
         .and_then(|v| {
@@ -540,7 +604,8 @@ pub fn run_with_session(
         && s.geometry.as_ref().is_some_and(|(old, _)| old != &key)
     {
         s.geometry = None;
-        s.window = None;
+        s.hydraulics.lock().unwrap().clear();
+        s.windows.clear();
     }
     let terrain_path = model::resolve(base, &req.terrain);
     let terrain_key = if session.is_some() {
@@ -561,7 +626,7 @@ pub fn run_with_session(
     });
     if !terrain_reused && let Some(s) = session.as_mut() {
         s.terrain = None;
-        s.window = None;
+        s.windows.clear();
     }
     let terrain = if terrain_reused {
         session
@@ -690,7 +755,8 @@ pub fn run_with_session(
                 .is_some_and(|s| s.geometry.as_ref().is_some_and(|(old, _)| old == &key));
             if !geometry_reused && let Some(s) = session.as_mut() {
                 s.geometry = None;
-                s.window = None;
+                s.hydraulics.lock().unwrap().clear();
+                s.windows.clear();
             }
             let geometry = if geometry_reused {
                 session
@@ -786,14 +852,10 @@ pub fn run_with_session(
                     None,
                 )
             };
-            let window_reused = session
-                .as_ref()
-                .is_some_and(|s| s.window.as_ref().is_some_and(|(old, _)| old == &window_key));
-            if !window_reused && let Some(s) = session.as_mut() {
-                s.window = None;
-            }
-            let mut data = if window_reused {
-                session.as_ref().unwrap().window.as_ref().unwrap().1.clone()
+            let cached_window = session.as_mut().and_then(|s| s.windows.get(&window_key));
+            let window_reused = cached_window.is_some();
+            let mut data = if let Some(data) = cached_window {
+                data
             } else {
                 let cells = crate::ownership::load(
                     &model::resolve(base, &req.geometry_file),
@@ -879,10 +941,22 @@ pub fn run_with_session(
                     weights: None,
                 })
             };
+            let window_base_bytes = count as u64 * 8
+                + (2 * std::mem::size_of::<(WindowKey, Arc<WindowData>, u64)>()
+                    + std::mem::size_of::<WindowData>()
+                    + 2 * std::mem::size_of::<usize>()) as u64
+                + window_key.0.len() as u64
+                + window_key.1.len() as u64
+                + (window_key.3.len() * std::mem::size_of::<[usize; 2]>()) as u64
+                + window_key.4.len() as u64
+                + window_key.5.as_ref().map_or(0, |v| v.len()) as u64;
+            let weight_budget = persistent_bytes
+                .saturating_sub(window_base_bytes)
+                .min(32 << 20);
             let (bw, bh) = terrain.block;
             if session.is_some()
                 && !window_reused
-                && count as u64 * 8 < persistent_bytes / 2
+                && weight_budget > 0
                 && req.options.render_mode != sloping::RenderMode::WithFaces
             {
                 let window = sloping::RasterWindow {
@@ -898,7 +972,7 @@ pub fn run_with_session(
                 let weights = sloping::PixelWeights::prepare(
                     stencils,
                     &window,
-                    (persistent_bytes / 2) as usize,
+                    weight_budget as usize,
                     &pool,
                 )?;
                 Arc::get_mut(&mut data).unwrap().weights = Some(weights);
@@ -906,25 +980,12 @@ pub fn run_with_session(
             let weight_bytes = data.weights.as_ref().map_or(0, |w| w.bytes());
             report["session"]["window_reused"] = window_reused.into();
             report["session"]["pixel_weight_cache_bytes"] = weight_bytes.into();
-            let window_bytes = count as u64 * 8
-                + weight_bytes as u64
-                + window_key.0.len() as u64
-                + window_key.1.len() as u64
-                + (window_key.3.len() * std::mem::size_of::<[usize; 2]>()) as u64
-                + window_key.4.len() as u64
-                + window_key.5.as_ref().map_or(0, |v| v.len()) as u64;
-            if window_bytes <= persistent_bytes
-                && let Some(s) = session.as_mut()
-            {
-                s.window = Some((window_key, data.clone()));
+            let window_bytes = window_base_bytes + weight_bytes as u64;
+            if let Some(s) = session.as_mut() {
+                s.windows.insert(window_key, data.clone(), window_bytes);
+                report["session"]["retained_window_bytes"] = s.windows.bytes().into();
+                report["session"]["retained_window_count"] = s.windows.len().into();
             }
-            report["session"]["retained_window_bytes"] =
-                if session.is_some() && window_bytes <= persistent_bytes {
-                    window_bytes
-                } else {
-                    0
-                }
-                .into();
             let window = sloping::RasterWindow {
                 source_transform: terrain.gt,
                 source_tile: [bw, bh],
@@ -962,6 +1023,10 @@ pub fn run_with_session(
                         data.weights.as_ref(),
                         velocity_normals.as_deref(),
                         &foreign,
+                        session
+                            .as_ref()
+                            .filter(|_| hydraulic_bytes > 0)
+                            .map(|s| &s.hydraulics),
                     )
                 })?;
                 // Indexed collection and ordered emission preserve the pipe/report
@@ -973,6 +1038,9 @@ pub fn run_with_session(
                         velocity,
                         hydraulic_seconds,
                         render_seconds,
+                        hydraulic_reused,
+                        finite_pixels,
+                        flooded_pixels,
                     } = rendered;
                     let dir = out.join(&profile.id);
                     fs::create_dir(&dir)?;
@@ -984,13 +1052,39 @@ pub fn run_with_session(
                         if velocity.is_some() {
                             header["velocity"] = true.into();
                         }
-                        writeln!(stream, "{header}")?;
-                        crate::horizontal::write_f32(&mut stream, &depth)?;
-                        crate::horizontal::write_f32(&mut stream, &wse)?;
-                        if let Some(velocity) = &velocity {
-                            crate::horizontal::write_f32(&mut stream, velocity)?;
+                        if req.geotiff_outputs {
+                            let tick = Instant::now();
+                            header["products"] = "native-geotiff/1".into();
+                            header["depth_finite_pixels"] = finite_pixels.into();
+                            header["flooded_pixels"] = flooded_pixels.into();
+                            crate::geotiff::write(
+                                &dir.join("depth.tif"),
+                                depth,
+                                width,
+                                height,
+                                transform,
+                                req.epsg,
+                            )?;
+                            crate::geotiff::write(
+                                &dir.join("wse.tif"),
+                                wse,
+                                width,
+                                height,
+                                transform,
+                                req.epsg,
+                            )?;
+                            header["write_seconds"] = tick.elapsed().as_secs_f64().into();
+                            writeln!(stream, "{header}")?;
+                            stream.flush()?;
+                        } else {
+                            writeln!(stream, "{header}")?;
+                            crate::horizontal::write_f32(&mut stream, &depth)?;
+                            crate::horizontal::write_f32(&mut stream, &wse)?;
+                            if let Some(velocity) = &velocity {
+                                crate::horizontal::write_f32(&mut stream, velocity)?;
+                            }
+                            stream.flush()?;
                         }
-                        stream.flush()?;
                     } else {
                         crate::horizontal::write_values(&dir.join("depth.bin"), &depth)?;
                         crate::horizontal::write_values(&dir.join("wse.bin"), &wse)?;
@@ -998,11 +1092,16 @@ pub fn run_with_session(
                             crate::horizontal::write_values(&dir.join("velocity.bin"), velocity)?;
                         }
                     }
-                    let unit = json!({"id":profile.id,"status":"complete","hydraulic_seconds":hydraulic_seconds,"render_seconds":render_seconds});
+                    let unit = json!({"id":profile.id,"status":"complete","hydraulic_seconds":hydraulic_seconds,"render_seconds":render_seconds,"hydraulic_reused":hydraulic_reused});
                     sink::write_json(&dir.join("unit.json"), &unit)?;
                     report["profiles"].as_array_mut().unwrap().push(unit);
                     sink::write_json(&out.join("report.json"), &report)?;
                 }
+            }
+            if let Some(s) = session.as_ref() {
+                let cache = s.hydraulics.lock().unwrap();
+                report["session"]["retained_hydraulic_bytes"] = cache.bytes().into();
+                report["session"]["retained_hydraulic_count"] = cache.len().into();
             }
             Ok(())
         },
@@ -1023,6 +1122,8 @@ pub fn run_with_session(
                     "wse.bin",
                     "depth.bin.partial",
                     "wse.bin.partial",
+                    "depth.tif",
+                    "wse.tif",
                 ] {
                     let _ = fs::remove_file(dir.join(filename));
                 }

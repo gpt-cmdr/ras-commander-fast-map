@@ -69,6 +69,33 @@ Bbox/polygon output masks retain global hydraulic topology. Planned allocation
 admission is not a hard RSS limit. Python delivery may use Rasterio/GDAL;
 the Rust mapping executable does not link it.
 
+### Retained reach state (development)
+
+The persistent sloping server additionally advertises `hydraulic_cache`,
+`multi_window_cache` and `native_geotiff_outputs`. Requests can set
+`hydraulic_cache_bytes` (default 0) and `window_cache_bytes` (default 64 MiB).
+Their ceilings are included in planned working-memory admission, independently
+of the terrain block cache. Zero disables retention. Both caches use LRU
+eviction and include retained input keys and allocation metadata in their plans.
+
+Hydraulic entries bind complete staged WSE file identities and rendering
+options to reconstructed global cell/corner/face state. Geometry changes clear
+them. Window entries bind terrain/geometry identity, the exact integer source
+window, cell addresses, polygon WKB and AOI WKB. They retain ownership, terrain
+and up to 32 MiB of plain-sloping weights per window when the budget permits.
+Cell-face rendering retains its original donor-history path. Reports include
+cache hit flags, retained byte plans and entry counts. No spatial clipping of
+hydraulic dependencies is introduced.
+
+With `stream_outputs=true, geotiff_outputs=true`, sloping requests write
+lossless LZW `depth.tif` and `wse.tif` beneath each unit folder and stream JSON
+completion records instead of arrays. Records include pixel counts and native
+write timing. terrio owns encoding; no GDAL/Python dependency is added to the
+engine. This route requires an EPSG-identifiable CRS and excludes velocity.
+Commander validates output metadata before delivery. Ordinary array streams
+and binary-file output remain compatible. These are development capabilities;
+use an explicit qualified build until the next release is published.
+
 Binary32 operation order and method identifiers are preserved. `MIGRATION.json`
 retains the immutable 0.8.0 extraction receipt; `SOURCE_MANIFEST.json` binds this
 version's current sources. `ras2fim-batch method` reports package/build identity
