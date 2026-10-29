@@ -1,5 +1,6 @@
 //! Whole-simulation stored-map products: arrival time, duration and percent time
-//! inundated (`native-whole-simulation-horizontal/1`).
+//! inundated (`native-whole-simulation-horizontal/1`; duration end rule
+//! `rasmapper-backward-window-recession/1`, advertised as `duration_rule`).
 //!
 //! Every stored output time is rendered by the unchanged horizontal method
 //! (cell-constant WSE, native float32 visibility) and accumulated per pixel in bounded memory: first wet time, last wet
@@ -12,17 +13,21 @@
 //!
 //! - percent = float32(100 * wet_count / n);
 //! - arrival = t[first wet];
-//! - duration = t[end] - t[first wet] in float32, where `end` is the first dry
-//!   output time after the last wet one, or the last wet one when that dry
-//!   time would be the final output time or there is none;
-//! - NoData (NaN) where the pixel is never wet.
+//! - duration = t[recession] - t[first wet] in float32, where `recession` is
+//!   RAS Mapper's backward window search (see [`recession`]): the cell's
+//!   water-surface series is split into monotone windows at its local extrema
+//!   (the PostProcessing `Increasing Regions` rule), and the window holding the
+//!   last wet time `L` decides: `L` itself when it is a window end, the step
+//!   before a falling window's end, or that window's start; otherwise `L + 1`
+//!   (the first dry time), as the native bisection finds it;
+//! - NoData (NaN) where the pixel is never wet (duration also where the native
+//!   search writes no recession).
 //!
 //! Qualified against native HEC-RAS 7.0.1 (threshold 0.5 ft) on Davis p02 and
-//! BaldEagleCrkMulti2D bridges p05: every valid pixel, arrival and percent value
-//! bit for bit, including initially wet, multi-period and threshold-equal
-//! samples; RAS Mapper's horizontal and sloping products are identical. Duration
-//! is unqualified (some native recession durations are one interval shorter)
-//! and is delivered only with `allow_unqualified`, as are irregular intervals.
+//! BaldEagleCrkMulti2D bridges p05: every valid pixel, arrival, percent and
+//! duration value bit for bit, including initially wet, multi-period and
+//! threshold-equal samples; RAS Mapper's horizontal and sloping products are
+//! identical. Irregular intervals are delivered only with `allow_unqualified`.
 use crate::{MapError, horizontal, sink};
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -31,6 +36,8 @@ use std::{fs, path::Path, time::Instant};
 
 pub const SCHEMA: &str = "ras-commander-whole-simulation-request/1";
 pub const METHOD_ID: &str = "native-whole-simulation-horizontal/1";
+/// Duration end rule advertised for capability detection.
+pub const DURATION_RULE: &str = "rasmapper-backward-window-recession/1";
 pub const PRODUCTS: [&str; 3] = ["arrival_time", "duration", "percent_inundated"];
 
 #[derive(Deserialize)]
@@ -53,7 +60,8 @@ pub struct Request {
     pub allow_unqualified: bool,
 }
 
-/// Default: the products qualified bit for bit. Duration is opt-in (unqualified).
+/// Default: arrival time and percent inundated. Duration is requested
+/// explicitly because it keeps a per-cell extrema table.
 fn all_products() -> Vec<String> {
     vec!["arrival_time".into(), "percent_inundated".into()]
 }
@@ -65,17 +73,18 @@ pub fn method_record() -> Value {
         "wet": "rendered depth valid and depth > threshold (float32, strict)",
         "percent_inundated": "float32(100 * wet_count / n_times)",
         "arrival_time": "first wet stored output time (hours)",
-        "duration": "duration_end - arrival (hours)",
+        "duration": "recession - arrival (hours), float32",
+        "duration_rule": DURATION_RULE,
         "nodata": "never wet, including unmapped pixels",
         "memory": "32 bytes per mapped pixel plus 12 bytes per window pixel for products; output times are evaluated sequentially, pixels in parallel",
         "cell_gate": "wse > cell_minimum + threshold (float32)",
-        "duration_end": "first dry output time after the last wet one, unless that is the final output time or none (then the last wet time)",
+        "recession": "RAS Mapper backward window search over the cell's local-extrema windows (Increasing Regions rule: v[k] >= v[k-1] rises): the last wet time L when it is a window end, the step before a falling window's end or that window's start, otherwise L + 1 as the native round-half-even bisection finds it; duration NoData when the search writes nothing",
         "time_arithmetic": "float32 hours",
-        "qualified": "native HEC-RAS 7.0.1 horizontal and sloping stored maps, Davis p02 (217 times) and BaldEagleCrkMulti2D bridges p05 (433 times), threshold 0.5 ft; arrival_time and percent_inundated",
-        "unqualified_refused": ["irregular_intervals", "duration"],
+        "qualified": "native HEC-RAS 7.0.1 horizontal and sloping stored maps, Davis p02 (217 times) and BaldEagleCrkMulti2D bridges p05 (433 times), threshold 0.5 ft; arrival_time, duration and percent_inundated",
+        "unqualified_refused": ["irregular_intervals"],
         "reported": ["initially_wet_pixels", "multiple_period_pixels", "threshold_equal_samples"],
-        "known_differences": "duration: Davis 103/4,879 and bridges 11/959,043 pixels one output interval longer than native; arrival and percent identical",
-        "not_implemented": "sloping rendering; recession; subinterval interpolation"
+        "duration_memory": "per cell: its local extrema (8 bytes each), admitted against max_working_bytes as they are found",
+        "not_implemented": "sloping rendering; recession product; subinterval interpolation"
     })
 }
 
@@ -100,8 +109,119 @@ struct Accumulated {
     multiple_periods: u64,
 }
 
+/// Local extrema of one cell's water-surface series, as RAS Mapper's
+/// PostProcessor stores them (`Increasing Regions`): time 0, every turning
+/// point (`v[k] >= v[k-1]` counts as rising) and the final time, with values.
+#[derive(Clone, Default)]
+struct Extrema {
+    points: Vec<(u32, f32)>,
+    previous: f32,
+    rising: bool,
+}
+
+impl Extrema {
+    /// Adds output time `k` (sequential from 0); returns the bytes added.
+    fn push(&mut self, k: u32, value: f32) -> usize {
+        let before = self.points.capacity();
+        match k {
+            0 => self.points.push((0, value)),
+            1 => self.rising = value >= self.previous,
+            _ => {
+                let rising = value >= self.previous;
+                if rising != self.rising {
+                    self.points.push((k - 1, self.previous));
+                    self.rising = rising;
+                }
+            }
+        }
+        self.previous = value;
+        (self.points.capacity() - before) * std::mem::size_of::<(u32, f32)>()
+    }
+    fn close(&mut self, last: u32) {
+        self.points.push((last, self.previous));
+    }
+}
+
+/// RAS Mapper's recession index for one pixel (`ParseWindowBackward`, start
+/// index 0): windows between consecutive extrema are visited from the last.
+/// `wet_at` is the exact pixel predicate for a stored extremum value. Inside
+/// the window that holds the last wet time `last` the cell water surface
+/// falls strictly, so the pixel is wet exactly up to `last` there; no other
+/// window's interior is ever queried (checked).
+fn recession(
+    points: &[(u32, f32)],
+    last: u32,
+    ground: f32,
+    threshold: f32,
+    wet_at: impl Fn(f32) -> bool,
+) -> Result<Option<u32>, MapError> {
+    for pair in points.windows(2).rev() {
+        let [(s, vs), (e, ve)] = [pair[0], pair[1]];
+        let wet = |t: u32| -> Result<bool, MapError> {
+            if t == e {
+                Ok(wet_at(ve))
+            } else if t == s {
+                Ok(wet_at(vs))
+            } else if s <= last && last < e {
+                Ok(t <= last)
+            } else {
+                Err(MapError::Internal(
+                    "recession search left the last wet window".into(),
+                ))
+            }
+        };
+        if wet(e)? {
+            return Ok(Some(e));
+        }
+        // Rising window (`ve >= vs`): only its end is examined.
+        if ve >= vs {
+            continue;
+        }
+        // Falling window: its maximum is the start value.
+        // Native `!(MaxValue < elevation + threshold)`: NaN does not skip.
+        let below = vs < ground + threshold;
+        if !below && wet(s)? {
+            if e > s && wet(e - 1)? {
+                return Ok(Some(e - 1));
+            }
+            let (mut lo, mut hi) = (s, e);
+            loop {
+                let middle = ((f64::from(lo) + f64::from(hi)) / 2.0).round_ties_even() as u32;
+                if middle == lo || middle == hi {
+                    break;
+                }
+                let (here, next) = (wet(middle)?, wet(middle + 1)?);
+                if here && !next {
+                    return Ok(Some(middle + 1));
+                }
+                if here {
+                    lo = middle;
+                } else {
+                    hi = middle;
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Per mapped pixel: cell and ground, for the duration recession search.
+struct Recession<'a> {
+    extrema: &'a [Extrema],
+    source: &'a [u32],
+    ground: &'a [f32],
+    gate: &'a [f32],
+    threshold: f32,
+}
+
 /// Scatters compact accumulators (window pixel `index[k]`) to window products.
-fn finish(acc: &[Acc], index: &[usize], window: usize, times: &[f64]) -> Accumulated {
+fn finish(
+    acc: &[Acc],
+    index: &[usize],
+    window: usize,
+    times: &[f64],
+    duration: Option<&Recession<'_>>,
+) -> Result<Accumulated, MapError> {
     let n = times.len() as f64;
     let mut out = Accumulated {
         arrival: vec![f32::NAN; window],
@@ -111,7 +231,7 @@ fn finish(acc: &[Acc], index: &[usize], window: usize, times: &[f64]) -> Accumul
         initially_wet: 0,
         multiple_periods: 0,
     };
-    for (a, &i) in acc.iter().zip(index) {
+    for (k, (a, &i)) in acc.iter().zip(index).enumerate() {
         if a.count == 0 {
             continue;
         }
@@ -119,17 +239,23 @@ fn finish(acc: &[Acc], index: &[usize], window: usize, times: &[f64]) -> Accumul
         out.initially_wet += u64::from(a.first == 0);
         out.multiple_periods += u64::from(a.periods > 1);
         let first = times[a.first as usize] as f32;
-        let last = a.last as usize;
-        let end = if last + 2 < times.len() {
-            last + 1
-        } else {
-            last
-        };
         out.arrival[i] = first;
-        out.duration[i] = times[end] as f32 - first;
+        if let Some(r) = duration {
+            let cell = r.source[k] as usize;
+            let (ground, gate, threshold) = (r.ground[k], r.gate[cell], r.threshold);
+            let wet_at = |value: f32| {
+                value > gate
+                    && matches!(horizontal::plot(value, ground), Ok(Some(d)) if d > threshold)
+            };
+            if let Some(end) =
+                recession(&r.extrema[cell].points, a.last, ground, threshold, wet_at)?
+            {
+                out.duration[i] = times[end as usize] as f32 - first;
+            }
+        }
         out.percent[i] = (100.0 * f64::from(a.count) / n) as f32;
     }
-    out
+    Ok(out)
 }
 
 #[inline]
@@ -161,6 +287,10 @@ struct Accumulator {
     ground: Vec<f32>,
     acc: Vec<Acc>,
     equal: u64,
+    /// Per 2D cell water-surface extrema, kept only for duration.
+    extrema: Option<Vec<Extrema>>,
+    /// Bytes the extrema may still use (duration only).
+    extrema_budget: u64,
 }
 
 impl horizontal::Consumer for Accumulator {
@@ -186,8 +316,24 @@ impl horizontal::Consumer for Accumulator {
     }
 
     fn profile(&mut self, position: usize, values: &[f32]) -> Result<(), MapError> {
-        let (threshold, gate) = (self.threshold, &self.gate);
         let position = position as u32;
+        if let Some(extrema) = &mut self.extrema {
+            if extrema.len() != values.len() {
+                return Err(MapError::Internal("extrema cell count".into()));
+            }
+            let added: usize = extrema
+                .par_iter_mut()
+                .zip(values.par_iter())
+                .map(|(e, &v)| e.push(position, v))
+                .sum();
+            self.extrema_budget =
+                self.extrema_budget
+                    .checked_sub(added as u64)
+                    .ok_or_else(|| {
+                        MapError::Budget("duration extrema exceed max_working_bytes".into())
+                    })?;
+        }
+        let (threshold, gate) = (self.threshold, &self.gate);
         self.equal += self
             .acc
             .par_iter_mut()
@@ -251,11 +397,6 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
             "products must be unique arrival_time, duration or percent_inundated".into(),
         ));
     }
-    if products.iter().any(|p| p == "duration") && !req.allow_unqualified {
-        return Err(MapError::Unsupported(
-            "duration is not qualified (native durations are one output interval shorter on some recession pixels); set allow_unqualified to deliver it".into(),
-        ));
-    }
     let [_, _, width, height] = h.window;
     let count = width
         .checked_mul(height)
@@ -284,9 +425,36 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
             "cell minimum elevations must be finite".into(),
         ));
     }
+    let duration = products.iter().any(|p| p == "duration");
+    // Duration keeps each cell's water-surface extrema (8 bytes each, at least
+    // the two ends); they are admitted out of the same budget as they grow.
+    // Reserve: the worst case (every time an extremum), capped at half the
+    // remaining budget; the per-cell floor (two ends) must fit.
+    let (reserve, extrema_budget) = if duration {
+        let per_cell = std::mem::size_of::<Extrema>() as u64;
+        let floor = (h.cell_count as u64)
+            .checked_mul(per_cell + 16)
+            .ok_or_else(|| MapError::Budget("whole-simulation plan overflow".into()))?;
+        let worst = (h.cell_count as u64)
+            .checked_mul(per_cell + 8 * n as u64)
+            .ok_or_else(|| MapError::Budget("whole-simulation plan overflow".into()))?;
+        let reserve = worst.min(budget / 2);
+        if reserve < floor {
+            return Err(MapError::Budget("duration extrema exceed budget".into()));
+        }
+        (reserve, reserve - floor)
+    } else {
+        (0, 0)
+    };
+    let horizontal_req = horizontal::Request {
+        max_working_bytes: budget - reserve,
+        ..horizontal_req
+    };
     let mut accumulator = Accumulator {
         threshold: req.threshold,
         gate: minimum.iter().map(|m| m + req.threshold).collect(),
+        extrema: duration.then(|| vec![Extrema::default(); h.cell_count]),
+        extrema_budget,
         ..Default::default()
     };
     let mut report = horizontal::run_with(&horizontal_req, base, out, Some(&mut accumulator))?;
@@ -299,12 +467,24 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
         return Ok(report);
     }
     let tick = Instant::now();
+    if let Some(extrema) = &mut accumulator.extrema {
+        let last = (n - 1) as u32;
+        extrema.par_iter_mut().for_each(|e| e.close(last));
+    }
+    let recession_inputs = accumulator.extrema.as_deref().map(|extrema| Recession {
+        extrema,
+        source: &accumulator.source,
+        ground: &accumulator.ground,
+        gate: &accumulator.gate,
+        threshold: accumulator.threshold,
+    });
     let result = finish(
         &accumulator.acc,
         &accumulator.index,
         count,
         &req.times_hours,
-    );
+        recession_inputs.as_ref(),
+    )?;
     let equal_samples = accumulator.equal;
     drop(accumulator);
     let irregular = !regular(&req.times_hours);
@@ -361,13 +541,71 @@ mod tests {
         let mut a = Accumulator {
             threshold,
             gate: vec![f32::NEG_INFINITY; n],
+            extrema: Some(vec![Extrema::default(); n]),
+            extrema_budget: u64::MAX,
             ..Default::default()
         };
         a.prepare(&owner, &vec![0.0; n]).unwrap();
         for (k, values) in series.iter().enumerate() {
             a.profile(k, values).unwrap();
         }
-        (finish(&a.acc, &a.index, n, times), a.equal)
+        (finish_all(&mut a, n, times), a.equal)
+    }
+
+    fn finish_all(a: &mut Accumulator, window: usize, times: &[f64]) -> Accumulated {
+        let last = (times.len() - 1) as u32;
+        let extrema = a.extrema.as_mut().unwrap();
+        extrema.iter_mut().for_each(|e| e.close(last));
+        let r = Recession {
+            extrema: a.extrema.as_deref().unwrap(),
+            source: &a.source,
+            ground: &a.ground,
+            gate: &a.gate,
+            threshold: a.threshold,
+        };
+        finish(&a.acc, &a.index, window, times, Some(&r)).unwrap()
+    }
+
+    fn extrema_of(series: &[f32]) -> Vec<(u32, f32)> {
+        let mut e = Extrema::default();
+        for (k, &v) in series.iter().enumerate() {
+            e.push(k as u32, v);
+        }
+        e.close((series.len() - 1) as u32);
+        e.points
+    }
+
+    #[test]
+    fn extrema_follow_the_increasing_regions_rule() {
+        // Equal steps count as rising; turning points are stored at k - 1.
+        assert_eq!(
+            extrema_of(&[0.6, 0.6, 0.4, 0.4, 0.4]),
+            vec![(0, 0.6), (1, 0.6), (2, 0.4), (4, 0.4)]
+        );
+        assert_eq!(extrema_of(&[1.0, 0.5]), vec![(0, 1.0), (1, 0.5)]);
+        assert_eq!(extrema_of(&[1.0]), vec![(0, 1.0), (0, 1.0)]);
+    }
+
+    #[test]
+    fn native_recession_cases() {
+        let wet = |v: f32| v > 0.5;
+        let r = |points: &[(u32, f32)], last| recession(points, last, 0.0, 0.5, wet).unwrap();
+        // Last wet at a window end, or the step before a falling window's end.
+        assert_eq!(r(&[(0, 0.0), (5, 1.0), (9, 0.0)], 8), Some(8));
+        // Inside a falling window: bisection finds the first dry time L + 1.
+        assert_eq!(r(&[(0, 1.0), (10, 0.0)], 4), Some(5));
+        // Last wet at the falling window's start: the bisection gives up and the
+        // previous window's end (L) is written.
+        assert_eq!(r(&[(0, 0.0), (3, 1.0), (9, 0.0)], 3), Some(3));
+        // ... and with no previous window nothing is written.
+        assert_eq!(r(&[(0, 1.0), (9, 0.0)], 0), None);
+        // Window maximum below ground + threshold skips the window.
+        let low = |points: &[(u32, f32)], last| {
+            recession(points, last, 0.0, 0.5, |v: f32| v > 0.4).unwrap()
+        };
+        assert_eq!(low(&[(0, 0.0), (3, 0.45), (9, 0.0)], 4), Some(3));
+        // Wet at the final time.
+        assert_eq!(r(&[(0, 0.0), (9, 1.0)], 9), Some(9));
     }
 
     #[test]
@@ -383,13 +621,16 @@ mod tests {
         let (r, equal) = run_series(&series, 0.5, &times);
         assert_eq!(equal, 5); // pixel 6 equals the threshold: reported, dry
         assert!(r.arrival[0].is_nan() && r.percent[0].is_nan() && r.duration[0].is_nan());
-        // Pixel 1 wet 0..2, dry at 3 (not the final time): ends at t[3].
+        // Pixel 1 wet 0..2 at the peak (a falling window's start): native
+        // recession is the last wet time t[2].
         assert_eq!(
             (r.arrival[1], r.duration[1], r.percent[1]),
-            (0.0, 0.75, 60.0)
+            (0.0, 0.5, 60.0)
         );
-        // Pixel 5 wet 0..1, dry at 2: ends at t[2].
-        assert_eq!((r.arrival[5], r.duration[5]), (0.0, 0.5));
+        // Pixel 3 wet 0 and 2, falls dry at 3 (the step before the window end).
+        assert_eq!((r.arrival[3], r.duration[3]), (0.0, 0.5));
+        // Pixel 5 wet 0..1, last wet one step before a falling window's end.
+        assert_eq!((r.arrival[5], r.duration[5]), (0.0, 0.25));
         // Pixels 2 and 4: last wet at 3, dry only at the final time: end at t[3].
         assert_eq!(
             (r.arrival[2], r.duration[2], r.percent[2]),
@@ -452,13 +693,15 @@ mod tests {
         let mut a = Accumulator {
             threshold: 0.5,
             gate: vec![0.2 + 0.5, -1.0 + 0.5],
+            extrema: Some(vec![Extrema::default(); 2]),
+            extrema_budget: u64::MAX,
             ..Default::default()
         };
         a.prepare(&[1, 2], &[0.0, 0.0]).unwrap();
         for k in 0..3 {
             a.profile(k, &[0.6, 0.6]).unwrap();
         }
-        let r = finish(&a.acc, &a.index, 2, &[0.0, 1.0, 2.0]);
+        let r = finish_all(&mut a, 2, &[0.0, 1.0, 2.0]);
         assert!(r.arrival[0].is_nan());
         // Wet at the final time: duration ends at the last wet time.
         assert_eq!(
@@ -477,13 +720,29 @@ mod tests {
             wet: false,
             periods: 1,
         }];
-        let r = finish(&acc, &[0], 1, &times);
+        // One cell rising to t[400] and falling to the end: recession at 489.
+        let falling = [Extrema {
+            points: vec![(0, 0.0), (400, 1.0), (864, 0.0)],
+            ..Default::default()
+        }];
+        let input = |extrema| Recession {
+            extrema,
+            source: &[0],
+            ground: &[0.0],
+            gate: &[f32::NEG_INFINITY],
+            threshold: 0.5,
+        };
+        let r = finish(&acc, &[0], 1, &times, Some(&input(&falling))).unwrap();
         assert_eq!(
             r.duration[0].to_bits(),
             ((489.0_f64 / 12.0) as f32 - (244.0_f64 / 12.0) as f32).to_bits()
         );
         acc[0].last = 864;
-        let r = finish(&acc, &[0], 1, &times);
+        let rising = [Extrema {
+            points: vec![(0, 0.0), (400, 1.0), (864, 1.0)],
+            ..Default::default()
+        }];
+        let r = finish(&acc, &[0], 1, &times, Some(&input(&rising))).unwrap();
         assert_eq!(r.duration[0], (72.0_f32) - (244.0_f64 / 12.0) as f32);
     }
 

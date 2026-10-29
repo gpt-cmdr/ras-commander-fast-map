@@ -33,10 +33,111 @@ pub fn method_record() -> serde_json::Value {
         "inputs": "per mesh: HDF face normals with polyline face lengths; per profile: face-normal velocities (Max: summary Maximum Face Velocity) and the cell WSE already supplied",
         "faces": "normal velocity plus a tangential component from an unweighted least-squares fit of the face and its two ring neighbours in each cell (when a neighbour is hydraulically connected); connected faces take the mean of both sides",
         "corners": "inverse polyline-length weighted mean of the face vectors over each hydraulically connected arc; zero where every incident face is dry",
-        "pixels": "cell-face sloping donated weights in binary32, native donation history replayed in source-tile order; drawn where rendered depth > 0",
-        "qualified": "native HEC-RAS 7.0.1: BaldEagleCrkMulti2D bridges p05 (Max, one output time), dam-break p07 2D cells (Max, one output time), Spring Creek eBFE AOI (one output time) bit for bit; Davis p02 Max all but 5 of 20,560 pixels (within 2 ulp)",
-        "not_rendered": "storage areas, 1D; derived products (D x V, D x V^2, Froude, shear) are not rendered here"
+        "pixels": "cell-face sloping donated weights in binary32, native donation history replayed in source-tile order; drawn where the clipping depth > 0",
+        "clipping_depth": "velocity_depth: rendered (this request's render mode, default) or horizontal (cell-constant WSE, RAS Mapper's horizontal render); RAS Mapper clips velocity with the depth of the active render mode and its values do not depend on it",
+        "qualified": "native HEC-RAS 7.0.1: BaldEagleCrkMulti2D bridges p05 (Max sloping and slopingPretty, one output time sloping), dam-break p07 2D cells (Max, one output time), Spring Creek eBFE AOI (one output time) bit for bit, masks included; Davis p02 Max all but 5 of 20,560 pixels (within 2 ulp)",
+        "derived": {
+            "method_id": DERIVED_METHOD_ID,
+            "products": DERIVED,
+            "depth_x_velocity": "d * v (binary32)",
+            "depth_x_velocity_squared": "(d * v) * v (binary32)",
+            "froude": "float32(v / sqrt(float32(g * d))), g the float32 gravity constant (32.174 US, 9.80665 SI)",
+            "pixels": "where the clipping depth and velocity are both drawn",
+            "max": "reduce_max: pixelwise maximum over every profile of the request (RAS Mapper's Max for these products: per output time, then max; the valid area is the union)"
+        },
+        "not_rendered": "storage areas, 1D, shear stress"
     })
+}
+
+pub const DERIVED_METHOD_ID: &str = "rasmapper-depth-velocity-products/1";
+/// Derived products, in stream/output order.
+pub const DERIVED: [&str; 3] = ["depth_x_velocity", "depth_x_velocity_squared", "froude"];
+
+/// Depth that clips velocity and feeds the derived products.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+pub enum VelocityDepth {
+    /// The request's rendered depth (its render mode).
+    #[default]
+    #[serde(rename = "rendered")]
+    Rendered,
+    /// RAS Mapper's horizontal render: the owning cell's WSE over terrain.
+    #[serde(rename = "horizontal")]
+    Horizontal,
+}
+
+/// Horizontal (cell-constant) depth of each window pixel from the cell WSE
+/// the request supplies: RAS Mapper's horizontal render skips cells with
+/// `wse <= minimum + 0.001` (float32), then applies the native plot test.
+pub fn horizontal_depth(
+    window: &crate::sloping::RasterWindow<'_>,
+    meshes: &[Mesh],
+    cell_values: &[Vec<f32>],
+) -> Result<Vec<f32>, MapError> {
+    let mut depth = vec![f32::NAN; window.owner.len()];
+    for (i, d) in depth.iter_mut().enumerate() {
+        let label = window.owner[i] as usize;
+        if label == 0 {
+            continue;
+        }
+        let [m, cell] = window.owner_cells[label - 1];
+        let value = *cell_values
+            .get(m)
+            .and_then(|v| v.get(cell))
+            .ok_or_else(|| MapError::Internal("horizontal depth cell".into()))?;
+        let wet = value > meshes[m].cells[cell].minimum + 0.001_f32;
+        if !wet {
+            continue;
+        }
+        if let Some(delta) = crate::horizontal::plot(value, window.terrain[i])? {
+            *d = delta;
+        }
+    }
+    Ok(depth)
+}
+
+/// One derived product from a pixel's depth and velocity (`None` if unknown).
+pub fn derived(name: &str, depth: f32, velocity: f32, gravity: f32) -> Option<f32> {
+    match name {
+        "depth_x_velocity" => Some(depth_x_velocity(depth, velocity)),
+        "depth_x_velocity_squared" => Some(depth_x_velocity_squared(depth, velocity)),
+        "froude" => Some(froude(depth, velocity, gravity)),
+        _ => None,
+    }
+}
+
+/// Derived product arrays, NaN where depth or velocity is not drawn.
+pub fn derive_all(
+    names: &[String],
+    depth: &[f32],
+    velocity: &[f32],
+    gravity: f32,
+) -> Result<Vec<Vec<f32>>, MapError> {
+    names
+        .iter()
+        .map(|name| {
+            depth
+                .iter()
+                .zip(velocity)
+                .map(|(&d, &v)| {
+                    if d.is_nan() || v.is_nan() {
+                        Ok(f32::NAN)
+                    } else {
+                        derived(name, d, v, gravity)
+                            .ok_or_else(|| MapError::Invalid(format!("unknown product {name}")))
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Pixelwise maximum into `acc` (NaN = not drawn; the valid area is the union).
+pub fn accumulate_max(acc: &mut [f32], values: &[f32]) {
+    for (a, &v) in acc.iter_mut().zip(values) {
+        if !v.is_nan() && (a.is_nan() || v > *a) {
+            *a = v;
+        }
+    }
 }
 
 /// Face geometry the native velocity stencils need: HDF `Faces NormalUnitVector
@@ -492,16 +593,17 @@ pub fn render(
 }
 
 /// Derived products from a pixel's binary32 depth and velocity at one output
-/// time. D x V and D x V^2 reproduce native bits given native depth and
-/// velocity; Froude is within one binary32 ulp (native uses unrounded inputs).
+/// time, in RAS Mapper's operation order (`DepthAndVelocityRenderer`): D x V
+/// and D x V^2 in binary32; Froude divides in binary64 by the square root of
+/// the binary32 product of the float32 gravity constant and depth.
 pub fn depth_x_velocity(depth: f32, velocity: f32) -> f32 {
     depth * velocity
 }
 pub fn depth_x_velocity_squared(depth: f32, velocity: f32) -> f32 {
     depth * velocity * velocity
 }
-pub fn froude(depth: f32, velocity: f32) -> f32 {
-    (f64::from(velocity) / (f64::from(32.174_f32) * f64::from(depth)).sqrt()) as f32
+pub fn froude(depth: f32, velocity: f32, gravity: f32) -> f32 {
+    (f64::from(velocity) / f64::from(gravity * depth).sqrt()) as f32
 }
 
 fn read_f32(path: &std::path::Path, count: usize) -> Result<Vec<f32>, MapError> {
@@ -678,6 +780,35 @@ mod tests {
             depth_x_velocity_squared(d, v).to_bits(),
             ((d * v) * v).to_bits()
         );
-        assert_eq!(froude(1.0, 0.0), 0.0);
+        assert_eq!(froude(1.0, 0.0, 32.174), 0.0);
+        // The product is rounded to binary32 before the binary64 square root.
+        let (d, v) = (0.731_f32, 2.2_f32);
+        assert_eq!(
+            froude(d, v, 32.174).to_bits(),
+            ((f64::from(v) / f64::from(32.174_f32 * d).sqrt()) as f32).to_bits()
+        );
+        assert_eq!(
+            derived("froude", d, v, 9.80665),
+            Some(froude(d, v, 9.80665))
+        );
+        assert_eq!(derived("shear", d, v, 9.80665), None);
+    }
+
+    #[test]
+    fn derived_arrays_and_max_union() {
+        let names = vec!["depth_x_velocity".to_string(), "froude".to_string()];
+        let depth = [1.0, f32::NAN, 2.0];
+        let velocity = [2.0, 1.0, f32::NAN];
+        let out = derive_all(&names, &depth, &velocity, 32.174).unwrap();
+        assert_eq!(out[0][0], 2.0);
+        assert!(out[0][1].is_nan() && out[0][2].is_nan());
+        assert!(derive_all(&["shear".to_string()], &depth, &velocity, 1.0).is_err());
+        let mut acc = vec![f32::NAN, 1.0, 5.0];
+        accumulate_max(&mut acc, &[3.0, f32::NAN, 6.0]);
+        assert_eq!(acc[0], 3.0);
+        assert_eq!(acc[1], 1.0);
+        assert_eq!(acc[2], 6.0);
+        accumulate_max(&mut acc, &[1.0, 0.5, f32::NAN]);
+        assert_eq!(acc, vec![3.0, 1.0, 6.0]);
     }
 }
