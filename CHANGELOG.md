@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.11.0 — 2026-10-29
 
 - Add byte-admitted LRU retention of reconstructed sloping timesteps across
   reach windows, keyed by complete staged values and rendering options.
@@ -8,6 +8,8 @@
   use bounded plain pixel-weight prefixes when space remains.
 - Add opt-in direct terrio LZW GeoTIFF delivery with completion records and
   unchanged float32 raster arithmetic.
+- Document multi-polygon/timestep catalog scheduling, capability checks and
+  bounded cache/concurrency settings through the RAS Commander API.
 
 ## 0.10.1 — 2026-10-28
 
