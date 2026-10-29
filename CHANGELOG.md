@@ -39,6 +39,23 @@ including all storage-area pixels (p07 Max 466,912; p04 Max 461,639).
   five synthetic HEC-RAS terrains (four bit-identical, 5 px on the fifth).
   Terrain modifications are refused.
 
+### Duration, velocity depth and derived products
+
+- Whole-simulation duration uses RAS Mapper's backward window recession rule
+  (`duration_rule` `rasmapper-backward-window-recession/1`) and no longer needs
+  `allow_unqualified`. Native HEC-RAS 7.0.1, threshold 0.5 ft: Davis p02
+  (4,879 pixels) and bridges p05 (959,043) match in every pixel. Method ID,
+  arrival time and percent inundated are unchanged.
+- Sloping velocity: `velocity_depth` (`rendered` or `horizontal`) selects the
+  clipping depth, reproducing RAS Mapper's horizontal-mode velocity;
+  slopingPretty velocity is advertised (`velocity_render_modes`).
+- `derived_products` (D x V, D x V^2, Froude; method
+  `rasmapper-depth-velocity-products/1`) and `reduce_max` (RAS Mapper's Max of
+  those products over every output time). Froude now rounds `g * d` to
+  binary32 before the square root, as RAS Mapper does (bit-identical where it
+  was within 1 ulp). Qualified bit for bit on bridges p05 (sloping and
+  horizontal, one output time and Max over 433 times).
+
 ## 0.11.0 — 2026-10-29
 
 - Add byte-admitted LRU retention of reconstructed sloping timesteps across
