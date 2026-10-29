@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Add `ras2fim-batch effective-terrain` (`rasmapper-effective-terrain/1`,
+  advertised as `effective_terrain` by `ras2fim-batch method`): RAS Mapper's
+  effective terrain of an unmodified multi-source terrain from its source
+  TIFFs, level-0 tile masks and stitch TIN, without HEC-RAS. Qualified against
+  HEC-RAS 7.0.1 `export_rasmapper_terrain` on BaldEagleCrkMulti2D Terrain50
+  (197,179,058 valid px: identical mask, 8 stitch-TIN corner values differ) and
+  five synthetic HEC-RAS terrains (four bit-identical, 5 px on the fifth).
+  Terrain modifications are refused.
+
 ## 0.11.0 — 2026-10-29
 
 - Add byte-admitted LRU retention of reconstructed sloping timesteps across

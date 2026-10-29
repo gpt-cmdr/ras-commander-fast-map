@@ -30,6 +30,7 @@ pub mod aoi;
 pub mod boundary_contour;
 pub mod boundary_session;
 pub mod cache;
+pub mod effective_terrain;
 mod finalize;
 mod geotiff;
 pub mod horizontal;
