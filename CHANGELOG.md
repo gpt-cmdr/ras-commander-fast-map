@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Add byte-admitted LRU retention of reconstructed sloping timesteps across
+  reach windows, keyed by complete staged values and rendering options.
+- Retain multiple ownership/terrain windows under one configurable ceiling;
+  use bounded plain pixel-weight prefixes when space remains.
+- Add opt-in direct terrio LZW GeoTIFF delivery with completion records and
+  unchanged float32 raster arithmetic.
+
 ## 0.10.1 — 2026-10-28
 
 First published release since 0.8.0. It includes every change listed under
