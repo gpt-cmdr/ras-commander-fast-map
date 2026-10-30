@@ -782,7 +782,7 @@ mod tests {
         }
         // Missing pool values with pool pixels present is an internal error.
         assert!(a.profile(3, &[9.0], None).is_err());
-        let r = finish(&a.acc, &a.index, 4, &[0.0, 1.0, 2.0]);
+        let r = finish(&a.acc, &a.index, 4, &[0.0, 1.0, 2.0], None).unwrap();
         assert!(r.arrival[0].is_nan() && r.arrival[1].is_nan());
         // Ground 1.0: depth 0.6 only at t=1.
         assert_eq!(
