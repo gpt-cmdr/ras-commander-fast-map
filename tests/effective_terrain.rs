@@ -1,5 +1,5 @@
-//! Effective terrain (`rasmapper-effective-terrain/1`): priority, footprint,
-//! stitch TIN, rounding, lattice and refusals on small synthetic sources.
+//! Effective terrain (`rasmapper-effective-terrain/2`): priority, footprint,
+//! stitch TIN, rounding, lattice, terrain modifications and refusals on small synthetic sources.
 use ras_commander_fast_map::effective_terrain::{
     self, Effective, Grid, METHOD_ID, NODATA, Request, quantize, snap_grid,
 };
@@ -303,4 +303,83 @@ fn run_writes_tiled_geotiff_and_report() {
     assert_eq!(info.nodata, Some(NODATA as f64));
     assert_eq!(info.block, (256, 256));
     assert!(out.join("report.json").is_file());
+}
+
+/// Schema 2: modification layers are applied after the mosaic, Priority 0
+/// last (it wins), and every result is rounded like the terrain.
+#[test]
+fn modifications_follow_priority_and_round() {
+    let dir = scratch();
+    let g = grid(1000.0, 2000.0, 10.0, 20, 12);
+    write_source(&dir, "a.tif", g, vec![50.0; 20 * 12]);
+    write_mask(&dir, "a.u1", 20, 12, |_, _| true);
+    // A SetValue pad (Priority 1) and a SetIfLower pad (Priority 0) over the
+    // same cells: Priority 0 is applied last, so the lower value survives.
+    let ring = json!([[
+        [1040.0, 1920.0],
+        [1120.0, 1920.0],
+        [1120.0, 1980.0],
+        [1040.0, 1980.0]
+    ]]);
+    let req = request(
+        json!([{"path": "a.tif", "mask": mask("a.u1", 20, 12)}]),
+        json!({
+            "schema": "ras-commander-effective-terrain-request/2",
+            "modifications": 2,
+            "modification_layers": [
+                {"kind": "polygon", "name": "cut", "priority": 0,
+                 "features": [{"elevation_type": "SetIfLower", "elevation": 40.01, "rings": ring}]},
+                {"kind": "polygon", "name": "pad", "priority": 1,
+                 "features": [{"elevation_type": "SetValue", "elevation": 60.0, "rings": ring}]}
+            ]
+        }),
+    );
+    let out = effective_terrain::compute(&req, &dir).unwrap();
+    // Pixel (row 5, col 6): centre (1065, 1945) is inside both pads.
+    assert_eq!(out.values[5 * 20 + 6], quantize(40.01));
+    assert_eq!(out.values[0], 50.0);
+    let layers = out.report["modifications"]["layers"].as_array().unwrap();
+    assert_eq!(layers[0]["name"], "pad");
+    assert_eq!(layers[1]["name"], "cut");
+}
+
+#[test]
+fn modification_count_must_match_and_v1_refuses_layers() {
+    let dir = scratch();
+    let srcs = json!([{"path": "missing.tif", "mask": mask("m.u1", 10, 10)}]);
+    let layer = json!([{"kind": "ellipse", "name": "e", "priority": 0,
+        "features": [{"elevation_type": "SetValue", "elevation": 1.0, "center": [0.0, 0.0], "radius_x": 1.0, "radius_y": 1.0}]}]);
+    let mismatch = request(
+        srcs.clone(),
+        json!({"schema": "ras-commander-effective-terrain-request/2", "modifications": 2, "modification_layers": layer.clone()}),
+    );
+    assert_eq!(
+        effective_terrain::compute(&mismatch, &dir)
+            .err()
+            .unwrap()
+            .kind(),
+        "invalid"
+    );
+    let v1 = request(
+        srcs.clone(),
+        json!({"modifications": 1, "modification_layers": layer}),
+    );
+    assert_eq!(
+        effective_terrain::compute(&v1, &dir).err().unwrap().kind(),
+        "unsupported"
+    );
+    let ground_line_set_value = request(
+        srcs,
+        json!({"schema": "ras-commander-effective-terrain-request/2", "modifications": 1, "modification_layers": [
+            {"kind": "ground_line", "name": "g", "priority": 0, "subtype": "levee", "features": [
+                {"elevation_type": "SetValue", "top_width": 2.0, "left_slope": 1.0, "right_slope": 1.0,
+                 "max_reach": 10.0, "points": [[0.0, 0.0], [5.0, 0.0]], "profile": [[0.0, 1.0], [5.0, 1.0]]}]}]}),
+    );
+    assert_eq!(
+        effective_terrain::compute(&ground_line_set_value, &dir)
+            .err()
+            .unwrap()
+            .kind(),
+        "unsupported"
+    );
 }

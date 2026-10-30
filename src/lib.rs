@@ -70,6 +70,7 @@ pub mod storage_area;
 pub mod storage_session;
 pub mod stored_grid;
 pub mod terrain;
+pub mod terrain_mods;
 pub mod terrain_scope;
 pub mod velocity;
 pub mod whole_simulation;
