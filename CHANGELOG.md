@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Terrain modifications on the effective terrain (`rasmapper-effective-terrain/2`)
+
+`ras2fim-batch effective-terrain` accepts request schema
+`ras-commander-effective-terrain-request/2` with `modification_layers` (one
+entry per `/Modifications` layer of the terrain HDF; `modifications` must equal
+their number) and applies them after the mosaic, as
+`RasTerrain.export_rasmapper_terrain(rasterize_modifications=True)` does in
+HEC-RAS 7.0.1. Rules were fitted pixel by pixel on exports of RAS-Mapper-authored
+terrains (no vendor code): ground lines are a triangulated template (centerline
+split at profile stations, crest at Top Width/2, toe at Max Reach/2 = total
+width, H:V slopes, beveled convex and mitered concave joints, square ends,
+Delaunay quad diagonals); constant polygons fill pixel centres inside (even-odd);
+ellipses fill centres strictly inside; SetValue / SetIfHigher / SetIfLower, a
+nodata pixel inside takes the modification value; layers in descending Priority
+(Priority 0 last). Refused: ground-line SetValue/Add, Max Reach <= Top Width,
+polygons with boundary elevations, rotated ellipses, unknown kinds. Schema 1 is
+unchanged; sources may carry their own caller-verified `crs_identity` when
+their WKT text differs from the first source's. Qualification (outside the
+stitch TIN): HCFCD Prop_Topo 0 differences; Kingswood TerrainAlt1 3 px off by
+1/32 ft at exact ties; TerrainAlt2 432 px (96 above 1/32, max 0.84 ft) on one
+levee/channel pair with short segments, so it is not yet exact.
+
 ### Storage-area level pools
 
 Render standalone storage areas as RAS Mapper level pools

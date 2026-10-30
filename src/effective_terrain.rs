@@ -30,8 +30,9 @@
 //! The output lattice defaults to the export's: the finest source (ties by
 //! priority), over the union of the source extents snapped outward.
 //!
-//! Not reproduced: terrain modifications (refused; the caller must not pass a
-//! modified terrain as unmodified), and a small number of pixels in stitch-TIN
+//! Terrain modifications (schema 2) are applied after the mosaic by
+//! `terrain_mods`. Not reproduced: unqualified modification forms (refused), and
+//! a number of pixels in stitch-TIN
 //! corners where RAS Mapper itself is not stable (see `method_record`).
 use crate::{
     MapError,
@@ -48,8 +49,11 @@ use std::{
     time::Instant,
 };
 
-pub const METHOD_ID: &str = "rasmapper-effective-terrain/1";
-pub const SCHEMA: &str = "ras-commander-effective-terrain-request/1";
+pub const METHOD_ID: &str = "rasmapper-effective-terrain/2";
+/// The unmodified-terrain contract, still accepted.
+pub const METHOD_ID_V1: &str = "rasmapper-effective-terrain/1";
+pub const SCHEMA: &str = "ras-commander-effective-terrain-request/2";
+pub const SCHEMA_V1: &str = "ras-commander-effective-terrain-request/1";
 /// Nodata of the written terrain, as in RAS Mapper's export.
 pub const NODATA: f32 = -9999.0;
 const TILE: usize = 256;
@@ -73,6 +77,11 @@ pub struct Source {
     /// Level-0 tile mask (`Terrain/<source>/0/Mask`), `|u1` `[tiles, 65536]`,
     /// tiles row-major over the source raster.
     pub mask: ArrayFile,
+    /// Caller-verified CRS identity of this source when its stored WKT text
+    /// differs from the first source's but the caller has proven the CRSs
+    /// equal. Default: the request's `crs_identity`.
+    #[serde(default)]
+    pub crs_identity: Option<CrsIdentity>,
 }
 
 /// `Terrain/Stitch TIN Points` (`<f8` `[n, 4]`: x, y, z, cell size) and
@@ -124,8 +133,13 @@ pub struct Request {
     /// the union of the source extents.
     #[serde(default)]
     pub extent: Option<[f64; 4]>,
-    /// The caller asserts the registered terrain has no enabled modification.
+    /// Number of modification layers in the terrain HDF. Schema 1: must be 0.
+    /// Schema 2: must equal `modification_layers.len()`, so a caller cannot
+    /// drop a layer silently.
     pub modifications: usize,
+    /// Schema 2: every modification layer of the terrain (see `terrain_mods`).
+    #[serde(default)]
+    pub modification_layers: Vec<crate::terrain_mods::Layer>,
     pub threads: usize,
     pub max_working_bytes: u64,
 }
@@ -133,8 +147,11 @@ pub struct Request {
 pub fn method_record() -> Value {
     json!({
         "method_id": METHOD_ID,
+        "compatible_method_ids": [METHOD_ID_V1],
         "request_schema": SCHEMA,
-        "reference": "RasTerrain.export_rasmapper_terrain(downsample_factor=1, rasterize_modifications=False), HEC-RAS 7.0.1",
+        "request_schemas": [SCHEMA_V1, SCHEMA],
+        "reference": "RasTerrain.export_rasmapper_terrain(downsample_factor=1, rasterize_modifications=False), HEC-RAS 7.0.1; with modification_layers, rasterize_modifications=True",
+        "modifications": crate::terrain_mods::method_record(),
         "lattice": "finest source (ties: priority), union of source extents snapped outward; or a supplied grid",
         "order": "stitch TIN first; then sources in priority order",
         "source_test": "all four quad centres valid; after a higher-priority source has a valid pixel containing the point, at least one quad centre must be in the source footprint (mask bit 0 and valid)",
@@ -147,7 +164,7 @@ pub fn method_record() -> Value {
             "synthetic HEC-RAS 7.0.1 terrains (1-3 sources)": "4 of 5 bit-identical; 5 stitch-TIN corner px differ on the fifth (687,908 valid)"
         },
         "known_differences": "a few pixels where a stitch TIN triangle meets a nodata corner; RAS Mapper's own exports of one terrain disagree there (2 px of T2 change when an unrelated modification is rasterized)",
-        "refused": "terrain modifications, non-float32/rotated/non-square sources, sources in different CRSs"
+        "refused": "unqualified modification types (see modifications.refused), non-float32/rotated/non-square sources, sources in different CRSs"
     })
 }
 
@@ -157,16 +174,26 @@ fn invalid(msg: impl Into<String>) -> MapError {
 
 impl Request {
     pub fn validate(&self) -> Result<(), MapError> {
-        if self.schema != SCHEMA {
-            return Err(invalid(format!("schema must be {SCHEMA}")));
+        if self.schema == SCHEMA_V1 {
+            if self.modifications != 0 || !self.modification_layers.is_empty() {
+                return Err(MapError::Unsupported(
+                    "terrain modifications need request schema ras-commander-effective-terrain-request/2".into(),
+                ));
+            }
+        } else if self.schema == SCHEMA {
+            if self.modifications != self.modification_layers.len() {
+                return Err(invalid(format!(
+                    "modifications ({}) must equal the number of modification_layers ({})",
+                    self.modifications,
+                    self.modification_layers.len()
+                )));
+            }
+            crate::terrain_mods::validate(&self.modification_layers)?;
+        } else {
+            return Err(invalid(format!("schema must be {SCHEMA} or {SCHEMA_V1}")));
         }
         if self.sources.is_empty() {
             return Err(invalid("at least one source is required"));
-        }
-        if self.modifications != 0 {
-            return Err(MapError::Unsupported(
-                "terrain modifications are not reproduced (rasmapper-effective-terrain/1); use RAS Mapper's export".into(),
-            ));
         }
         if self.threads == 0 || self.max_working_bytes == 0 {
             return Err(invalid("threads and max_working_bytes must be positive"));
@@ -503,7 +530,7 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
             path.to_str()
                 .ok_or_else(|| invalid("source path is not UTF-8"))?,
             req.epsg,
-            &req.crs_identity,
+            s.crs_identity.as_ref().unwrap_or(&req.crs_identity),
             QueryConvention::PixelCenter,
             NodataPolicy::Dry,
             cache,
@@ -642,6 +669,10 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
             *t += v;
         }
     }
+    let mods_started = Instant::now();
+    let mods = crate::terrain_mods::apply(&req.modification_layers, &grid, &mut values)?;
+    let mods_seconds = mods_started.elapsed().as_secs_f64();
+    let valid = values.iter().filter(|v| **v != NODATA).count() as u64;
     let report = json!({
         "method_id": METHOD_ID,
         "grid": {"origin_x": grid.origin_x, "origin_y": grid.origin_y, "cell_size": grid.cell_size,
@@ -652,7 +683,8 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
             "cache": s.terrain.stats().cache,
         })).collect::<Vec<_>>(),
         "stitch_tin": {"triangles": tin_triangles, "pixels": tin_pixels, "seconds": tin_seconds},
-        "valid_pixels": tin_pixels + per_source.iter().sum::<u64>(),
+        "modifications": {"layers": mods, "seconds": mods_seconds},
+        "valid_pixels": valid,
         "seconds": started.elapsed().as_secs_f64(),
     });
     Ok(Effective {
