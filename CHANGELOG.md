@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### Storage-area level pools
+
+Render standalone storage areas as RAS Mapper level pools
+(`storage-area-level-pool/1`, advertised as `storage_area_surfaces` by the
+`sloping`, `horizontal` and `whole_simulation` methods). Optional
+`storage_areas_file` (framed little-endian WKB polygons), `storage_area_count`
+and per-profile `storage_area_values_file` (one finite float32 WSE per area) are
+all-or-nothing; requests without them are unchanged. A pixel whose centre is
+inside a storage-area polygon (terrio burn on the request window, clipped by the
+`global-terrain-lattice/1` AOI) gets the area's WSE; it is visible when float32
+`wse >= terrain + 0.001`, depth `wse - terrain`, and a horizontal request's
+strict `min_depth` applies as to 2D pixels. Whole-simulation requests accumulate
+pool pixels as wet when the rendered depth is strictly greater than the
+threshold; a level pool has no cell gate. Refused: storage-area pixels also owned
+by a 2D cell, pixels inside two storage areas, nonfinite storage-area WSE,
+velocity together with storage areas, boundary requests with storage areas and,
+on a top-priority source terrain, any storage-area pixel outside the source
+footprint.
+
+Native HEC-RAS 7.0.1 stored maps, BaldEagleCrkMulti2D p07 (87,039 cells) and
+p04 (15,503 cells, 2D levee structures), one storage area each: Max and
+02JAN1999 13:00 Depth/WSE in horizontal, plain sloping, slopingPretty and
+slopingPretty with shallow reduction, and whole-simulation arrival time and
+percent inundated (0.5 ft), match in every valid-mask pixel and float32 bit,
+including all storage-area pixels (p07 Max 466,912; p04 Max 461,639).
+
 ## 0.11.0 — 2026-10-29
 
 - Add byte-admitted LRU retention of reconstructed sloping timesteps across

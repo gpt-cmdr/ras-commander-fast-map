@@ -175,8 +175,8 @@ sloping surfaces. Cell-face interpolation, shallow-to-horizontal controls and
 face depth weighting are rejected. Supply one original, unmodified float32
 terrain TIFF and its matching terrain HDF metadata. Retiled/cropped TIFFs,
 terrain modifications and multi-source mosaics are outside this boundary scope.
-Commander rejects models containing 1D elements; standalone storage-area surfaces
-are excluded.
+Commander rejects models containing 1D elements; boundary requests refuse
+storage-area surfaces.
 
 The method retains valid negative depths to locate the zero-depth crossings.
 The intrinsic cell-wet gate uses float32 `WSE > minimum_elevation + 0.001`;
@@ -289,6 +289,43 @@ Lower-priority sources are not mosaicked: RAS Mapper's export resamples them
 with a rule close to, but not, pixel-centre bilinear (84% of float32 values
 reproduced), so a native mosaic is unqualified.
 
+## Storage-area surfaces
+
+`sloping`, `horizontal` and `whole-simulation` requests can render standalone
+storage areas as level pools (method `storage-area-level-pool/1`, advertised as
+`storage_area_surfaces` in `ras2fim-batch method`). Supply all three together:
+
+| Field | Contract |
+|---|---|
+| `storage_areas_file` | Framed little-endian WKB Polygons/MultiPolygons, one per storage area (same framing as `geometry_file`) |
+| `storage_area_count` | Number of storage areas in that file |
+| `profiles[].storage_area_values_file` | Little-endian float32 storage-area WSE for that profile (Max or one output time), one per area, finite |
+
+Each storage-area pixel (pixel centre inside the polygon, on the request window,
+clipped by the AOI mask) gets the area's WSE; it is visible when float32
+`wse >= terrain + 0.001`, with depth `wse - terrain`, in every render mode. The
+caller sizes `window` to cover the storage areas as well as the 2D cells. In
+whole-simulation requests a pool pixel is wet when its depth is strictly greater
+than the threshold; there is no cell gate. Pixels owned by both a 2D cell and a
+storage area, or by two storage areas, are refused (RAS Mapper's ordering for
+those layouts is not qualified), as are velocity with storage areas, boundary
+requests with storage areas and storage-area pixels outside a top-priority
+source's footprint.
+
+Qualification against native HEC-RAS 7.0.1 stored maps (RAS Mapper terrain
+export, valid masks and float32 bits):
+
+| Model | Products | Storage-area pixels | Result |
+|---|---|---|---|
+| BaldEagleCrkMulti2D p07 | Max Depth/WSE: horizontal, sloping, slopingPretty (with and without shallow reduction); 02JAN1999 13:00 horizontal and sloping | 466,912 (Max), 422,515 (13:00) | identical |
+| BaldEagleCrkMulti2D p04 (15,503 cells, 2D levee structures) | Max Depth/WSE: horizontal, sloping, slopingPretty (both); 13:00 sloping | 461,639 (Max), 421,927 (13:00) | identical |
+| p07 and p04 | Arrival time and percent inundated, 0.5 ft (865 output times) | 464,106 / 458,764 | identical |
+
+Duration stays unqualified: its 8 (p07) and 46 (p04) one-interval differences
+are all 2D pixels; every storage-area duration matches. Both models have one
+storage area connected to the 2D area; multiple storage areas and
+storage-area-to-storage-area connections are not covered by this evidence.
+
 ## Qualification and limits
 
 The retained [five-model comparisons](https://rascommander.info/ras/development/fim-mapping-performance/)
@@ -297,7 +334,7 @@ without an added depth cutoff. Those published timing observations predate this
 packaging extraction; no new speedup is claimed for renaming/distribution.
 
 Mapping covers physical 2D cells. Commander rejects models with 1D river/cross-
-section geometry. Standalone storage-area surfaces are excluded. Cell-face
+section geometry. Storage areas are mapped only when the request supplies them. Cell-face
 matching preserves the original source TIFF grid and 256-square tile layout;
 arbitrary retiled/cropped terrain and multi-source mosaics are unqualified.
 Depth weighting needs stored corner ground elevations. When absent, explicit

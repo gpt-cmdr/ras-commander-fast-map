@@ -76,7 +76,7 @@ pub fn method_record() -> Value {
         "terrain": "original float32 TIFF of the highest-priority registered source, 256 x 256 tiles; no export, resampling or mosaic",
         "footprint": "bit 0 of the source's level-0 terrain-HDF tile mask, with valid source data",
         "foreign_pixels": "owned pixels outside the footprint; allowed only in sloping cells that fail the native wet gate",
-        "refused": "foreign pixels of wet cells, foreign pixels in horizontal rendering, cell-face sloping",
+        "refused": "foreign pixels of wet cells, foreign pixels in horizontal rendering, foreign storage-area pixels, cell-face sloping",
         "qualified": "BaldEagleCrkMulti2D p07 (2 sources), native HEC-RAS 7.0.1 plain sloping Max and one output time"
     })
 }
@@ -135,27 +135,43 @@ pub struct Scoped {
 }
 
 /// Classifies owned pixels against the top-priority source's footprint.
+///
+/// `storage` lists storage-area (level-pool) window pixels. A level pool has no
+/// cell minimum that could bound a pixel's visibility without its terrain, so
+/// with more than one source any storage-area pixel outside the footprint is
+/// refused.
 pub fn check(
     scope: &TerrainScope,
     base: &Path,
     terrain: &NativeTerrain,
     window: [usize; 4],
     owner: &[u32],
+    storage: &[usize],
 ) -> Result<Scoped, MapError> {
     scope.validate()?;
     let [_, _, width, height] = window;
-    if owner.len() != width * height {
+    if owner.len() != width * height || storage.iter().any(|&p| p >= width * height) {
         return Err(MapError::Internal("ownership/window size mismatch".into()));
     }
     let inside = footprint(scope, base, terrain, window)?;
     let (owned, foreign) = classify(&inside, owner);
-    let record = json!({"method": method_record(), "source_count": scope.source_count,
+    let foreign_storage = foreign_storage(&inside, storage);
+    let mut record = json!({"method": method_record(), "source_count": scope.source_count,
         "owned_pixels": owned, "foreign_2d_pixels": foreign.len()});
+    if !storage.is_empty() {
+        record["storage_area_pixels"] = storage.len().into();
+        record["foreign_storage_area_pixels"] = foreign_storage.into();
+    }
     if scope.source_count == 1 {
         return Ok(Scoped {
             record,
             foreign: Vec::new(),
         });
+    }
+    if foreign_storage > 0 {
+        return Err(MapError::Unsupported(format!(
+            "{foreign_storage} storage-area pixels lie outside the top-priority source's footprint; lower-priority sources and stitches are not qualified"
+        )));
     }
     Ok(Scoped { record, foreign })
 }
@@ -181,6 +197,11 @@ pub fn deny_wet_foreign(
         )));
     }
     Ok(())
+}
+
+/// Storage-area pixels outside the footprint.
+fn foreign_storage(inside: &[bool], storage: &[usize]) -> usize {
+    storage.iter().filter(|&&p| !inside[p]).count()
 }
 
 /// Owned pixel count and 2D-owned pixels outside the footprint (window order).
@@ -218,6 +239,9 @@ mod tests {
         let owner = [1, 1, 0, 2, 0, 0];
         assert_eq!(classify(&inside, &owner), (3, vec![1, 3]));
         assert_eq!(classify(&inside, &[0; 6]), (0, vec![]));
+        // Storage-area pixels are classified on the same footprint.
+        assert_eq!(foreign_storage(&inside, &[2, 3, 5]), 1);
+        assert_eq!(foreign_storage(&inside, &[]), 0);
     }
 
     #[test]

@@ -7,8 +7,10 @@
 //!
 //! A pixel is wet at an output time when its rendered depth is strictly greater
 //! than `threshold` **and** its 2D cell passes RAS Mapper's thresholded cell gate
-//! `wse > cell_minimum + threshold` (float32). Physical 2D cells only; storage
-//! areas are not rendered (Commander refuses such plans). With times `t` as float32 hours and `n` output times:
+//! `wse > cell_minimum + threshold` (float32). Physical 2D cells, plus optional
+//! storage-area level pools (`storage-area-level-pool/1`) when the horizontal
+//! request supplies them: a pool pixel is wet when its rendered depth is
+//! strictly greater than `threshold`; a level pool has no cell gate. With times `t` as float32 hours and `n` output times:
 //!
 //! - percent = float32(100 * wet_count / n);
 //! - arrival = t[first wet];
@@ -61,7 +63,9 @@ fn all_products() -> Vec<String> {
 pub fn method_record() -> Value {
     json!({
         "method_id": METHOD_ID,
-        "render": "horizontal-cell-constant/2 per stored output time; physical 2D cells only",
+        "render": "horizontal-cell-constant/2 per stored output time; physical 2D cells and optional storage-area level pools",
+        "storage_area_surfaces": crate::storage_area::METHOD_ID,
+        "storage_area_wet": "rendered pool depth > threshold (float32, strict); no cell gate",
         "wet": "rendered depth valid and depth > threshold (float32, strict)",
         "percent_inundated": "float32(100 * wet_count / n_times)",
         "arrival_time": "first wet stored output time (hours)",
@@ -149,27 +153,50 @@ fn step(a: &mut Acc, position: u32, depth: Option<f32>, threshold: f32) -> u64 {
     u64::from(depth == Some(threshold))
 }
 
-/// Mapped pixels only (2D-owned with terrain); every other window pixel is
-/// never wet and stays NoData.
+/// Mapped pixels only (2D-owned or storage-area pixels with terrain); every
+/// other window pixel is never wet and stays NoData.
 #[derive(Default)]
 struct Accumulator {
     threshold: f32,
     /// Per 2D cell: minimum + threshold (float32), the native cell gate.
     gate: Vec<f32>,
     index: Vec<usize>,
+    /// 2D cell position, or storage-area position for entries at or after `storage_start`.
     source: Vec<u32>,
     ground: Vec<f32>,
     acc: Vec<Acc>,
+    /// First accumulator of a storage-area (level-pool) pixel.
+    storage_start: usize,
     equal: u64,
 }
 
 impl horizontal::Consumer for Accumulator {
-    fn prepare(&mut self, owner: &[u32], ground: &[f32]) -> Result<(), MapError> {
+    fn prepare(
+        &mut self,
+        owner: &[u32],
+        ground: &[f32],
+        storage: Option<&crate::storage_area::StorageAreaPixels>,
+    ) -> Result<(), MapError> {
         for (i, (&label, &g)) in owner.iter().zip(ground).enumerate() {
             if label != 0 && g.is_finite() {
                 self.index.push(i);
                 self.source.push(label - 1);
                 self.ground.push(g);
+            }
+        }
+        self.storage_start = self.index.len();
+        if let Some(storage) = storage {
+            for ((&p, &label), &g) in storage
+                .pixels
+                .iter()
+                .zip(&storage.labels)
+                .zip(&storage.ground)
+            {
+                if g.is_finite() {
+                    self.index.push(p);
+                    self.source.push(label);
+                    self.ground.push(g);
+                }
             }
         }
         self.acc = vec![
@@ -185,15 +212,31 @@ impl horizontal::Consumer for Accumulator {
         Ok(())
     }
 
-    fn profile(&mut self, position: usize, values: &[f32]) -> Result<(), MapError> {
-        let (threshold, gate) = (self.threshold, &self.gate);
+    fn profile(
+        &mut self,
+        position: usize,
+        values: &[f32],
+        storage: Option<&[f32]>,
+    ) -> Result<(), MapError> {
+        let (threshold, gate, start) = (self.threshold, &self.gate, self.storage_start);
+        if storage.is_none() && self.index.len() != start {
+            return Err(MapError::Internal(
+                "storage-area profile values missing".into(),
+            ));
+        }
         let position = position as u32;
         self.equal += self
             .acc
             .par_iter_mut()
+            .enumerate()
             .zip(self.source.par_iter())
             .zip(self.ground.par_iter())
-            .map(|((a, &source), &g)| -> Result<u64, MapError> {
+            .map(|(((k, a), &source), &g)| -> Result<u64, MapError> {
+                if k >= start {
+                    // Level pool: the storage area's WSE, with no cell gate.
+                    let value = storage.map_or(f32::NAN, |s| s[source as usize]);
+                    return Ok(step(a, position, horizontal::plot(value, g)?, threshold));
+                }
                 let value = values[source as usize];
                 // Fails the thresholded cell gate: never wet at this time.
                 let passes = value > gate[source as usize];
@@ -363,9 +406,9 @@ mod tests {
             gate: vec![f32::NEG_INFINITY; n],
             ..Default::default()
         };
-        a.prepare(&owner, &vec![0.0; n]).unwrap();
+        a.prepare(&owner, &vec![0.0; n], None).unwrap();
         for (k, values) in series.iter().enumerate() {
-            a.profile(k, values).unwrap();
+            a.profile(k, values, None).unwrap();
         }
         (finish(&a.acc, &a.index, n, times), a.equal)
     }
@@ -454,9 +497,9 @@ mod tests {
             gate: vec![0.2 + 0.5, -1.0 + 0.5],
             ..Default::default()
         };
-        a.prepare(&[1, 2], &[0.0, 0.0]).unwrap();
+        a.prepare(&[1, 2], &[0.0, 0.0], None).unwrap();
         for k in 0..3 {
-            a.profile(k, &[0.6, 0.6]).unwrap();
+            a.profile(k, &[0.6, 0.6], None).unwrap();
         }
         let r = finish(&a.acc, &a.index, 2, &[0.0, 1.0, 2.0]);
         assert!(r.arrival[0].is_nan());
@@ -465,6 +508,39 @@ mod tests {
             (r.arrival[1], r.duration[1], r.percent[1]),
             (0.0, 2.0, 100.0)
         );
+    }
+
+    #[test]
+    fn storage_area_pools_have_no_cell_gate() {
+        // Window of 4: pixel 0 is a 2D cell, pixels 2 and 3 are one storage
+        // area on grounds 1.0 and 0.0, pixel 1 is unmapped.
+        let storage = crate::storage_area::StorageAreaPixels {
+            pixels: vec![2, 3],
+            labels: vec![0, 0],
+            ground: vec![1.0, 0.0],
+            count: 1,
+        };
+        let mut a = Accumulator {
+            threshold: 0.5,
+            gate: vec![f32::INFINITY], // the 2D cell always fails its gate
+            ..Default::default()
+        };
+        a.prepare(&[1, 0, 0, 0], &[0.0; 4], Some(&storage)).unwrap();
+        // Pool WSE 0.6, 1.6, 1.4 (strictly > threshold above ground only where marked).
+        for (k, pool) in [0.6_f32, 1.6, 1.4].into_iter().enumerate() {
+            a.profile(k, &[9.0], Some(&[pool])).unwrap();
+        }
+        // Missing pool values with pool pixels present is an internal error.
+        assert!(a.profile(3, &[9.0], None).is_err());
+        let r = finish(&a.acc, &a.index, 4, &[0.0, 1.0, 2.0]);
+        assert!(r.arrival[0].is_nan() && r.arrival[1].is_nan());
+        // Ground 1.0: depth 0.6 only at t=1.
+        assert_eq!(
+            (r.arrival[2], r.percent[2]),
+            (1.0, (100.0_f64 / 3.0) as f32)
+        );
+        // Ground 0.0: depth 0.6, 1.6, 1.4: wet throughout.
+        assert_eq!((r.arrival[3], r.percent[3]), (0.0, 100.0));
     }
 
     #[test]

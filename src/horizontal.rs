@@ -44,12 +44,38 @@ pub struct Request {
     /// Declares `terrain` as the top-priority source of a registered terrain.
     #[serde(default)]
     pub terrain_scope: Option<crate::terrain_scope::TerrainScope>,
+    /// Optional standalone storage-area polygons (framed WKB, one per area).
+    #[serde(default)]
+    pub storage_areas_file: Option<String>,
+    #[serde(default)]
+    pub storage_area_count: usize,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     pub id: String,
     pub values_file: String,
+    /// Storage-area WSE for this profile (f32 per area), required with storage areas.
+    #[serde(default)]
+    pub storage_area_values_file: Option<String>,
+}
+
+/// Checks that storage-area polygons, count and per-profile values come together.
+pub(crate) fn validate_storage_fields<'a>(
+    file: Option<&String>,
+    count: usize,
+    mut profile_values: impl Iterator<Item = Option<&'a String>>,
+) -> Result<bool, MapError> {
+    let storage = file.is_some();
+    if storage != (count > 0)
+        || count >= u32::MAX as usize
+        || profile_values.any(|v| v.is_some() != storage)
+    {
+        return Err(MapError::Invalid(
+            "storage_areas_file, storage_area_count and every profile's storage_area_values_file go together".into(),
+        ));
+    }
+    Ok(storage)
 }
 
 pub fn method_record() -> Value {
@@ -61,7 +87,8 @@ pub fn method_record() -> Value {
         "terrain":"same-CRS north-up square float32 GeoTIFF; native terrio block reads once per window",
         "reuse":"terrain and ownership shared across all profiles; pixel parallelism inside bounded Rayon pool",
         "terrain_scope":crate::terrain_scope::METHOD_ID,
-        "scope":"2D horizontal cells only; no native sloping, 1D or structure renderer"})
+        "storage_area_surfaces":crate::storage_area::METHOD_ID,
+        "scope":"2D horizontal cells; optional storage-area level pools; no native sloping, 1D or structure renderer"})
 }
 fn bytes(count: usize, width: usize) -> Result<u64, MapError> {
     count
@@ -190,10 +217,22 @@ pub(crate) fn evaluate_for_test(
 /// request order, instead of rendered products being delivered.
 pub(crate) trait Consumer: Send {
     /// Window ownership (0 = none, else cell position + 1) and terrain
-    /// (NaN = nodata), after AOI masking.
-    fn prepare(&mut self, owner: &[u32], ground: &[f32]) -> Result<(), MapError>;
-    /// Cell WSE (NaN = dry) of one profile.
-    fn profile(&mut self, position: usize, values: &[f32]) -> Result<(), MapError>;
+    /// (NaN = nodata), after AOI masking, and the storage-area pixels when the
+    /// request has storage areas.
+    fn prepare(
+        &mut self,
+        owner: &[u32],
+        ground: &[f32],
+        storage: Option<&crate::storage_area::StorageAreaPixels>,
+    ) -> Result<(), MapError>;
+    /// Cell WSE (NaN = dry) of one profile, and its storage-area WSE (one
+    /// finite value per area) when the request has storage areas.
+    fn profile(
+        &mut self,
+        position: usize,
+        values: &[f32],
+        storage: Option<&[f32]>,
+    ) -> Result<(), MapError>;
 }
 
 /// Runs the horizontal pipeline. With a consumer, profiles are handed to it in
@@ -227,6 +266,13 @@ pub(crate) fn run_with(
     if let Some(scope) = &req.terrain_scope {
         scope.validate()?;
     }
+    let storage = validate_storage_fields(
+        req.storage_areas_file.as_ref(),
+        req.storage_area_count,
+        req.profiles
+            .iter()
+            .map(|p| p.storage_area_values_file.as_ref()),
+    )?;
     let mut ids = HashSet::new();
     for p in &req.profiles {
         model::validate_id(&p.id)?;
@@ -242,7 +288,9 @@ pub(crate) fn run_with(
     } else {
         0
     };
-    let planned = bytes(count, 40)?
+    // Storage areas: forward/reverse label burns, the retained AOI mask and
+    // sparse pixel lists (28 bytes per window pixel, conservatively).
+    let planned = bytes(count, if storage { 68 } else { 40 })?
         .checked_add(scope_bytes)
         .ok_or_else(|| MapError::Budget("size overflow".into()))?
         .checked_add(bytes(req.cell_count, 64)?)
@@ -279,13 +327,17 @@ pub(crate) fn run_with(
             "terrain block exceeds 64 MiB; export tiled terrain".into(),
         ));
     }
-    let geometry_bytes = [req.geometry_file.as_ref(), req.aoi_file.as_ref()]
-        .into_iter()
-        .flatten()
-        .try_fold(0_u64, |sum, name| -> Result<u64, MapError> {
-            sum.checked_add(fs::metadata(model::resolve(base, name))?.len())
-                .ok_or_else(|| MapError::Budget("geometry size overflow".into()))
-        })?;
+    let geometry_bytes = [
+        req.geometry_file.as_ref(),
+        req.aoi_file.as_ref(),
+        req.storage_areas_file.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .try_fold(0_u64, |sum, name| -> Result<u64, MapError> {
+        sum.checked_add(fs::metadata(model::resolve(base, name))?.len())
+            .ok_or_else(|| MapError::Budget("geometry size overflow".into()))
+    })?;
     let geometry_plan = geometry_bytes
         .checked_mul(12)
         .ok_or_else(|| MapError::Budget("geometry size overflow".into()))?;
@@ -326,6 +378,14 @@ pub(crate) fn run_with(
                 p.id
             )));
         }
+        if let Some(file) = &p.storage_area_values_file
+            && fs::metadata(model::resolve(base, file))?.len() != bytes(req.storage_area_count, 4)?
+        {
+            return Err(MapError::Invalid(format!(
+                "{}: storage-area values length mismatch",
+                p.id
+            )));
+        }
     }
     fs::create_dir(out)?;
     let mut report = json!({"schema":"ras2fim-horizontal-report/1", "status":"in_progress",
@@ -339,20 +399,22 @@ pub(crate) fn run_with(
                 .build()
                 .map_err(|e| MapError::Internal(e.to_string()))?;
             let owner_started = Instant::now();
+            let grid = terrio::ops::rasterize::Grid {
+                geo_transform: [
+                    terrain.gt[0] + col as f64 * terrain.gt[1],
+                    terrain.gt[1],
+                    0.,
+                    terrain.gt[3] + row as f64 * terrain.gt[5],
+                    0.,
+                    terrain.gt[5],
+                ],
+                cols: width,
+                rows: height,
+                crs: Default::default(),
+            };
+            // The AOI mask is kept for storage-area pixels, which it clips the same way.
+            let mut aoi_mask = None;
             let owner = if let Some(name) = &req.geometry_file {
-                let grid = terrio::ops::rasterize::Grid {
-                    geo_transform: [
-                        terrain.gt[0] + col as f64 * terrain.gt[1],
-                        terrain.gt[1],
-                        0.,
-                        terrain.gt[3] + row as f64 * terrain.gt[5],
-                        0.,
-                        terrain.gt[5],
-                    ],
-                    cols: width,
-                    rows: height,
-                    crs: Default::default(),
-                };
                 let cells =
                     crate::ownership::load(&model::resolve(base, name), req.cell_count, false)?;
                 let mut labels = pool.install(|| crate::ownership::burn(cells, grid.clone()))?;
@@ -370,6 +432,9 @@ pub(crate) fn run_with(
                                 }
                             })
                     });
+                    if storage {
+                        aoi_mask = Some(mask);
+                    }
                 }
                 labels
             } else {
@@ -413,9 +478,41 @@ pub(crate) fn run_with(
                 }
             }
             report["terrain_prepare_seconds"] = terrain_started.elapsed().as_secs_f64().into();
+            let storage_pixels = req
+                .storage_areas_file
+                .as_ref()
+                .map(|file| -> Result<_, MapError> {
+                    let tick = Instant::now();
+                    let mut pixels = crate::storage_area::prepare(
+                        &model::resolve(base, file),
+                        req.storage_area_count,
+                        &grid,
+                        &owner,
+                        aoi_mask.as_deref(),
+                        &pool,
+                    )?;
+                    for (g, &p) in pixels.ground.iter_mut().zip(&pixels.pixels) {
+                        *g = ground[p];
+                    }
+                    report["storage_areas"] = json!({
+                        "method": crate::storage_area::method_record(),
+                        "count": req.storage_area_count,
+                        "pixels": pixels.pixels.len(),
+                        "prepare_seconds": tick.elapsed().as_secs_f64(),
+                    });
+                    Ok(pixels)
+                })
+                .transpose()?;
+            drop(aoi_mask);
             if let Some(scope) = &req.terrain_scope {
-                let scoped =
-                    crate::terrain_scope::check(scope, base, &terrain, req.window, &owner)?;
+                let scoped = crate::terrain_scope::check(
+                    scope,
+                    base,
+                    &terrain,
+                    req.window,
+                    &owner,
+                    storage_pixels.as_ref().map_or(&[], |s| &s.pixels),
+                )?;
                 report["terrain_scope"] = scoped.record;
                 // Horizontal requests carry no cell minimum, so a foreign pixel's
                 // visibility cannot be bounded without its terrain: refuse.
@@ -429,13 +526,26 @@ pub(crate) fn run_with(
             for (position, p) in req.profiles.iter().enumerate() {
                 let tick = Instant::now();
                 let dir = out.join(&p.id);
+                let storage_values = |p: &Profile| -> Result<Option<Vec<f32>>, MapError> {
+                    match (&storage_pixels, &p.storage_area_values_file) {
+                        (Some(s), Some(file)) => Ok(Some(crate::storage_area::values(
+                            &model::resolve(base, file),
+                            s.count,
+                        )?)),
+                        (None, None) => Ok(None),
+                        _ => Err(MapError::Invalid(
+                            "storage-area profile values missing".into(),
+                        )),
+                    }
+                };
                 if let Some(consume) = consumer.as_mut() {
                     if position == 0 {
-                        pool.install(|| consume.prepare(&owner, &ground))?;
+                        pool.install(|| consume.prepare(&owner, &ground, storage_pixels.as_ref()))?;
                     }
                     let values =
                         read_values(&model::resolve(base, &p.values_file), req.cell_count)?;
-                    pool.install(|| consume.profile(position, &values))?;
+                    let pools = storage_values(p)?;
+                    pool.install(|| consume.profile(position, &values, pools.as_deref()))?;
                     report["profiles"].as_array_mut().unwrap().push(
                         json!({"id":p.id,"status":"complete","seconds":tick.elapsed().as_secs_f64()}),
                     );
@@ -457,6 +567,15 @@ pub(crate) fn run_with(
                             &mut wse,
                         )
                     })?;
+                    if let (Some(storage), Some(pools)) = (&storage_pixels, storage_values(p)?) {
+                        crate::storage_area::apply(
+                            storage,
+                            &pools,
+                            req.min_depth as f32,
+                            &mut depth,
+                            &mut wse,
+                        )?;
+                    }
                     if req.stream_outputs {
                         let stdout = std::io::stdout();
                         let mut stream = BufWriter::with_capacity(65536, stdout.lock());
