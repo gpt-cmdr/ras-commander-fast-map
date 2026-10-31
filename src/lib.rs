@@ -47,6 +47,7 @@ pub mod sloping_session;
 pub mod step05;
 pub mod storage_area;
 pub mod terrain;
+pub mod terrain_mods;
 pub mod terrain_scope;
 pub mod velocity;
 pub mod whole_simulation;
