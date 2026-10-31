@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-const USAGE: &str = "usage:\n  ras2fim-batch run <session.json> <new-output-dir>\n  ras2fim-batch boundary <request.json> <new-output-dir>\n  ras2fim-batch horizontal <request.json> <new-output-dir>\n  ras2fim-batch whole-simulation <request.json> <new-output-dir>\n  ras2fim-batch sloping <request.json> <new-output-dir>\n  ras2fim-batch step05 <request.json> <new-output-dir>\n  ras2fim-batch method\n  ras2fim-batch terrain-info <terrain.tif>";
+const USAGE: &str = "usage:\n  ras2fim-batch run <session.json> <new-output-dir>\n  ras2fim-batch boundary <request.json> <new-output-dir>\n  ras2fim-batch horizontal <request.json> <new-output-dir>\n  ras2fim-batch whole-simulation <request.json> <new-output-dir>\n  ras2fim-batch sloping <request.json> <new-output-dir>\n  ras2fim-batch step05 <request.json> <new-output-dir>\n  ras2fim-batch effective-terrain <request.json> <new-output-dir>\n  ras2fim-batch method\n  ras2fim-batch terrain-info <terrain.tif>";
 
 /// Samples this process's OS thread count (Linux /proc) to evidence no nested decode threads.
 struct ThreadMonitor {
@@ -103,8 +103,28 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             Ok(0)
         }
         ("method", 1) => {
-            let m = serde_json::json!({"engine": {"package": "ras-commander-fast-map", "version": ras_commander_fast_map::ENGINE_VERSION, "source_commit": ras_commander_fast_map::ENGINE_COMMIT}, "batch_session_r1": method_record(), "step05_r2": ras_commander_fast_map::step05::method_record(), "horizontal": ras_commander_fast_map::horizontal::method_record(), "sloping":ras_commander_fast_map::sloping_session::method_record(), "boundary":ras_commander_fast_map::boundary_session::method_record(), "whole_simulation":ras_commander_fast_map::whole_simulation::method_record()});
+            let m = serde_json::json!({"engine": {"package": "ras-commander-fast-map", "version": ras_commander_fast_map::ENGINE_VERSION, "source_commit": ras_commander_fast_map::ENGINE_COMMIT}, "batch_session_r1": method_record(), "step05_r2": ras_commander_fast_map::step05::method_record(), "horizontal": ras_commander_fast_map::horizontal::method_record(), "sloping":ras_commander_fast_map::sloping_session::method_record(), "boundary":ras_commander_fast_map::boundary_session::method_record(), "whole_simulation":ras_commander_fast_map::whole_simulation::method_record(), "effective_terrain":ras_commander_fast_map::effective_terrain::method_record()});
             println!("{}", serde_json::to_string_pretty(&m)?);
+            Ok(0)
+        }
+        ("effective-terrain", 3) => {
+            let path = PathBuf::from(&args[1]);
+            let out = PathBuf::from(&args[2]);
+            if out.exists() {
+                return Err("output directory exists; choose a new path".into());
+            }
+            let req: ras_commander_fast_map::effective_terrain::Request =
+                serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(&path)?))?;
+            let base = path
+                .canonicalize()?
+                .parent()
+                .map(PathBuf::from)
+                .ok_or("request has no parent")?;
+            let report = ras_commander_fast_map::effective_terrain::run(&req, &base, &out)?;
+            println!(
+                "{}",
+                serde_json::json!({"status": report["status"], "valid_pixels": report["valid_pixels"], "seconds": report["seconds"]})
+            );
             Ok(0)
         }
         ("terrain-info", 2) => {
