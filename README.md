@@ -126,6 +126,19 @@ Commander validates output metadata before delivery. Ordinary array streams
 and binary-file output remain compatible. These capabilities are included
 in 0.11.0; inspect advertised flags when integrating older binaries.
 
+### Fast-Map 0.12
+
+0.12.0 adds storage-area level pools (`storage_area_surfaces`
+`storage-area-level-pool/1` on the `sloping`, `horizontal` and
+`whole_simulation` methods), `ras2fim-batch effective-terrain` for unmodified
+multi-source terrains (`effective_terrain` `rasmapper-effective-terrain/1`),
+the qualified duration rule (`duration_rule`
+`rasmapper-backward-window-recession/1`), velocity clipping by the rendered or
+horizontal depth (`velocity_depth`), and D x V, D x V^2 and Froude with their
+Max over output times (`derived_products`, `derived_max` `reduce_max/1`).
+Existing method IDs and request schemas are unchanged; inspect the advertised
+flags before using these fields.
+
 Binary32 operation order and method identifiers are preserved. `MIGRATION.json`
 retains the immutable 0.8.0 extraction receipt; `SOURCE_MANIFEST.json` binds this
 version's current sources. `ras2fim-batch method` reports package/build identity
