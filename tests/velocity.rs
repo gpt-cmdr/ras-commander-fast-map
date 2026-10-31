@@ -69,3 +69,68 @@ fn capability_is_advertised() {
         "rasmapper-sloping-velocity/0"
     );
 }
+
+fn with_velocity() -> Value {
+    let mut v = sloping();
+    v["velocity_normals_files"] = json!(["n.f32"]);
+    v["profiles"][0]["face_velocity_files"] = json!(["v.f32"]);
+    v
+}
+
+fn invalid(v: Value) -> String {
+    let folder = scratch();
+    let r: sloping_session::Request = serde_json::from_value(v).unwrap();
+    let err = sloping_session::run(&r, &folder, &folder.join("out")).unwrap_err();
+    assert_eq!(err.kind(), "invalid", "{err}");
+    assert!(!folder.join("out").exists());
+    fs::remove_dir_all(folder).unwrap();
+    err.to_string()
+}
+
+#[test]
+fn derived_controls_are_validated_before_reads() {
+    // Derived controls without velocity.
+    for (field, value) in [
+        ("derived_products", json!(["depth_x_velocity"])),
+        ("velocity_depth", json!("horizontal")),
+        ("reduce_max", json!(true)),
+    ] {
+        let mut v = sloping();
+        v[field] = value;
+        assert!(invalid(v).contains("require velocity"), "{field}");
+    }
+    // Unknown or repeated products, Froude without gravity.
+    for products in [json!(["shear"]), json!(["froude", "froude"])] {
+        let mut v = with_velocity();
+        v["derived_products"] = products;
+        v["gravity"] = json!(32.174);
+        assert!(invalid(v).contains("derived_products"));
+    }
+    let mut v = with_velocity();
+    v["derived_products"] = json!(["froude"]);
+    assert!(invalid(v).contains("gravity"));
+    // The Max reduction needs products and file outputs.
+    let mut v = with_velocity();
+    v["reduce_max"] = json!(true);
+    assert!(invalid(v).contains("reduce_max"));
+    let mut v = with_velocity();
+    v["reduce_max"] = json!(true);
+    v["derived_products"] = json!(["depth_x_velocity"]);
+    v["stream_outputs"] = json!(true);
+    assert!(invalid(v).contains("reduce_max"));
+}
+
+#[test]
+fn derived_capabilities_are_advertised() {
+    let record = sloping_session::method_record();
+    assert_eq!(
+        record["derived_products"],
+        json!(["depth_x_velocity", "depth_x_velocity_squared", "froude"])
+    );
+    assert_eq!(record["velocity_depth"], json!(["rendered", "horizontal"]));
+    assert_eq!(record["derived_max"], "reduce_max/1");
+    assert_eq!(
+        record["derived_method_id"],
+        "rasmapper-depth-velocity-products/1"
+    );
+}

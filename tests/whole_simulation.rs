@@ -62,10 +62,25 @@ fn invalid_requests_are_rejected_before_reads() {
 }
 
 #[test]
-fn duration_requires_allow_unqualified() {
+fn duration_is_qualified_and_needs_no_opt_in() {
+    // Duration uses the native recession rule; it is no longer refused, so
+    // this request reaches its (missing) inputs.
     let mut v = request();
     v["products"] = json!(["arrival_time", "duration"]);
-    assert!(rejected(v).starts_with("unsupported"));
+    let err = rejected(v);
+    assert!(!err.starts_with("unsupported"), "{err}");
+    assert!(!err.starts_with("invalid input"), "{err}");
+}
+
+#[test]
+fn duration_with_storage_areas_is_refused_before_reads() {
+    // Level-pool pixels have no cell position for the recession search.
+    let mut v = request();
+    v["products"] = json!(["arrival_time", "duration"]);
+    v["horizontal"]["storage_areas_file"] = "areas.wkb".into();
+    v["horizontal"]["storage_area_count"] = 1.into();
+    let err = rejected(v);
+    assert!(err.contains("duration with storage-area surfaces"), "{err}");
 }
 
 #[test]
@@ -74,6 +89,10 @@ fn capability_is_advertised() {
     assert_eq!(record["method_id"], "native-whole-simulation-horizontal/1");
     assert_eq!(
         record["unqualified_refused"],
-        json!(["irregular_intervals", "duration"])
+        json!(["irregular_intervals"])
+    );
+    assert_eq!(
+        record["duration_rule"],
+        "rasmapper-backward-window-recession/1"
     );
 }

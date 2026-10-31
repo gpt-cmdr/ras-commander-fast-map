@@ -113,6 +113,21 @@ pub struct Request {
     /// magnitude product is rendered (method `rasmapper-sloping-velocity/0`).
     #[serde(default)]
     pub velocity_normals_files: Option<Vec<String>>,
+    /// Depth that clips velocity and feeds `derived_products`: the rendered
+    /// depth (default) or the horizontal cell-constant depth.
+    #[serde(default)]
+    pub velocity_depth: crate::velocity::VelocityDepth,
+    /// Per-profile products from that depth and velocity, in
+    /// `velocity::DERIVED` names (requires velocity).
+    #[serde(default)]
+    pub derived_products: Vec<String>,
+    /// Float32 gravity for `froude` in model units (32.174 or 9.80665).
+    #[serde(default)]
+    pub gravity: Option<f32>,
+    /// Pixelwise maximum of each derived product over every profile, written
+    /// to `max/`; per-profile products are then not written or streamed.
+    #[serde(default)]
+    pub reduce_max: bool,
 
     /// Declares `terrain` as the top-priority source of a registered terrain.
     #[serde(default)]
@@ -161,6 +176,7 @@ struct RenderedProfile {
     depth: Vec<f32>,
     wse: Vec<f32>,
     velocity: Option<Vec<f32>>,
+    derived: Vec<Vec<f32>>,
     hydraulic_seconds: f64,
     render_seconds: f64,
     hydraulic_reused: bool,
@@ -182,6 +198,7 @@ fn render(
     foreign: &[usize],
     hydraulic_cache: Option<&Mutex<Retained<String, Vec<sloping::PreparedProfile>>>>,
     storage: Option<&crate::storage_area::StorageAreaPixels>,
+    products: &DerivedPlan<'_>,
 ) -> Result<RenderedProfile, MapError> {
     let tick = Instant::now();
     let cache_key = if hydraulic_cache.is_some() && normals.is_none() {
@@ -245,6 +262,7 @@ fn render(
             .filter(|&&p| depth[p] > 0.0 && depth[p] <= 10000.0)
             .count();
     }
+    let mut derived = Vec::new();
     let velocity = match (normals, &profile.face_velocity_files) {
         (Some(normals), Some(files)) => {
             let mut face_velocity = Vec::new();
@@ -270,7 +288,18 @@ fn render(
                     )
                 })
                 .collect();
-            Some(crate::velocity::render(&inputs, window, &depth, pool)?)
+            let horizontal;
+            let clip = match products.depth {
+                crate::velocity::VelocityDepth::Rendered => &depth,
+                crate::velocity::VelocityDepth::Horizontal => {
+                    horizontal = crate::velocity::horizontal_depth(window, meshes, &cell_values)?;
+                    &horizontal
+                }
+            };
+            let velocity = crate::velocity::render(&inputs, window, clip, pool)?;
+            derived =
+                crate::velocity::derive_all(products.names, clip, &velocity, products.gravity)?;
+            Some(velocity)
         }
         _ => None,
     };
@@ -278,12 +307,57 @@ fn render(
         depth,
         wse,
         velocity,
+        derived,
         hydraulic_seconds,
         render_seconds,
         hydraulic_reused,
         finite_pixels,
         flooded_pixels,
     })
+}
+
+/// Velocity clipping depth and derived products of one request.
+struct DerivedPlan<'a> {
+    depth: crate::velocity::VelocityDepth,
+    names: &'a [String],
+    gravity: f32,
+}
+
+/// Validates the velocity-derived controls before any read.
+fn validate_derived(req: &Request) -> Result<(), MapError> {
+    let velocity = req.velocity_normals_files.is_some();
+    let names = &req.derived_products;
+    let mut seen = HashSet::new();
+    if names
+        .iter()
+        .any(|n| !crate::velocity::DERIVED.contains(&n.as_str()) || !seen.insert(n))
+    {
+        return Err(MapError::Invalid(format!(
+            "derived_products must be unique names from {:?}",
+            crate::velocity::DERIVED
+        )));
+    }
+    if !velocity
+        && (!names.is_empty()
+            || req.reduce_max
+            || req.velocity_depth != crate::velocity::VelocityDepth::Rendered)
+    {
+        return Err(MapError::Invalid(
+            "velocity_depth, derived_products and reduce_max require velocity".into(),
+        ));
+    }
+    if names.iter().any(|n| n == "froude") && !req.gravity.is_some_and(|g| g.is_finite() && g > 0.0)
+    {
+        return Err(MapError::Invalid(
+            "froude requires a finite positive gravity".into(),
+        ));
+    }
+    if req.reduce_max && (names.is_empty() || req.stream_outputs || req.geotiff_outputs) {
+        return Err(MapError::Invalid(
+            "reduce_max requires derived_products and file outputs".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -419,6 +493,12 @@ pub fn method_record() -> Value {
         "bounded_profile_concurrency":true,
         "persistent_session":true,"multi_window_cache":true,"hydraulic_cache":true,"native_geotiff_outputs":true,"bounded_pixel_weights":true,
         "velocity":crate::velocity::METHOD_ID,
+        "velocity_depth":["rendered","horizontal"],
+        "velocity_render_modes":["horizontal","sloping","slopingPretty"],
+        "derived_products":crate::velocity::DERIVED,
+        "derived_method_id":crate::velocity::DERIVED_METHOD_ID,
+        "derived_max":"reduce_max/1",
+
         "terrain_scope":crate::terrain_scope::METHOD_ID,
         "storage_area_surfaces":crate::storage_area::METHOD_ID,
         "options":{"CellRenderMode":"Sloping","CellStencilMode":"JustFacepoints",
@@ -482,6 +562,7 @@ pub fn run_with_session(
     mut session: Option<&mut PreparedSession>,
 ) -> Result<Value, MapError> {
     req.options.validate()?;
+    validate_derived(req)?;
     if req.geotiff_outputs && (!req.stream_outputs || req.velocity_normals_files.is_some()) {
         return Err(MapError::Unsupported(
             "native GeoTIFF requires stream_outputs and no velocity".into(),
@@ -746,6 +827,31 @@ pub fn run_with_session(
                 .and_then(|g| v.checked_add(g))
         })
         .ok_or_else(|| MapError::Budget("sloping concurrent profile plan overflow".into()))?;
+    // Velocity, an optional horizontal clipping depth and each derived array
+    // per in-flight profile; the max accumulators once.
+    let velocity_arrays = if req.velocity_normals_files.is_some() {
+        1 + u64::from(req.velocity_depth == crate::velocity::VelocityDepth::Horizontal)
+            + req.derived_products.len() as u64
+    } else {
+        0
+    };
+    let per_profile = (count as u64)
+        .checked_mul(4 * velocity_arrays)
+        .ok_or_else(|| MapError::Budget("velocity product plan overflow".into()))?;
+    let reduce = if req.reduce_max {
+        (count as u64)
+            .checked_mul(4 * req.derived_products.len() as u64)
+            .ok_or_else(|| MapError::Budget("max reduction plan overflow".into()))?
+    } else {
+        0
+    };
+    let admitted = admitted
+        .checked_add(per_profile)
+        .and_then(|v| v.checked_add(reduce))
+        .ok_or_else(|| MapError::Budget("velocity product plan overflow".into()))?;
+    let additional = additional
+        .checked_add(per_profile)
+        .ok_or_else(|| MapError::Budget("velocity product plan overflow".into()))?;
     let (effective, admitted) = admit_profiles(
         req.max_inflight_profiles,
         req.threads,
@@ -837,8 +943,23 @@ pub fn run_with_session(
                 })
                 .transpose()?;
             if velocity_normals.is_some() {
-                report["velocity"] = json!({"method": crate::velocity::method_record()});
+                report["velocity"] = json!({"method": crate::velocity::method_record(),
+                    "velocity_depth": match req.velocity_depth {
+                        crate::velocity::VelocityDepth::Rendered => "rendered",
+                        crate::velocity::VelocityDepth::Horizontal => "horizontal",
+                    },
+                    "derived_products": req.derived_products, "reduce_max": req.reduce_max});
             }
+            let plan = DerivedPlan {
+                depth: req.velocity_depth,
+                names: &req.derived_products,
+                gravity: req.gravity.unwrap_or(f32::NAN),
+            };
+            let mut maxima = if req.reduce_max {
+                vec![vec![f32::NAN; count]; req.derived_products.len()]
+            } else {
+                Vec::new()
+            };
             report["session"] = json!({"terrain_reused":terrain_reused,"geometry_reused":geometry_reused,"retained_window_budget_bytes":persistent_bytes});
             for &[mesh, cell] in &req.owner_cells {
                 if mesh >= meshes.len()
@@ -1101,6 +1222,7 @@ pub fn run_with_session(
                             .filter(|_| hydraulic_bytes > 0)
                             .map(|s| &s.hydraulics),
                         storage.as_ref(),
+                        &plan,
                     )
                 })?;
                 // Indexed collection and ordered emission preserve the pipe/report
@@ -1110,6 +1232,7 @@ pub fn run_with_session(
                         depth,
                         wse,
                         velocity,
+                        derived,
                         hydraulic_seconds,
                         render_seconds,
                         hydraulic_reused,
@@ -1118,13 +1241,20 @@ pub fn run_with_session(
                     } = rendered;
                     let dir = out.join(&profile.id);
                     fs::create_dir(&dir)?;
-                    if req.stream_outputs {
+                    if req.reduce_max {
+                        for (acc, values) in maxima.iter_mut().zip(&derived) {
+                            crate::velocity::accumulate_max(acc, values);
+                        }
+                    } else if req.stream_outputs {
                         let mut stream =
                             std::io::BufWriter::with_capacity(65536, std::io::stdout().lock());
                         let mut header =
                             json!({"id":profile.id,"status":"complete","pixels":count});
                         if velocity.is_some() {
                             header["velocity"] = true.into();
+                        }
+                        if !derived.is_empty() {
+                            header["derived"] = json!(req.derived_products);
                         }
                         if req.geotiff_outputs {
                             let tick = Instant::now();
@@ -1157,6 +1287,9 @@ pub fn run_with_session(
                             if let Some(velocity) = &velocity {
                                 crate::horizontal::write_f32(&mut stream, velocity)?;
                             }
+                            for values in &derived {
+                                crate::horizontal::write_f32(&mut stream, values)?;
+                            }
                             stream.flush()?;
                         }
                     } else {
@@ -1165,12 +1298,33 @@ pub fn run_with_session(
                         if let Some(velocity) = &velocity {
                             crate::horizontal::write_values(&dir.join("velocity.bin"), velocity)?;
                         }
+                        for (name, values) in req.derived_products.iter().zip(&derived) {
+                            crate::horizontal::write_values(
+                                &dir.join(format!("{name}.bin")),
+                                values,
+                            )?;
+                        }
                     }
                     let unit = json!({"id":profile.id,"status":"complete","hydraulic_seconds":hydraulic_seconds,"render_seconds":render_seconds,"hydraulic_reused":hydraulic_reused});
                     sink::write_json(&dir.join("unit.json"), &unit)?;
                     report["profiles"].as_array_mut().unwrap().push(unit);
                     sink::write_json(&out.join("report.json"), &report)?;
                 }
+            }
+            if req.reduce_max {
+                let dir = out.join("max");
+                fs::create_dir(&dir)?;
+                for (name, values) in req.derived_products.iter().zip(&maxima) {
+                    crate::horizontal::write_values(&dir.join(format!("{name}.bin")), values)?;
+                }
+                let valid: Vec<usize> = maxima
+                    .iter()
+                    .map(|m| m.iter().filter(|v| !v.is_nan()).count())
+                    .collect();
+                let unit = json!({"id":"max","status":"complete","profiles":req.profiles.len(),
+                    "products":req.derived_products,"valid_pixels":valid});
+                sink::write_json(&dir.join("unit.json"), &unit)?;
+                report["max"] = unit;
             }
             if let Some(s) = session.as_ref() {
                 let cache = s.hydraulics.lock().unwrap();
@@ -1194,11 +1348,16 @@ pub fn run_with_session(
                 for filename in [
                     "depth.bin",
                     "wse.bin",
+                    "velocity.bin",
                     "depth.bin.partial",
                     "wse.bin.partial",
                     "depth.tif",
                     "wse.tif",
-                ] {
+                ]
+                .into_iter()
+                .map(String::from)
+                .chain(req.derived_products.iter().map(|n| format!("{n}.bin")))
+                {
                     let _ = fs::remove_file(dir.join(filename));
                 }
                 if dir.is_dir() {

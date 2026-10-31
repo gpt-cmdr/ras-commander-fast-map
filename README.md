@@ -215,16 +215,44 @@ as float32 x, y, length, with **length replaced by the face polyline length**)
 and per-profile `face_velocity_files` (float32 face-normal velocities; for Max,
 the summary `Maximum Face Velocity` with Max WSE as the profile values) to a
 `sloping` request. Velocity magnitude is written as `velocity.bin`, or as a
-third streamed array when the stream header has `"velocity": true`. It is drawn
-where rendered depth > 0 and does not depend on the WSE render mode (method
-`rasmapper-sloping-velocity/0`).
+third streamed array when the stream header has `"velocity": true`. Its values
+do not depend on the WSE render mode; RAS Mapper clips them with the active
+mode's depth, so velocity is drawn where the clipping depth > 0 (method
+`rasmapper-sloping-velocity/0`). `velocity_depth` selects that depth:
+`rendered` (default, this request's `sloping` or `slopingPretty` depth) or
+`horizontal` (RAS Mapper's horizontal render: the owning cell's WSE over
+terrain, skipping cells with `wse <= minimum + 0.001`, float32).
+
+`derived_products` (`depth_x_velocity`, `depth_x_velocity_squared`, `froude`;
+method `rasmapper-depth-velocity-products/1`) adds per-profile arrays from the
+clipping depth `d` and velocity `v`, in RAS Mapper's operation order: `d * v`,
+`(d * v) * v`, and `float32(v / sqrt(float32(g * d)))` with the request's
+float32 `gravity` (32.174 or 9.80665). They are written as `<product>.bin` or
+streamed after velocity in the listed order (header `"derived"`).
+`reduce_max: true` keeps the pixelwise maximum of each derived product over
+every profile in the request and writes only `max/<product>.bin`: RAS Mapper's
+Max D x V, D x V^2 and Froude are per-output-time products reduced this way
+(the valid area is the union over times), not Max depth times Max velocity.
+The sloping method record advertises `velocity_depth`, `velocity_render_modes`,
+`derived_products`, `derived_method_id` and `derived_max` (`reduce_max/1`).
 
 Native HEC-RAS 7.0.1 comparison: BaldEagleCrkMulti2D bridges p05 (973,532 Max
 and 402,500 output-time pixels), dam-break p07 2D cells (Max and one output
 time, valid masks equal to depth) and a 2,500 x 2,500 Spring Creek eBFE AOI
 (1,101,529 pixels) match bit for bit; Davis p02 Max differs in 5 of 20,560
-pixels by at most 2 ulp. Storage areas, boundary requests, shear stress and Max
-derived products are outside this method.
+pixels by at most 2 ulp. A true sloping native run shows the valid mask equals
+the sloping depth mask on bridges Max (973,902 pixels, values and mask
+identical); the 973,532-pixel figure above came from a horizontal-mode
+reference. Horizontal clipping matches native horizontal velocity on bridges
+Max (973,532 pixels) and 03JAN1999 00:00 (402,500), and slopingPretty velocity
+values match natively on every common pixel (its mask follows the rendered
+slopingPretty depth). Derived products, native 7.0.1: bridges 03JAN1999 00:00
+sloping (402,616 pixels) and horizontal (402,500) bit for bit for all three;
+`reduce_max` over all 433 output times bridges Max sloping (973,956) and
+horizontal (973,531) bit for bit; Davis p02 (horizontal Max over 217 times and
+one sloping/horizontal output time) equal masks, at most 5 pixels within 2 ulp
+(the Davis velocity residual). Storage areas, boundary requests and shear
+stress are outside this method.
 
 ## Whole-simulation products (arrival time, duration, percent inundated)
 
@@ -237,17 +265,24 @@ horizontal request whose profiles are the stored output times in order, plus
 `times_hours` (one per profile, strictly increasing), `threshold`,
 `cell_minimum_file` (float32 cell minimum elevations in cell order), optional
 `products` (default `arrival_time`, `percent_inundated`) and
-`allow_unqualified` (required for `duration` and irregular intervals). Output times are evaluated sequentially over
+`allow_unqualified` (required for irregular intervals). Output times are evaluated sequentially over
 the mapped 2D-owned pixels only, in parallel, with 32
 bytes per mapped pixel. Products are written to `whole_simulation/<product>.bin`
 (float32, NaN = never wet).
 
 A pixel is wet when its horizontal depth is `> threshold` and its cell passes
 RAS Mapper's thresholded gate `wse > minimum + threshold`. Storage areas are
-not rendered; Commander refuses plans that contain them. Arrival is the first wet time and percent is
-`100 * wet / n`. Duration runs from arrival to the first dry time after the last
-wet one, or to the last wet time when that dry time would be the final output
-or there is none. Times are float32 hours. Irregular output intervals are
+rendered as level pools (see Storage-area surfaces) for arrival and percent;
+duration with storage areas is refused. Arrival is the first wet time and percent is
+`100 * wet / n`. Duration runs from arrival to RAS Mapper's recession time
+(`duration_rule` `rasmapper-backward-window-recession/1`): each cell's WSE
+series is split into monotone windows at its local extrema (PostProcessing's
+`Increasing Regions` rule, `v[k] >= v[k-1]` rising), and the windows are searched
+from the last. With `L` the last wet time, the recession is `L` when it ends a
+window, is one step before a falling window's end, or starts that falling
+window (the native round-half-even bisection gives up there), and `L + 1`
+otherwise. Duration keeps 8 bytes per cell extremum, admitted against the
+budget. Times are float32 hours. Irregular output intervals are
 refused unless `allow_unqualified` is set. Initially wet pixels, multi-period
 pixels and threshold-equal samples are reported.
 
@@ -257,8 +292,9 @@ BaldEagleCrkMulti2D bridges p05 (433 times, 959,043 pixels) match in every
 valid-mask pixel and every arrival and percent value bit for bit, including
 initially wet, multi-period and threshold-equal samples. RAS Mapper gives the
 same products in horizontal and sloping render modes on both models, so this
-horizontal pass covers sloping maps too. Duration is opt-in and unqualified:
-103 (Davis) and 11 (bridges) native durations are one output interval shorter.
+horizontal pass covers sloping maps too. Duration matches the same references
+in every pixel (the earlier first-dry-time rule differed on 103 Davis and 11
+bridges pixels).
 Bridges runs in 8.9 s at 383 MiB peak against about 25 s for the native call.
 
 ## Top-priority source terrain (no RAS Mapper export)
@@ -308,8 +344,8 @@ caller sizes `window` to cover the storage areas as well as the 2D cells. In
 whole-simulation requests a pool pixel is wet when its depth is strictly greater
 than the threshold; there is no cell gate. Pixels owned by both a 2D cell and a
 storage area, or by two storage areas, are refused (RAS Mapper's ordering for
-those layouts is not qualified), as are velocity with storage areas, boundary
-requests with storage areas and storage-area pixels outside a top-priority
+those layouts is not qualified), as are velocity with storage areas, duration
+with storage areas, boundary requests with storage areas and storage-area pixels outside a top-priority
 source's footprint.
 
 Qualification against native HEC-RAS 7.0.1 stored maps (RAS Mapper terrain
@@ -321,8 +357,10 @@ export, valid masks and float32 bits):
 | BaldEagleCrkMulti2D p04 (15,503 cells, 2D levee structures) | Max Depth/WSE: horizontal, sloping, slopingPretty (both); 13:00 sloping | 461,639 (Max), 421,927 (13:00) | identical |
 | p07 and p04 | Arrival time and percent inundated, 0.5 ft (865 output times) | 464,106 / 458,764 | identical |
 
-Duration stays unqualified: its 8 (p07) and 46 (p04) one-interval differences
-are all 2D pixels; every storage-area duration matches. Both models have one
+Duration with storage areas is refused: the recession search indexes cells,
+and level-pool pixels have no cell position. (A pre-recession-rule prototype
+matched every storage-area duration; its 8 (p07) and 46 (p04) one-interval
+differences were all 2D pixels.) Both models have one
 storage area connected to the 2D area; multiple storage areas and
 storage-area-to-storage-area connections are not covered by this evidence.
 
