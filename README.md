@@ -272,7 +272,8 @@ bytes per mapped pixel. Products are written to `whole_simulation/<product>.bin`
 
 A pixel is wet when its horizontal depth is `> threshold` and its cell passes
 RAS Mapper's thresholded gate `wse > minimum + threshold`. Storage areas are
-not rendered; Commander refuses plans that contain them. Arrival is the first wet time and percent is
+rendered as level pools (see Storage-area surfaces) for arrival and percent;
+duration with storage areas is refused. Arrival is the first wet time and percent is
 `100 * wet / n`. Duration runs from arrival to RAS Mapper's recession time
 (`duration_rule` `rasmapper-backward-window-recession/1`): each cell's WSE
 series is split into monotone windows at its local extrema (PostProcessing's
@@ -343,8 +344,8 @@ caller sizes `window` to cover the storage areas as well as the 2D cells. In
 whole-simulation requests a pool pixel is wet when its depth is strictly greater
 than the threshold; there is no cell gate. Pixels owned by both a 2D cell and a
 storage area, or by two storage areas, are refused (RAS Mapper's ordering for
-those layouts is not qualified), as are velocity with storage areas, boundary
-requests with storage areas and storage-area pixels outside a top-priority
+those layouts is not qualified), as are velocity with storage areas, duration
+with storage areas, boundary requests with storage areas and storage-area pixels outside a top-priority
 source's footprint.
 
 Qualification against native HEC-RAS 7.0.1 stored maps (RAS Mapper terrain
@@ -356,8 +357,10 @@ export, valid masks and float32 bits):
 | BaldEagleCrkMulti2D p04 (15,503 cells, 2D levee structures) | Max Depth/WSE: horizontal, sloping, slopingPretty (both); 13:00 sloping | 461,639 (Max), 421,927 (13:00) | identical |
 | p07 and p04 | Arrival time and percent inundated, 0.5 ft (865 output times) | 464,106 / 458,764 | identical |
 
-Duration stays unqualified: its 8 (p07) and 46 (p04) one-interval differences
-are all 2D pixels; every storage-area duration matches. Both models have one
+Duration with storage areas is refused: the recession search indexes cells,
+and level-pool pixels have no cell position. (A pre-recession-rule prototype
+matched every storage-area duration; its 8 (p07) and 46 (p04) one-interval
+differences were all 2D pixels.) Both models have one
 storage area connected to the 2D area; multiple storage areas and
 storage-area-to-storage-area connections are not covered by this evidence.
 

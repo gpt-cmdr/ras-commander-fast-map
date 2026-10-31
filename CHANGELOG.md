@@ -17,7 +17,7 @@ strict `min_depth` applies as to 2D pixels. Whole-simulation requests accumulate
 pool pixels as wet when the rendered depth is strictly greater than the
 threshold; a level pool has no cell gate. Refused: storage-area pixels also owned
 by a 2D cell, pixels inside two storage areas, nonfinite storage-area WSE,
-velocity together with storage areas, boundary requests with storage areas and,
+velocity or whole-simulation duration together with storage areas, boundary requests with storage areas and,
 on a top-priority source terrain, any storage-area pixel outside the source
 footprint.
 

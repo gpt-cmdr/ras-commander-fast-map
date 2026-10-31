@@ -440,6 +440,14 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
             "products must be unique arrival_time, duration or percent_inundated".into(),
         ));
     }
+    let duration = products.iter().any(|p| p == "duration");
+    // The recession search indexes cells; level-pool pixels carry storage-area
+    // labels, not cell positions, so duration is not defined for them yet.
+    if duration && h.storage_areas_file.is_some() {
+        return Err(MapError::Invalid(
+            "duration with storage-area surfaces is not implemented".into(),
+        ));
+    }
     let [_, _, width, height] = h.window;
     let count = width
         .checked_mul(height)
@@ -468,7 +476,6 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
             "cell minimum elevations must be finite".into(),
         ));
     }
-    let duration = products.iter().any(|p| p == "duration");
     // Duration keeps each cell's water-surface extrema (8 bytes each, at least
     // the two ends); they are admitted out of the same budget as they grow.
     // Reserve: the worst case (every time an extremum), capped at half the
@@ -775,7 +782,7 @@ mod tests {
         }
         // Missing pool values with pool pixels present is an internal error.
         assert!(a.profile(3, &[9.0], None).is_err());
-        let r = finish(&a.acc, &a.index, 4, &[0.0, 1.0, 2.0]);
+        let r = finish(&a.acc, &a.index, 4, &[0.0, 1.0, 2.0], None).unwrap();
         assert!(r.arrival[0].is_nan() && r.arrival[1].is_nan());
         // Ground 1.0: depth 0.6 only at t=1.
         assert_eq!(
