@@ -90,6 +90,62 @@ def sloping_smoke(engine, root, terrain):
             expected=np.full((4,4),level,dtype="<f4");expected[:,2:]=np.nan
             np.testing.assert_array_equal(actual,expected,err_msg=band)
     assert not stream.read()
+    # Native output controls preserve decoded values and explicitly set compression.
+    request.update(geotiff_outputs=True, products=["depth"])
+    for compression in ("NONE", "LZW"):
+        request["compression"] = compression
+        path.write_text(json.dumps(request))
+        destination = folder / f"native-{compression}"
+        result = subprocess.run([engine, "sloping", str(path), str(destination)],
+                                check=True, capture_output=True)
+        headers = [json.loads(line) for line in result.stdout.splitlines()]
+        assert all(h["selected_products"] == ["depth"] for h in headers)
+        for name, level in [("a", 1), ("b", 2)]:
+            assert not (destination / name / "wse.tif").exists()
+            with rasterio.open(destination / name / "depth.tif") as ds:
+                expected = np.full((4, 4), level, dtype="<f4")
+                expected[:, 2:] = np.nan
+                np.testing.assert_array_equal(ds.read(1).view("<u4"), expected.view("<u4"))
+                assert (ds.compression is None) == (compression == "NONE")
+    model = dict(request)
+    for key in ("products", "compression", "stream_outputs", "geotiff_outputs", "aoi_file"):
+        model.pop(key, None)
+    model.update(options={}, max_inflight_profiles=1)
+    grouped = dict(schema="ras-commander-depth-groups-request/1", model=model,
+        source_indices=[0, 1], depth_units="feet", depth_cutoff_ft=1.5,
+        max_accumulator_bytes=0, compression="NONE",
+        scratch=dict(path=str(root), node_local=True, max_bytes=1024),
+        jobs=[dict(job_id="left", reach_id="left", window=[0, 4, 4, 4], aoi_file="aoi.wkb",
+                   groups=[dict(group_id="both", timesteps=[1, 0]),
+                           dict(group_id="below-cutoff", timesteps=[0])])])
+    path.write_text(json.dumps(grouped))
+    grouped_out = folder / "groups"
+    subprocess.run([engine, "depth-groups", str(path), str(grouped_out)], check=True, capture_output=True)
+    report = json.loads((grouped_out / "report.json").read_text())
+    assert report["status"] == "complete" and report["hydraulic_preparations"] == 2
+    assert report["geometry_preparations"] == 1 and report["scratch_peak_bytes"] == 128
+    assert report["jobs"][0]["groups"][0]["source_indices"] == [1, 0]
+    with rasterio.open(grouped_out / "left/both.tif") as ds:
+        expected = np.full((4, 4), 2, dtype="<f4"); expected[:, 2:] = np.nan
+        np.testing.assert_array_equal(ds.read(1).view("<u4"), expected.view("<u4"))
+        assert ds.crs.to_epsg() == 3857 and ds.transform == Affine(1, 0, 0, 0, -1, 4)
+    with rasterio.open(grouped_out / "left/below-cutoff.tif") as ds:
+        assert np.isnan(ds.read(1)).all() and ds.shape == (4, 4)
+    assert sorted(p.name for p in grouped_out.iterdir()) == ["left", "report.json"]
+    # Exact byte lengths keep newlines inside Float32 payloads out of JSON framing.
+    grouped["sink"] = "grouped-buffer"
+    path.write_text(json.dumps(grouped))
+    result = subprocess.run([engine, "depth-groups", str(path), str(folder / "group-buffers")],
+                            check=True, capture_output=True)
+    stream = io.BytesIO(result.stdout)
+    for name in ("both", "below-cutoff"):
+        header = json.loads(stream.readline())["group"]
+        assert header["group_id"] == name and header["byte_length"] == 64
+        data = np.frombuffer(stream.read(header["byte_length"]), dtype="<f4")
+        assert len(data) == 16
+    assert json.loads(stream.readline()) == {"command_status": "complete"}
+    assert not stream.read()
+    print("Installed wheel: native selection/compression, grouped maxima/spill/buffers PASS")
     print("Installed wheel: plain/enhanced sloping options, binary geometry, profiles, file/stream AOI PASS")
 
 
@@ -100,6 +156,8 @@ def main():
     assert "step05_r2" in method
     assert method["horizontal"]["method_id"] == "horizontal-cell-constant/2"
     assert method["sloping"]["method_id"] == "rasmapper-plain-sloping/1"
+    assert method["sloping"]["native_output_compression"] == ["NONE", "LZW"]
+    assert method["depth_groups"]["request_schema"] == "ras-commander-depth-groups-request/1"
     with tempfile.TemporaryDirectory(prefix="ras2fim-wheel-") as tmp:
         root = Path(tmp)
         terrain = root / "terrain.tif"

@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Selected native products and grouped depth maxima
+
+Add optional native GeoTIFF product selection and explicit NONE/LZW compression,
+preserving existing Rust request structs, entry points and omitted-field defaults.
+Add versioned `depth-groups` requests, ordered per-sample receipts, per-reach AOI
+reduction of finalized Float32 depths, shared hydraulic preparation, bounded
+accumulator spill to explicit local scratch, row-based GeoTIFF delivery and a
+length-delimited grouped-buffer sink. Grouped scope initially covers saved
+timesteps with plain sloping and explicit feet/metres depth units. No grouped
+real-model hydraulic or performance qualification is claimed. See
+`docs/depth-groups.md` for capability checks, resource controls and failure rules.
+
 ## 0.12.0 — 2026-10-31
 
 ### Storage-area level pools
