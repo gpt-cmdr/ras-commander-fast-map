@@ -192,17 +192,16 @@ the callback metadata and one owned `Vec<f32>`. It introduces no Python/NumPy co
 The `sloping-server` command dispatches grouped-schema request files to the same
 session and emits one terminal command status, as with ordinary requests.
 
-## Commander and FIM integration
+## Application integration
 
-Commander must supply a new public `map_depth_groups()` wrapper, stage saved
-selectors through its native HDF engine, qualify depth units and compatible
-parent identities, supervise global memory/CPU budgets and record actual HDF
-preparation waves. Its existing catalog wrapper must pass product/compression
-controls and accept selected native output. Those Python integrations belong
-in the Commander checkout that contains `RasFim`; they are not implemented by
-this standalone crate or its binary-only wheel.
+Applications stage saved selectors, qualify depth units and compatible parent
+identities, supervise global memory/CPU budgets and record actual preparation
+waves. A caller can use existing model/HDF preparation primitives without adding
+a public mapping wrapper to those libraries. Native product/compression options
+are wire capabilities, independent of any Python API. Application orchestration
+is outside this standalone crate and its binary-only wheel.
 
-FIM retains station/band selection, discharge labels and merges, nearest
+Applications retain station/band selection, discharge labels and merges, nearest
 EPSG:3857 reprojection, wet crop, block maxima, packing and viewer checks. The
 coordinator must authorize the exact two-reach packet before external acceptance
 or benchmarks. Generated-fixture software parity alone establishes neither

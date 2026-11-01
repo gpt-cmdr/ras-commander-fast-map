@@ -111,8 +111,8 @@ The additive `depth-groups` command reduces finalized, individually masked saved
 timestep depths into one native-grid Float32 maximum per reach/group, with an
 inclusive cutoff, bounded resident accumulators, explicit local spill and ordered
 sample receipts. It also supports length-delimited binary delivery. See the
-[grouped depth contract](docs/depth-groups.md). Commander integration requires
-the corresponding wrapper; the native command consumes staged inputs, not HDF.
+[grouped depth contract](docs/depth-groups.md). The native command consumes staged
+inputs, not HDF; downstream applications own preparation and orchestration.
 Real-model hydraulic and performance qualification of grouped output is pending.
 
 The persistent sloping server additionally advertises `hydraulic_cache`,
