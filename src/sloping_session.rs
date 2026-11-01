@@ -20,6 +20,8 @@ use std::{
     time::Instant,
 };
 
+type PinnedHydraulics = Mutex<Option<(String, Arc<Vec<sloping::PreparedProfile>>)>>;
+
 type CachedGeometry = (Vec<Mesh>, Vec<Vec<Option<sloping::CellStencil>>>);
 type WindowKey = (
     String,
@@ -39,6 +41,10 @@ struct WindowData {
 /// terrain share bounded LRU window and hydraulic caches. Dropping releases all.
 #[derive(Default)]
 pub struct PreparedSession {
+    pinned_hydraulics: PinnedHydraulics,
+    grouped_profile: bool,
+    terrain_preparations: u64,
+    geometry_preparations: u64,
     terrain: Option<(String, Arc<NativeTerrain>)>,
     geometry: Option<(String, Arc<CachedGeometry>)>,
     windows: Retained<WindowKey, WindowData>,
@@ -46,7 +52,32 @@ pub struct PreparedSession {
     pool: Option<(usize, Arc<rayon::ThreadPool>)>,
 }
 
-fn identity(path: &Path) -> Result<String, MapError> {
+impl PreparedSession {
+    pub(crate) fn preparation_counts(&self) -> (u64, u64) {
+        (self.terrain_preparations, self.geometry_preparations)
+    }
+
+    pub(crate) fn install<R: Send>(
+        &self,
+        work: impl FnOnce() -> Result<R, MapError> + Send,
+    ) -> Result<R, MapError> {
+        self.pool
+            .as_ref()
+            .ok_or_else(|| MapError::Internal("session has no pool".into()))?
+            .1
+            .install(work)
+    }
+    pub(crate) fn begin_grouped_profile(&mut self) {
+        self.grouped_profile = true;
+        *self.pinned_hydraulics.lock().unwrap() = None;
+    }
+    pub(crate) fn end_grouped_profile(&mut self) {
+        self.grouped_profile = false;
+        *self.pinned_hydraulics.lock().unwrap() = None;
+    }
+}
+
+pub(crate) fn identity(path: &Path) -> Result<String, MapError> {
     let path = path.canonicalize()?;
     let metadata = path.metadata()?;
     Ok(format!(
@@ -56,7 +87,7 @@ fn identity(path: &Path) -> Result<String, MapError> {
         metadata.modified()?
     ))
 }
-fn geometry_key(req: &Request, base: &Path) -> Result<String, MapError> {
+pub(crate) fn geometry_key(req: &Request, base: &Path) -> Result<String, MapError> {
     let mut key = String::new();
     for filename in &req.mesh_files {
         let path = model::resolve(base, filename);
@@ -76,7 +107,7 @@ fn geometry_key(req: &Request, base: &Path) -> Result<String, MapError> {
 
 pub const SCHEMA: &str = "ras-commander-sloping-request/1";
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub schema: String,
@@ -197,11 +228,12 @@ fn render(
     normals: Option<&[Vec<crate::velocity::FaceNormal>]>,
     foreign: &[usize],
     hydraulic_cache: Option<&Mutex<Retained<String, Vec<sloping::PreparedProfile>>>>,
+    pinned: Option<&PinnedHydraulics>,
     storage: Option<&crate::storage_area::StorageAreaPixels>,
     products: &DerivedPlan<'_>,
 ) -> Result<RenderedProfile, MapError> {
     let tick = Instant::now();
-    let cache_key = if hydraulic_cache.is_some() && normals.is_none() {
+    let cache_key = if (hydraulic_cache.is_some() || pinned.is_some()) && normals.is_none() {
         let mut key =
             serde_json::to_string(&options).map_err(|e| MapError::Invalid(e.to_string()))?;
         for file in &profile.values_files {
@@ -211,10 +243,17 @@ fn render(
     } else {
         None
     };
-    let cached = match (&cache_key, hydraulic_cache) {
+    let pinned_value = pinned.and_then(|p| {
+        let guard = p.lock().unwrap();
+        guard
+            .as_ref()
+            .filter(|(key, _)| Some(key) == cache_key.as_ref())
+            .map(|(_, p)| p.clone())
+    });
+    let cached = pinned_value.or_else(|| match (&cache_key, hydraulic_cache) {
         (Some(key), Some(cache)) => cache.lock().unwrap().get(key),
         _ => None,
-    };
+    });
     let hydraulic_reused = cached.is_some();
     let mut new_prepared = Vec::new();
     let mut cell_values = Vec::new();
@@ -230,6 +269,9 @@ fn render(
         }
     }
     let prepared = cached.unwrap_or_else(|| Arc::new(new_prepared));
+    if let (Some(key), Some(pin)) = (&cache_key, pinned) {
+        *pin.lock().unwrap() = Some((key.clone(), prepared.clone()));
+    }
     if !hydraulic_reused && let (Some(key), Some(cache)) = (cache_key, hydraulic_cache) {
         let bytes = prepared.iter().map(|p| p.retained_bytes()).sum::<u64>()
             + (prepared.capacity() * std::mem::size_of::<sloping::PreparedProfile>()) as u64
@@ -360,7 +402,7 @@ fn validate_derived(req: &Request) -> Result<(), MapError> {
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     pub id: String,
@@ -491,7 +533,7 @@ pub fn method_record() -> Value {
         "depth_weighted_faces":true,
         "native_donation_history":true,
         "bounded_profile_concurrency":true,
-        "persistent_session":true,"multi_window_cache":true,"hydraulic_cache":true,"native_geotiff_outputs":true,"bounded_pixel_weights":true,
+        "persistent_session":true,"multi_window_cache":true,"hydraulic_cache":true,"native_geotiff_outputs":true,"native_output_products":["depth","wse"],"native_output_compression":["NONE","LZW"],"bounded_pixel_weights":true,
         "velocity":crate::velocity::METHOD_ID,
         "velocity_depth":["rendered","horizontal"],
         "velocity_render_modes":["horizontal","sloping","slopingPretty"],
@@ -559,8 +601,66 @@ pub fn run_with_session(
     req: &Request,
     base: &Path,
     out: &Path,
-    mut session: Option<&mut PreparedSession>,
+    session: Option<&mut PreparedSession>,
 ) -> Result<Value, MapError> {
+    run_with_output_options(req, base, out, session, None)
+}
+
+/// Run with optional GeoTIFF product/compression controls. Existing callers keep defaults.
+pub fn run_with_output_options(
+    req: &Request,
+    base: &Path,
+    out: &Path,
+    session: Option<&mut PreparedSession>,
+    output: Option<&crate::native_output::OutputOptions>,
+) -> Result<Value, MapError> {
+    run_internal(req, base, out, session, output, None, false)
+}
+
+pub(crate) type FrameSink<'a> = dyn FnMut(&Profile, Vec<f32>, Value) -> Result<(), MapError> + 'a;
+
+pub(crate) fn run_to_sink(
+    req: &Request,
+    base: &Path,
+    out: &Path,
+    session: &mut PreparedSession,
+    consumer: &mut FrameSink<'_>,
+) -> Result<Value, MapError> {
+    run_internal(req, base, out, Some(session), None, Some(consumer), false)
+}
+
+pub(crate) fn plan_with_session(
+    req: &Request,
+    base: &Path,
+    session: &mut PreparedSession,
+) -> Result<u64, MapError> {
+    Ok(
+        run_internal(req, base, Path::new(""), Some(session), None, None, true)?["planned_bytes"]
+            .as_u64()
+            .unwrap(),
+    )
+}
+
+fn run_internal(
+    req: &Request,
+    base: &Path,
+    out: &Path,
+    mut session: Option<&mut PreparedSession>,
+    output: Option<&crate::native_output::OutputOptions>,
+    mut consumer: Option<&mut FrameSink<'_>>,
+    plan_only: bool,
+) -> Result<Value, MapError> {
+    if let Some(output) = output {
+        output.validate()?;
+        if !req.geotiff_outputs {
+            return Err(MapError::Unsupported(
+                "output options require native geotiff_outputs".into(),
+            ));
+        }
+    }
+    let defaults = crate::native_output::OutputOptions::default();
+    let selected = output.unwrap_or(&defaults);
+    let deliver_files = consumer.is_none();
     req.options.validate()?;
     validate_derived(req)?;
     if req.geotiff_outputs && (!req.stream_outputs || req.velocity_normals_files.is_some()) {
@@ -723,6 +823,7 @@ pub fn run_with_session(
         && s.geometry.as_ref().is_some_and(|(old, _)| old != &key)
     {
         s.geometry = None;
+        *s.pinned_hydraulics.lock().unwrap() = None;
         s.hydraulics.lock().unwrap().clear();
         s.windows.clear();
     }
@@ -747,6 +848,34 @@ pub fn run_with_session(
         s.terrain = None;
         s.windows.clear();
     }
+    if !terrain_reused && let Some(s) = session.as_mut() {
+        s.terrain_preparations += 1;
+    }
+    if let Some(s) = session.as_mut()
+        && s.pool
+            .as_ref()
+            .is_some_and(|(threads, _)| *threads != req.threads)
+    {
+        s.pool = None;
+    }
+    let pool = if let Some((threads, pool)) = session
+        .as_ref()
+        .and_then(|s| s.pool.as_ref())
+        .filter(|(threads, _)| *threads == req.threads)
+    {
+        let _ = threads;
+        pool.clone()
+    } else {
+        Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(req.threads)
+                .build()
+                .map_err(|e| MapError::Internal(e.to_string()))?,
+        )
+    };
+    if let Some(s) = session.as_mut() {
+        s.pool = Some((req.threads, pool.clone()));
+    }
     let terrain = if terrain_reused {
         session
             .as_ref()
@@ -757,16 +886,18 @@ pub fn run_with_session(
             .1
             .clone()
     } else {
-        Arc::new(NativeTerrain::open(
-            model::resolve(base, &req.terrain)
-                .to_str()
-                .ok_or_else(|| MapError::Invalid("terrain path is not UTF8".into()))?,
-            req.epsg,
-            &req.crs_identity,
-            QueryConvention::PixelCenter,
-            NodataPolicy::Dry,
-            cache,
-        )?)
+        Arc::new(pool.install(|| {
+            NativeTerrain::open(
+                model::resolve(base, &req.terrain)
+                    .to_str()
+                    .ok_or_else(|| MapError::Invalid("terrain path is not UTF8".into()))?,
+                req.epsg,
+                &req.crs_identity,
+                QueryConvention::PixelCenter,
+                NodataPolicy::Dry,
+                cache,
+            )
+        })?)
     };
     if let Some(s) = session.as_mut() {
         s.terrain = Some((terrain_key.clone(), terrain.clone()));
@@ -860,39 +991,21 @@ pub fn run_with_session(
         admitted,
         additional,
     )?;
-    fs::create_dir(out)?;
+    if plan_only {
+        return Ok(json!({"planned_bytes":admitted}));
+    }
+    if deliver_files {
+        fs::create_dir(out)?;
+    }
     let mut report = json!({"schema":"ras-commander-sloping-report/1","status":"in_progress", "method":selected_method(req.options),
         "threads":req.threads,"window":req.window,"planned_bytes":admitted,
         "requested_inflight_profiles":req.max_inflight_profiles,"effective_inflight_profiles":effective,
         "additional_profile_planned_bytes":additional,"profiles":[]});
-    sink::write_json(&out.join("report.json"), &report)?;
+    if deliver_files {
+        sink::write_json(&out.join("report.json"), &report)?;
+    }
     let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || -> Result<(), MapError> {
-            if let Some(s) = session.as_mut()
-                && s.pool
-                    .as_ref()
-                    .is_some_and(|(threads, _)| *threads != req.threads)
-            {
-                s.pool = None;
-            }
-            let pool = if let Some((threads, pool)) = session
-                .as_ref()
-                .and_then(|s| s.pool.as_ref())
-                .filter(|(threads, _)| *threads == req.threads)
-            {
-                let _ = threads;
-                pool.clone()
-            } else {
-                Arc::new(
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(req.threads)
-                        .build()
-                        .map_err(|e| MapError::Internal(e.to_string()))?,
-                )
-            };
-            if let Some(s) = session.as_mut() {
-                s.pool = Some((req.threads, pool.clone()));
-            }
             let tick = Instant::now();
             let geometry_reused = session
                 .as_ref()
@@ -901,6 +1014,9 @@ pub fn run_with_session(
                 s.geometry = None;
                 s.hydraulics.lock().unwrap().clear();
                 s.windows.clear();
+            }
+            if !geometry_reused && let Some(s) = session.as_mut() {
+                s.geometry_preparations += 1;
             }
             let geometry = if geometry_reused {
                 session
@@ -1221,6 +1337,10 @@ pub fn run_with_session(
                             .as_ref()
                             .filter(|_| hydraulic_bytes > 0)
                             .map(|s| &s.hydraulics),
+                        session
+                            .as_ref()
+                            .filter(|s| s.grouped_profile)
+                            .map(|s| &s.pinned_hydraulics),
                         storage.as_ref(),
                         &plan,
                     )
@@ -1239,6 +1359,15 @@ pub fn run_with_session(
                         finite_pixels,
                         flooded_pixels,
                     } = rendered;
+                    if let Some(consumer) = consumer.as_mut() {
+                        let unit = json!({"id":profile.id,"status":"complete",
+                            "hydraulic_seconds":hydraulic_seconds,"render_seconds":render_seconds,
+                            "hydraulic_reused":hydraulic_reused});
+                        drop(wse);
+                        consumer(profile, depth, unit.clone())?;
+                        report["profiles"].as_array_mut().unwrap().push(unit);
+                        continue;
+                    }
                     let dir = out.join(&profile.id);
                     fs::create_dir(&dir)?;
                     if req.reduce_max {
@@ -1261,22 +1390,36 @@ pub fn run_with_session(
                             header["products"] = "native-geotiff/1".into();
                             header["depth_finite_pixels"] = finite_pixels.into();
                             header["flooded_pixels"] = flooded_pixels.into();
-                            crate::geotiff::write(
-                                &dir.join("depth.tif"),
-                                depth,
-                                width,
-                                height,
-                                transform,
-                                req.epsg,
-                            )?;
-                            crate::geotiff::write(
-                                &dir.join("wse.tif"),
-                                wse,
-                                width,
-                                height,
-                                transform,
-                                req.epsg,
-                            )?;
+                            if selected.products.iter().any(|p| p == "depth") {
+                                pool.install(|| {
+                                    crate::geotiff::write(
+                                        &dir.join("depth.tif"),
+                                        depth,
+                                        width,
+                                        height,
+                                        transform,
+                                        req.epsg,
+                                        selected.compression,
+                                    )
+                                })?;
+                            }
+                            if selected.products.iter().any(|p| p == "wse") {
+                                pool.install(|| {
+                                    crate::geotiff::write(
+                                        &dir.join("wse.tif"),
+                                        wse,
+                                        width,
+                                        height,
+                                        transform,
+                                        req.epsg,
+                                        selected.compression,
+                                    )
+                                })?;
+                            }
+                            if output.is_some() {
+                                header["selected_products"] = json!(selected.products);
+                                header["compression"] = json!(selected.compression);
+                            }
                             header["write_seconds"] = tick.elapsed().as_secs_f64().into();
                             writeln!(stream, "{header}")?;
                             stream.flush()?;
@@ -1308,7 +1451,9 @@ pub fn run_with_session(
                     let unit = json!({"id":profile.id,"status":"complete","hydraulic_seconds":hydraulic_seconds,"render_seconds":render_seconds,"hydraulic_reused":hydraulic_reused});
                     sink::write_json(&dir.join("unit.json"), &unit)?;
                     report["profiles"].as_array_mut().unwrap().push(unit);
-                    sink::write_json(&out.join("report.json"), &report)?;
+                    if deliver_files {
+                        sink::write_json(&out.join("report.json"), &report)?;
+                    }
                 }
             }
             if req.reduce_max {
@@ -1343,7 +1488,7 @@ pub fn run_with_session(
                 _ => "sloping internal panic".into(),
             }
             .into();
-            for profile in &req.profiles {
+            for profile in req.profiles.iter().filter(|_| deliver_files) {
                 let dir = out.join(&profile.id);
                 for filename in [
                     "depth.bin",
@@ -1377,7 +1522,9 @@ pub fn run_with_session(
     }
     report["total_seconds"] = started.elapsed().as_secs_f64().into();
     report["terrain_cache"] = json!(terrain.stats());
-    sink::write_json(&out.join("report.json"), &report)?;
+    if deliver_files {
+        sink::write_json(&out.join("report.json"), &report)?;
+    }
     Ok(report)
 }
 

@@ -101,6 +101,20 @@ statuses, preserve partial receipts and use a fresh output folder for retries.
 
 ### Retained reach state (0.11)
 
+Native sloping GeoTIFF requests also accept optional `products` (unique selections
+of `"depth"` and `"wse"`) and `compression` (`"NONE"` or `"LZW"`). Omission retains
+both products and LZW. These controls require `stream_outputs=true` and
+`geotiff_outputs=true`; inspect `native_output_products` and
+`native_output_compression` capabilities before sending them to older engines.
+
+The additive `depth-groups` command reduces finalized, individually masked saved
+timestep depths into one native-grid Float32 maximum per reach/group, with an
+inclusive cutoff, bounded resident accumulators, explicit local spill and ordered
+sample receipts. It also supports length-delimited binary delivery. See the
+[grouped depth contract](docs/depth-groups.md). Commander integration requires
+the corresponding wrapper; the native command consumes staged inputs, not HDF.
+Real-model hydraulic and performance qualification of grouped output is pending.
+
 The persistent sloping server additionally advertises `hydraulic_cache`,
 `multi_window_cache` and `native_geotiff_outputs`. Requests can set
 `hydraulic_cache_bytes` (default 0) and `window_cache_bytes` (default 64 MiB).
