@@ -97,6 +97,7 @@ pub fn method_record() -> Value {
         "sinks":["grouped-geotiff","grouped-buffer"],"compression":["NONE","LZW"],
         "products":["depth_max"],"render_modes":["sloping"],"saved_timesteps_only":true,
         "aoi_mask":crate::aoi::METHOD,"local_spill":true,"max_inflight_profiles":1,
+        "retained_job_windows":true,"native_timers":true,
         "buffer_protocol":"ras-commander-depth-group-buffer/1","hydraulic_qualification":"untested"})
 }
 
@@ -211,22 +212,123 @@ fn accumulate(acc: &mut [f32], depth: &[f32], threshold: f32) {
     }
 }
 
+/// Exclusive native phases. Their sum with `unattributed_seconds` equals `total_seconds`.
+#[derive(Default)]
+struct Timers {
+    admission: f64,
+    setup: f64,
+    accumulator_init: f64,
+    geometry: f64,
+    ownership: f64,
+    terrain: f64,
+    weights: f64,
+    hydraulic_read: f64,
+    hydraulic_other: f64,
+    render: f64,
+    finalize: f64,
+    resident_reduce: f64,
+    spill_read: f64,
+    spill_merge: f64,
+    spill_write: f64,
+    frame_accounting: f64,
+    full_route_overhead: f64,
+    pinned_route_overhead: f64,
+    input_recheck: f64,
+    delivery_spill_read: f64,
+    delivery_sink: f64,
+    delivery_other: f64,
+}
+impl Timers {
+    fn record(&self, total: f64) -> Value {
+        let mut record = serde_json::Map::new();
+        let mut sum = 0.0;
+        for (name, seconds) in [
+            ("admission_seconds", self.admission),
+            ("setup_seconds", self.setup),
+            ("accumulator_init_seconds", self.accumulator_init),
+            ("geometry_prepare_seconds", self.geometry),
+            ("ownership_prepare_seconds", self.ownership),
+            ("terrain_prepare_seconds", self.terrain),
+            ("weights_prepare_seconds", self.weights),
+            ("hydraulic_read_seconds", self.hydraulic_read),
+            ("hydraulic_other_seconds", self.hydraulic_other),
+            ("render_seconds", self.render),
+            ("finalize_seconds", self.finalize),
+            ("resident_reduce_seconds", self.resident_reduce),
+            ("spill_read_seconds", self.spill_read),
+            ("spill_merge_seconds", self.spill_merge),
+            ("spill_write_seconds", self.spill_write),
+            ("frame_accounting_seconds", self.frame_accounting),
+            ("full_route_overhead_seconds", self.full_route_overhead),
+            ("pinned_route_overhead_seconds", self.pinned_route_overhead),
+            ("input_recheck_seconds", self.input_recheck),
+            ("delivery_spill_read_seconds", self.delivery_spill_read),
+            ("delivery_sink_seconds", self.delivery_sink),
+            ("delivery_other_seconds", self.delivery_other),
+        ] {
+            sum += seconds;
+            record.insert(name.into(), seconds.into());
+        }
+        record.insert("unattributed_seconds".into(), (total - sum).into());
+        record.into()
+    }
+}
+
+#[derive(Default)]
+struct Retention {
+    pinned_frames: u64,
+    lru_hits: u64,
+    misses: u64,
+    unretained_frames: u64,
+    hydraulic_reuses: u64,
+}
+
+/// Stat identities of every retained input; compared once after the profile loop
+/// because retained windows no longer rehash these inputs for each frame.
+fn input_identities(req: &Request, base: &Path) -> Result<Vec<String>, MapError> {
+    let mut identities = vec![
+        sloping_session::identity(&model::resolve(base, &req.model.terrain))?,
+        sloping_session::identity(&model::resolve(base, &req.model.geometry_file))?,
+        sloping_session::geometry_key(&req.model, base)?,
+    ];
+    for job in &req.jobs {
+        if let Some(file) = &job.aoi_file {
+            identities.push(sloping_session::identity(&model::resolve(base, file))?);
+        }
+    }
+    Ok(identities)
+}
+
 enum Accumulator {
     Resident(Vec<f32>),
     Spill(PathBuf),
 }
 impl Accumulator {
-    fn update(&mut self, depth: &[f32], threshold: f32) -> Result<(), MapError> {
+    fn update(
+        &mut self,
+        depth: &[f32],
+        threshold: f32,
+        timers: &mut Timers,
+    ) -> Result<(), MapError> {
         match self {
-            Self::Resident(acc) => accumulate(acc, depth, threshold),
+            Self::Resident(acc) => {
+                let tick = Instant::now();
+                accumulate(acc, depth, threshold);
+                timers.resident_reduce += tick.elapsed().as_secs_f64();
+            }
             Self::Spill(path) => {
+                let tick = Instant::now();
                 let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+                timers.spill_read += tick.elapsed().as_secs_f64();
                 let mut bytes = vec![0; CHUNK * 4];
                 let mut acc = vec![0.0; CHUNK];
                 for (chunk, values) in depth.chunks(CHUNK).enumerate() {
                     let offset = (chunk * CHUNK * 4) as u64;
+                    let tick = Instant::now();
                     file.seek(SeekFrom::Start(offset))?;
                     file.read_exact(&mut bytes[..values.len() * 4])?;
+                    timers.spill_read += tick.elapsed().as_secs_f64();
+                    let tick = Instant::now();
                     for (a, b) in acc.iter_mut().zip(bytes.chunks_exact(4)).take(values.len()) {
                         *a = f32::from_le_bytes(b.try_into().unwrap());
                     }
@@ -234,8 +336,11 @@ impl Accumulator {
                     for (b, a) in bytes.chunks_exact_mut(4).zip(&acc).take(values.len()) {
                         b.copy_from_slice(&a.to_le_bytes());
                     }
+                    timers.spill_merge += tick.elapsed().as_secs_f64();
+                    let tick = Instant::now();
                     file.seek(SeekFrom::Start(offset))?;
                     file.write_all(&bytes[..values.len() * 4])?;
+                    timers.spill_write += tick.elapsed().as_secs_f64();
                 }
             }
         }
@@ -245,6 +350,7 @@ impl Accumulator {
         &self,
         width: usize,
         height: usize,
+        read_seconds: &mut f64,
         consume: &mut dyn FnMut(Vec<f32>, usize) -> Result<(), MapError>,
     ) -> Result<(), MapError> {
         let rows = crate::geotiff::strip_rows(width).min(height);
@@ -259,7 +365,9 @@ impl Accumulator {
                 for first in (0..height).step_by(rows) {
                     let nrows = rows.min(height - first);
                     let mut bytes = vec![0; nrows * width * 4];
+                    let tick = Instant::now();
                     file.read_exact(&mut bytes)?;
+                    *read_seconds += tick.elapsed().as_secs_f64();
                     let data = bytes
                         .chunks_exact(4)
                         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
@@ -436,6 +544,8 @@ pub fn run_with_session(
     let mut model = req.model.clone();
     model.max_working_bytes -= reserved;
     let mut peak_mapping = 0;
+    let mut timers = Timers::default();
+    let tick = Instant::now();
     // All windows are admitted before terrain payload reads or accumulator allocation.
     // Header/descriptors are inspected by the existing sloping planner.
     model.profiles.truncate(1);
@@ -456,6 +566,7 @@ pub fn run_with_session(
         }
         peak_mapping = peak_mapping.max(plan);
     }
+    timers.admission = tick.elapsed().as_secs_f64();
     let scratch = if spilled > 0 {
         Some(scratch_dir(req.scratch.as_ref().unwrap(), base)?)
     } else {
@@ -477,12 +588,14 @@ pub fn run_with_session(
             })).collect::<Vec<_>>() })).collect::<Vec<_>>() });
     crate::sink::write_json(&out.join("report.json"), &report)?;
     let mut delivered = Vec::new();
+    let mut retention = Retention::default();
     let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || -> Result<(), MapError> {
             let setup = Instant::now();
             let terrain_identity =
                 sloping_session::identity(&model::resolve(base, &req.model.terrain))?;
             let parent_key = sloping_session::geometry_key(&req.model, base)?;
+            let inputs = input_identities(req, base)?;
             let parent_identity = format!(
                 "fnv1a64:{:016x}",
                 crate::sink::fnv1a64(parent_key.as_bytes())
@@ -496,6 +609,8 @@ pub fn run_with_session(
                 .map_err(|e| MapError::Unsupported(format!("group CRS definition: {e}")))?
                 .to_wkt()
                 .ok_or_else(|| MapError::Invalid("group CRS has no WKT".into()))?;
+            timers.setup = setup.elapsed().as_secs_f64();
+            let tick = Instant::now();
             let mut accumulators = Vec::new();
             let mut slot = 0;
             for job in &req.jobs {
@@ -522,12 +637,14 @@ pub fn run_with_session(
                     slot += 1;
                 }
             }
+            timers.accumulator_init = tick.elapsed().as_secs_f64();
             report["prepare_seconds"] = (report["prepare_seconds"].as_f64().unwrap()
                 + setup.elapsed().as_secs_f64())
             .into();
             report["scratch_write_bytes"] = spilled.into();
             crate::sink::write_json(&out.join("report.json"), &report)?;
             let mut group_reduce_seconds = vec![0.0; layout.len()];
+            let mut pinned_windows: Vec<Option<usize>> = vec![None; req.jobs.len()];
             let mut frames: Vec<HashMap<u64, Value>> =
                 req.jobs.iter().map(|_| HashMap::new()).collect();
             for (profile, &source_index) in req.model.profiles.iter().zip(&req.source_indices) {
@@ -546,6 +663,7 @@ pub fn run_with_session(
                     model.window = job.window;
                     model.aoi_file = job.aoi_file.clone();
                     let mut seen = false;
+                    let mut consumer_seconds = 0.0;
                     let mut consume = |_: &sloping_session::Profile,
                                        depth: Vec<f32>,
                                        timing: Value|
@@ -556,6 +674,11 @@ pub fn run_with_session(
                             ));
                         }
                         seen = true;
+                        let consumer_started = Instant::now();
+                        let reduced_before = timers.resident_reduce
+                            + timers.spill_read
+                            + timers.spill_merge
+                            + timers.spill_write;
                         let native_wet =
                             depth.iter().filter(|d| d.is_finite() && **d > 0.0).count();
                         let retained = depth
@@ -573,7 +696,7 @@ pub fn run_with_session(
                         {
                             let _ = group;
                             let tick = Instant::now();
-                            accumulators[offset + g].update(&depth, threshold)?;
+                            accumulators[offset + g].update(&depth, threshold, &mut timers)?;
                             group_reduce_seconds[offset + g] += tick.elapsed().as_secs_f64();
                             if !layout[offset + g] {
                                 for key in ["scratch_read_bytes", "scratch_write_bytes"] {
@@ -601,15 +724,79 @@ pub fn run_with_session(
                             }
                         }
                         frames[j].insert(source_index, frame);
+                        consumer_seconds = consumer_started.elapsed().as_secs_f64();
+                        timers.frame_accounting += consumer_seconds
+                            - (timers.resident_reduce
+                                + timers.spill_read
+                                + timers.spill_merge
+                                + timers.spill_write
+                                - reduced_before);
                         Ok(())
                     };
-                    let mapped =
-                        sloping_session::run_to_sink(&model, base, out, session, &mut consume)?;
+                    let route_started = Instant::now();
+                    let pinned_route = pinned_windows[j].is_some();
+                    let mapped = match pinned_windows[j] {
+                        Some(index) => sloping_session::run_pinned_to_sink(
+                            &model,
+                            base,
+                            session,
+                            index,
+                            &mut consume,
+                        )?,
+                        None => {
+                            sloping_session::run_to_sink(&model, base, out, session, &mut consume)?
+                        }
+                    };
+                    let route_seconds = route_started.elapsed().as_secs_f64();
                     if mapped["status"] != "complete" || !seen {
                         return Err(MapError::Invalid(format!(
                             "incomplete mapped sample {source_index}: {}",
                             mapped["error"]
                         )));
+                    }
+                    let seconds = |key: &str| mapped[key].as_f64().unwrap_or(0.0);
+                    let unit = &mapped["profiles"][0];
+                    let hydraulic = unit["hydraulic_seconds"].as_f64().unwrap();
+                    let read = unit["hydraulic_read_seconds"].as_f64().unwrap();
+                    let render = unit["render_seconds"].as_f64().unwrap();
+                    let finalize = unit["finalize_seconds"].as_f64().unwrap();
+                    let weights = seconds("weights_prepare_seconds");
+                    timers.geometry += seconds("geometry_prepare_seconds");
+                    timers.ownership += seconds("ownership_prepare_seconds");
+                    timers.terrain += seconds("terrain_prepare_seconds");
+                    timers.weights += weights;
+                    timers.hydraulic_read += read;
+                    timers.hydraulic_other += hydraulic - read;
+                    timers.render += render;
+                    timers.finalize += finalize;
+                    let overhead = route_seconds
+                        - (seconds("geometry_prepare_seconds")
+                            + seconds("ownership_prepare_seconds")
+                            + seconds("terrain_prepare_seconds")
+                            + weights
+                            + hydraulic
+                            + render
+                            + finalize
+                            + consumer_seconds);
+                    if pinned_route {
+                        timers.pinned_route_overhead += overhead;
+                        retention.pinned_frames += 1;
+                    } else {
+                        timers.full_route_overhead += overhead;
+                        if mapped["session"]["window_reused"] == true {
+                            retention.lru_hits += 1;
+                        } else {
+                            retention.misses += 1;
+                        }
+                        pinned_windows[j] = mapped["session"]["pinned_window"]
+                            .as_u64()
+                            .map(|index| index as usize);
+                        if pinned_windows[j].is_none() {
+                            retention.unretained_frames += 1;
+                        }
+                    }
+                    if unit["hydraulic_reused"] == true {
+                        retention.hydraulic_reuses += 1;
                     }
                     for (key, flag) in [
                         ("geometry_preparations", "geometry_reused"),
@@ -636,6 +823,13 @@ pub fn run_with_session(
                 }
                 session.end_grouped_profile();
             }
+            let tick = Instant::now();
+            if input_identities(req, base)? != inputs {
+                return Err(MapError::Invalid(
+                    "grouped terrain, geometry or AOI input changed during mapping".into(),
+                ));
+            }
+            timers.input_recheck = tick.elapsed().as_secs_f64();
             let mut slot = 0;
             for (j, job) in req.jobs.iter().enumerate() {
                 let [col, row, width, height] = job.window;
@@ -702,29 +896,38 @@ pub fn run_with_session(
                     };
                     let mut valid = 0u64;
                     let mut hash = 0xcbf29ce484222325u64;
+                    let mut spill_read = 0.0;
+                    let mut sink = 0.0;
                     session.install(|| {
-                        accumulators[slot].rows(width, height, &mut |data, rows| {
-                            for &value in &data {
-                                valid += u64::from(value.is_finite());
-                                for byte in value.to_le_bytes() {
-                                    hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
+                        accumulators[slot].rows(
+                            width,
+                            height,
+                            &mut spill_read,
+                            &mut |data, rows| {
+                                for &value in &data {
+                                    valid += u64::from(value.is_finite());
+                                    for byte in value.to_le_bytes() {
+                                        hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
+                                    }
                                 }
-                            }
-                            if let Some(writer) = writer.as_mut() {
-                                writer
-                                    .write_rows(
-                                        &wbraster::raster::RasterData::F32(data),
-                                        rows,
-                                        None,
-                                    )
-                                    .map_err(|e| {
-                                        MapError::Io(format!("group GeoTIFF write: {e}"))
-                                    })?;
-                            } else {
-                                buffer.as_mut().unwrap().write(&data)?;
-                            }
-                            Ok(())
-                        })
+                                let tick = Instant::now();
+                                if let Some(writer) = writer.as_mut() {
+                                    writer
+                                        .write_rows(
+                                            &wbraster::raster::RasterData::F32(data),
+                                            rows,
+                                            None,
+                                        )
+                                        .map_err(|e| {
+                                            MapError::Io(format!("group GeoTIFF write: {e}"))
+                                        })?;
+                                } else {
+                                    buffer.as_mut().unwrap().write(&data)?;
+                                }
+                                sink += tick.elapsed().as_secs_f64();
+                                Ok(())
+                            },
+                        )
                     })?;
                     if let Some(writer) = writer {
                         session.install(|| {
@@ -747,6 +950,9 @@ pub fn run_with_session(
                     metadata["all_dry"] = (valid == 0).into();
                     metadata["output"]["float32_fnv1a64"] = format!("{hash:016x}").into();
                     let seconds = tick.elapsed().as_secs_f64();
+                    timers.delivery_spill_read += spill_read;
+                    timers.delivery_sink += sink;
+                    timers.delivery_other += seconds - spill_read - sink;
                     metadata["write_seconds"] = seconds.into();
                     metadata["timings"]["write_seconds"] = seconds.into();
                     report["write_seconds"] =
@@ -766,6 +972,11 @@ pub fn run_with_session(
         },
     ));
     session.end_grouped_profile();
+    let (windows_pinned, pinned_bytes) =
+        session.release_pinned_windows(req.model.window_cache_bytes);
+    report["window_retention"] = json!({"windows_pinned":windows_pinned,"pinned_bytes":pinned_bytes,
+        "pinned_frames":retention.pinned_frames,"lru_hits":retention.lru_hits,"misses":retention.misses,
+        "unretained_frames":retention.unretained_frames,"hydraulic_reuses":retention.hydraulic_reuses});
     match execution {
         Ok(Ok(())) => report["status"] = "complete".into(),
         failure => {
@@ -789,7 +1000,9 @@ pub fn run_with_session(
     let counts = session.preparation_counts();
     report["terrain_preparations"] = (counts.0 - initial_counts.0).into();
     report["geometry_preparations"] = (counts.1 - initial_counts.1).into();
-    report["total_seconds"] = started.elapsed().as_secs_f64().into();
+    let total = started.elapsed().as_secs_f64();
+    report["total_seconds"] = total.into();
+    report["native_timers"] = timers.record(total);
     if let Err(error) = crate::sink::write_json(&out.join("report.json"), &report) {
         for path in &delivered {
             let _ = fs::remove_file(path);
@@ -811,6 +1024,28 @@ pub fn run_with_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn input_identities_detect_a_replaced_aoi() {
+        let dir = std::env::temp_dir().join(format!("fast-map-identity-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        for name in ["terrain.tif", "cells.wkb", "aoi.wkb"] {
+            fs::write(dir.join(name), b"a").unwrap();
+        }
+        fs::write(dir.join("mesh.json"), b"{}").unwrap();
+        let req: Request = serde_json::from_value(json!({"schema":SCHEMA,
+            "model":{"schema":sloping_session::SCHEMA,"terrain":"terrain.tif","epsg":3857,
+                "crs_identity":{"kind":"epsg"},"terrain_transform":[0.,1.,0.,1.,0.,-1.],
+                "window":[0,0,1,1],"geometry_file":"cells.wkb","mesh_files":["mesh.json"],
+                "owner_cells":[[0,0]],"profiles":[],"threads":1,"max_working_bytes":1},
+            "source_indices":[],"depth_units":"feet","max_accumulator_bytes":0,
+            "jobs":[{"job_id":"a","reach_id":"a","window":[0,0,1,1],"aoi_file":"aoi.wkb","groups":[]}]}))
+        .unwrap();
+        let before = input_identities(&req, &dir).unwrap();
+        assert_eq!(before, input_identities(&req, &dir).unwrap());
+        fs::write(dir.join("aoi.wkb"), b"changed").unwrap();
+        assert_ne!(before, input_identities(&req, &dir).unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+    }
     #[test]
     fn cutoff_and_nodata_preserve_selected_bits() {
         let before = f32::from_bits(0.5f32.to_bits() - 1);

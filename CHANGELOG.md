@@ -14,6 +14,12 @@ timesteps with plain sloping and explicit feet/metres depth units. No grouped
 real-model hydraulic or performance qualification is claimed. See
 `docs/depth-groups.md` for capability checks, resource controls and failure rules.
 
+Grouped requests pin each admitted job window for the whole request, so later
+frames skip replanning and polygon rereads. Pinned windows share the
+`window_cache_bytes` ceiling and return to the LRU afterwards; windows that do not
+fit keep the per-frame route. Inputs are re-identified once before delivery. Reports
+add `window_retention` counters and exclusive `native_timers`.
+
 ## 0.12.0 — 2026-10-31
 
 ### Storage-area level pools
