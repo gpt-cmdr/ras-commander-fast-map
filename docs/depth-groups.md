@@ -181,10 +181,50 @@ window, LRU hits, misses, frames that stayed unretained and hydraulic reuses.
 terrain and weight preparation, hydraulic read and other hydraulic work, render,
 finalize, resident reduction, spill read/merge/write, frame accounting, per-frame
 route overhead on the full and pinned routes, the input recheck, and delivery spill
-read, sink and other delivery time. Ownership time includes the window-key read on a
-miss; on a hit that read is full-route overhead. The older `prepare_seconds` and
+read, sink and other delivery time. `window_key_seconds` measures the window-key
+read and construction separately from ownership. `hydraulic_reconstruction_seconds`
+measures the reconstruction calls separately from staged-value reads and other
+hydraulic work. The older `prepare_seconds` and
 `reduce_seconds` totals are unchanged and overlap these phases. Spill and sink timers
 measure blocking calls, not storage device waits.
+
+### Bounded profile preparation
+
+Engines advertising `bounded_profile_preparation: true` accept positive
+`model.max_inflight_profiles` above one. After the first profile prepares the
+shared parent and windows, batches reconstruct at most the admitted number of
+profiles on the session's existing Rayon pool. No additional pool or process is
+created. Rendering, group reduction, and delivery remain serialized in source
+order, retaining the same Float32 operation order, masks, cutoff, and maximum bits.
+The active profile stays pinned across requesting jobs; queued profiles remain
+owned until consumed. This is parallel reconstruction in bounded batches, rather
+than overlapping reconstruction with rendering.
+
+Admission caps the request by threads, profile count, and remaining working memory
+after accumulator/output/receipt reservations. Each extra slot conservatively
+reserves the existing full geometry/hydraulic allowance and output/work arrays.
+Insufficient space reduces concurrency to one; a serial plan that does not fit
+fails before payload reads. `requested_inflight_profiles`,
+`effective_inflight_profiles`, and `planned_bytes` report this decision.
+
+`native_timers.profile_prepare_wall_seconds` is exclusive batch elapsed time.
+`parallel_profile_durations` contains summed worker durations for staged-value
+reads, reconstruction, and other preparation work, plus preparation cache hits and
+misses. These worker durations overlap and must not be added to exclusive phases.
+Frame hydraulic durations include their attributed preparation work. The separate
+`hydraulic_cache` counts actual reused frames and reconstructed profiles, including
+the serial bootstrap. `terrain_cache.before` and `terrain_cache.after` retain
+session cumulative tile counters and decode durations; their difference describes
+this request. Window pin uses remain separate from window LRU hits/misses.
+
+`max_accumulator_bytes` has no fixed engine ceiling. Resident payload is admitted
+inside `model.max_working_bytes`; increasing its ceiling can reduce available
+profile slots or fail the serial plan. The receipt records the configured ceiling,
+`total_accumulator_bytes`, `resident_accumulator_bytes`, and spill peak/read/write
+bytes. A ceiling covering the full accumulator payload avoids all group spill
+traffic, including initialization, updates, and delivery readout. Partial budgets
+retain groups in request order. Measure the resulting wall time and residency;
+logical byte reduction alone does not establish a speedup.
 
 Only aggregate `status: complete` is success. Pending frames, failed groups,
 unknown statuses, an aborted report or nonzero process exit must be rejected.

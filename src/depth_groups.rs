@@ -8,7 +8,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -96,7 +96,7 @@ pub fn method_record() -> Value {
     json!({"method_id":METHOD,"request_schema":SCHEMA,"report_schema":REPORT_SCHEMA,
         "sinks":["grouped-geotiff","grouped-buffer"],"compression":["NONE","LZW"],
         "products":["depth_max"],"render_modes":["sloping"],"saved_timesteps_only":true,
-        "aoi_mask":crate::aoi::METHOD,"local_spill":true,"max_inflight_profiles":1,
+        "aoi_mask":crate::aoi::METHOD,"local_spill":true,"max_inflight_profiles":64,"bounded_profile_preparation":true,
         "retained_job_windows":true,"native_timers":true,
         "buffer_protocol":"ras-commander-depth-group-buffer/1","hydraulic_qualification":"untested"})
 }
@@ -142,9 +142,9 @@ impl Request {
             || self.model.reduce_max
             || self.model.stream_outputs
             || self.model.geotiff_outputs
-            || self.model.max_inflight_profiles != 1
+            || self.model.max_inflight_profiles == 0
         {
-            return Err(MapError::Unsupported("depth groups require plain sloping, no velocity/derived/output flags, and one in-flight profile".into()));
+            return Err(MapError::Unsupported("depth groups require plain sloping, no velocity/derived/output flags, and positive in-flight profiles".into()));
         }
         let mut selectors = HashSet::new();
         let mut profile_ids = HashSet::new();
@@ -220,10 +220,13 @@ struct Timers {
     accumulator_init: f64,
     geometry: f64,
     ownership: f64,
+    key: f64,
     terrain: f64,
     weights: f64,
     hydraulic_read: f64,
     hydraulic_other: f64,
+    hydraulic_reconstruction: f64,
+    profile_prepare_wall: f64,
     render: f64,
     finalize: f64,
     resident_reduce: f64,
@@ -248,10 +251,16 @@ impl Timers {
             ("accumulator_init_seconds", self.accumulator_init),
             ("geometry_prepare_seconds", self.geometry),
             ("ownership_prepare_seconds", self.ownership),
+            ("window_key_seconds", self.key),
             ("terrain_prepare_seconds", self.terrain),
             ("weights_prepare_seconds", self.weights),
             ("hydraulic_read_seconds", self.hydraulic_read),
             ("hydraulic_other_seconds", self.hydraulic_other),
+            (
+                "hydraulic_reconstruction_seconds",
+                self.hydraulic_reconstruction,
+            ),
+            ("profile_prepare_wall_seconds", self.profile_prepare_wall),
             ("render_seconds", self.render),
             ("finalize_seconds", self.finalize),
             ("resident_reduce_seconds", self.resident_reduce),
@@ -548,14 +557,16 @@ pub fn run_with_session(
     let tick = Instant::now();
     // All windows are admitted before terrain payload reads or accumulator allocation.
     // Header/descriptors are inspected by the existing sloping planner.
-    model.profiles.truncate(1);
+    let requested_inflight = model.max_inflight_profiles;
+    let mut effective_inflight = requested_inflight
+        .min(model.threads)
+        .min(model.profiles.len());
+    model.profiles.truncate(effective_inflight);
     for job in &req.jobs {
         model.window = job.window;
         model.aoi_file = job.aoi_file.clone();
-        let available = model.max_working_bytes;
-        model.max_working_bytes = u64::MAX;
-        let plan = sloping_session::plan_with_session(&model, base, session)?;
-        model.max_working_bytes = available;
+        let (plan, effective) = sloping_session::plan_grouped_profiles(&model, base, session)?;
+        effective_inflight = effective_inflight.min(effective);
         let total = add(reserved, plan)?;
         if total > req.model.max_working_bytes {
             return Err(budget(
@@ -566,6 +577,11 @@ pub fn run_with_session(
         }
         peak_mapping = peak_mapping.max(plan);
     }
+    // The serial plan includes one complete profile; each extra admitted slot
+    // reserves full output/work arrays and the geometry/hydraulic allowance.
+    // Reconstruction alone uses those extra slots; rendering stays serialized.
+    model.profiles.truncate(1);
+    model.max_inflight_profiles = 1;
     timers.admission = tick.elapsed().as_secs_f64();
     let scratch = if spilled > 0 {
         Some(scratch_dir(req.scratch.as_ref().unwrap(), base)?)
@@ -577,9 +593,11 @@ pub fn run_with_session(
         "engine":{"version":crate::ENGINE_VERSION,"source_commit":crate::ENGINE_COMMIT,"terrio":"0.4.2"},
         "depth_units":req.depth_units,"depth_cutoff_ft":req.depth_cutoff_ft,"effective_cutoff":threshold,
         "planned_bytes":add(reserved,peak_mapping)?,"resident_accumulator_bytes":resident,
+        "max_accumulator_bytes":req.max_accumulator_bytes,"total_accumulator_bytes":add(resident,spilled)?,
         "scratch_peak_bytes":spilled,"scratch_read_bytes":0,"scratch_write_bytes":0,
         "preparation_waves":1,"geometry_preparations":0,"terrain_preparations":0,
-        "hydraulic_preparations":0,"effective_inflight_profiles":1,"threads":model.threads,
+        "hydraulic_preparations":0,"requested_inflight_profiles":requested_inflight,
+        "effective_inflight_profiles":effective_inflight,"threads":model.threads,
         "compute_seconds":0.0,"prepare_seconds":started.elapsed().as_secs_f64(),"reduce_seconds":0.0,"write_seconds":0.0,
         "jobs":req.jobs.iter().map(|job| json!({"job_id":job.job_id,"reach_id":job.reach_id,
             "groups":job.groups.iter().map(|group| json!({"group_id":group.group_id,
@@ -589,6 +607,12 @@ pub fn run_with_session(
     crate::sink::write_json(&out.join("report.json"), &report)?;
     let mut delivered = Vec::new();
     let mut retention = Retention::default();
+    let mut profile_read_sum = 0.0;
+    let mut profile_other_sum = 0.0;
+    let mut profile_reconstruction_sum = 0.0;
+    let mut profile_hits = 0u64;
+    let mut profile_misses = 0u64;
+    let terrain_before = session.terrain_cache_stats();
     let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || -> Result<(), MapError> {
             let setup = Instant::now();
@@ -647,10 +671,51 @@ pub fn run_with_session(
             let mut pinned_windows: Vec<Option<usize>> = vec![None; req.jobs.len()];
             let mut frames: Vec<HashMap<u64, Value>> =
                 req.jobs.iter().map(|_| HashMap::new()).collect();
-            for (profile, &source_index) in req.model.profiles.iter().zip(&req.source_indices) {
+            let mut pending = VecDeque::new();
+            for (profile_index, (profile, &source_index)) in req
+                .model
+                .profiles
+                .iter()
+                .zip(&req.source_indices)
+                .enumerate()
+            {
                 session.begin_grouped_profile();
+                // Bootstrap the shared geometry/windows through the existing route.
+                // Subsequent batches reconstruct on the same bounded Rayon pool.
+                if profile_index > 0 && effective_inflight > 1 && pending.is_empty() {
+                    let end = (profile_index + effective_inflight).min(req.model.profiles.len());
+                    let tick = Instant::now();
+                    let prepared_batch = session.prepare_grouped_profiles(
+                        &model,
+                        base,
+                        &req.model.profiles[profile_index..end],
+                    );
+                    timers.profile_prepare_wall += tick.elapsed().as_secs_f64();
+                    pending = prepared_batch?.into();
+                    for prepared in &pending {
+                        profile_read_sum += prepared.read_seconds;
+                        profile_reconstruction_sum += prepared.reconstruction_seconds;
+                        profile_other_sum += prepared.seconds
+                            - prepared.read_seconds
+                            - prepared.reconstruction_seconds;
+                        if prepared.reused {
+                            profile_hits += 1;
+                        } else {
+                            profile_misses += 1;
+                        }
+                        report["hydraulic_preparations"] =
+                            (report["hydraulic_preparations"].as_u64().unwrap()
+                                + u64::from(!prepared.reused))
+                            .into();
+                    }
+                }
+                let prefetched = pending.pop_front();
+                if let Some(prepared) = &prefetched {
+                    session.pin_grouped_hydraulics(prepared);
+                }
                 model.profiles[0] = profile.clone();
                 let mut offset = 0;
+                let mut first_reach = true;
                 for (j, job) in req.jobs.iter().enumerate() {
                     if !job
                         .groups
@@ -662,11 +727,12 @@ pub fn run_with_session(
                     }
                     model.window = job.window;
                     model.aoi_file = job.aoi_file.clone();
+                    let prepared_timing = prefetched.as_ref().filter(|_| first_reach);
                     let mut seen = false;
                     let mut consumer_seconds = 0.0;
                     let mut consume = |_: &sloping_session::Profile,
                                        depth: Vec<f32>,
-                                       timing: Value|
+                                       mut timing: Value|
                      -> Result<(), MapError> {
                         if seen || depth.len() != pixels(job)? {
                             return Err(MapError::Internal(
@@ -675,6 +741,12 @@ pub fn run_with_session(
                         }
                         seen = true;
                         let consumer_started = Instant::now();
+                        if let Some(prepared) = prepared_timing {
+                            timing["hydraulic_seconds"] =
+                                (timing["hydraulic_seconds"].as_f64().unwrap() + prepared.seconds)
+                                    .into();
+                            timing["hydraulic_reused"] = prepared.reused.into();
+                        }
                         let reduced_before = timers.resident_reduce
                             + timers.spill_read
                             + timers.spill_merge
@@ -763,15 +835,21 @@ pub fn run_with_session(
                     let weights = seconds("weights_prepare_seconds");
                     timers.geometry += seconds("geometry_prepare_seconds");
                     timers.ownership += seconds("ownership_prepare_seconds");
+                    timers.key += seconds("window_key_seconds");
                     timers.terrain += seconds("terrain_prepare_seconds");
                     timers.weights += weights;
                     timers.hydraulic_read += read;
-                    timers.hydraulic_other += hydraulic - read;
+                    let reconstruction = unit["hydraulic_reconstruction_seconds"]
+                        .as_f64()
+                        .unwrap_or(0.0);
+                    timers.hydraulic_reconstruction += reconstruction;
+                    timers.hydraulic_other += hydraulic - read - reconstruction;
                     timers.render += render;
                     timers.finalize += finalize;
                     let overhead = route_seconds
                         - (seconds("geometry_prepare_seconds")
                             + seconds("ownership_prepare_seconds")
+                            + seconds("window_key_seconds")
                             + seconds("terrain_prepare_seconds")
                             + weights
                             + hydraulic
@@ -796,7 +874,8 @@ pub fn run_with_session(
                         }
                     }
                     if unit["hydraulic_reused"] == true {
-                        retention.hydraulic_reuses += 1;
+                        retention.hydraulic_reuses +=
+                            u64::from(prepared_timing.is_none_or(|p| p.reused));
                     }
                     for (key, flag) in [
                         ("geometry_preparations", "geometry_reused"),
@@ -820,6 +899,7 @@ pub fn run_with_session(
                         + mapped["profiles"][0]["hydraulic_seconds"].as_f64().unwrap())
                     .into();
                     offset += job.groups.len();
+                    first_reach = false;
                 }
                 session.end_grouped_profile();
             }
@@ -1003,6 +1083,14 @@ pub fn run_with_session(
     let total = started.elapsed().as_secs_f64();
     report["total_seconds"] = total.into();
     report["native_timers"] = timers.record(total);
+    report["parallel_profile_durations"] = json!({"scope":"summed_worker_wall_seconds_not_additive_to_native_timers",
+        "hydraulic_read_seconds":profile_read_sum,"hydraulic_other_seconds":profile_other_sum,
+        "hydraulic_reconstruction_seconds":profile_reconstruction_sum,
+        "cache_hits":profile_hits,"cache_misses":profile_misses});
+    report["hydraulic_cache"] = json!({"hits":retention.hydraulic_reuses,
+        "misses":report["hydraulic_preparations"]});
+    report["terrain_cache"] = json!({"before":terrain_before,"after":session.terrain_cache_stats(),
+        "scope":"session_cumulative_snapshots"});
     if let Err(error) = crate::sink::write_json(&out.join("report.json"), &report) {
         for path in &delivered {
             let _ = fs::remove_file(path);

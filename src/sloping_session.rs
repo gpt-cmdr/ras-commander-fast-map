@@ -22,6 +22,16 @@ use std::{
 
 type PinnedHydraulics = Mutex<Option<(String, Arc<Vec<sloping::PreparedProfile>>)>>;
 
+/// One admitted profile reconstructed before its serialized render/reduction.
+pub(crate) struct GroupedHydraulics {
+    key: String,
+    prepared: Arc<Vec<sloping::PreparedProfile>>,
+    pub seconds: f64,
+    pub read_seconds: f64,
+    pub reconstruction_seconds: f64,
+    pub reused: bool,
+}
+
 type CachedGeometry = (Vec<Mesh>, Vec<Vec<Option<sloping::CellStencil>>>);
 type WindowKey = (
     String,
@@ -63,6 +73,53 @@ pub struct PreparedSession {
 }
 
 impl PreparedSession {
+    /// Reconstruct a bounded batch on the session's existing Rayon pool.
+    /// The caller admits all slots before invoking this function.
+    pub(crate) fn prepare_grouped_profiles(
+        &self,
+        req: &Request,
+        base: &Path,
+        profiles: &[Profile],
+    ) -> Result<Vec<GroupedHydraulics>, MapError> {
+        let (_, geometry) = self
+            .geometry
+            .as_ref()
+            .ok_or_else(|| MapError::Internal("grouped geometry not prepared".into()))?;
+        let pool = &self.pool.as_ref().unwrap().1;
+        map_batch(profiles, pool, |profile| {
+            let tick = Instant::now();
+            let pin = Mutex::new(None);
+            let (key, prepared, _, read_seconds, reconstruction_seconds, reused) =
+                prepare_hydraulics(
+                    profile,
+                    base,
+                    &geometry.0,
+                    &geometry.1,
+                    pool,
+                    req.options,
+                    true,
+                    (req.hydraulic_cache_bytes > 0).then_some(&self.hydraulics),
+                    Some(&pin),
+                )?;
+            Ok(GroupedHydraulics {
+                key: key.ok_or_else(|| MapError::Internal("missing hydraulic identity".into()))?,
+                prepared,
+                seconds: tick.elapsed().as_secs_f64(),
+                read_seconds,
+                reconstruction_seconds,
+                reused,
+            })
+        })
+    }
+
+    pub(crate) fn pin_grouped_hydraulics(&self, profile: &GroupedHydraulics) {
+        *self.pinned_hydraulics.lock().unwrap() =
+            Some((profile.key.clone(), profile.prepared.clone()));
+    }
+
+    pub(crate) fn terrain_cache_stats(&self) -> Option<crate::terrain::TerrainStats> {
+        self.terrain.as_ref().map(|(_, terrain)| terrain.stats())
+    }
     pub(crate) fn preparation_counts(&self) -> (u64, u64) {
         (self.terrain_preparations, self.geometry_preparations)
     }
@@ -230,6 +287,7 @@ struct RenderedProfile {
     derived: Vec<Vec<f32>>,
     hydraulic_seconds: f64,
     hydraulic_read_seconds: f64,
+    hydraulic_reconstruction_seconds: f64,
     render_seconds: f64,
     finalize_seconds: f64,
     hydraulic_reused: bool,
@@ -237,25 +295,28 @@ struct RenderedProfile {
     flooded_pixels: usize,
 }
 
-#[allow(clippy::too_many_arguments)] // Explicit immutable geometry/window/cache borrows.
-fn render(
+type HydraulicPreparation = (
+    Option<String>,
+    Arc<Vec<sloping::PreparedProfile>>,
+    Vec<Vec<f32>>,
+    f64,
+    f64,
+    bool,
+);
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_hydraulics(
     profile: &Profile,
     base: &Path,
     meshes: &[Mesh],
     stencils: &[Vec<Option<sloping::CellStencil>>],
-    window: &sloping::RasterWindow<'_>,
     pool: &rayon::ThreadPool,
     options: sloping::Options,
-    weights: Option<&sloping::PixelWeights>,
-    normals: Option<&[Vec<crate::velocity::FaceNormal>]>,
-    foreign: &[usize],
+    not_velocity: bool,
     hydraulic_cache: Option<&Mutex<Retained<String, Vec<sloping::PreparedProfile>>>>,
     pinned: Option<&PinnedHydraulics>,
-    storage: Option<&crate::storage_area::StorageAreaPixels>,
-    products: &DerivedPlan<'_>,
-) -> Result<RenderedProfile, MapError> {
-    let tick = Instant::now();
-    let cache_key = if (hydraulic_cache.is_some() || pinned.is_some()) && normals.is_none() {
+) -> Result<HydraulicPreparation, MapError> {
+    let cache_key = if (hydraulic_cache.is_some() || pinned.is_some()) && not_velocity {
         let mut key =
             serde_json::to_string(&options).map_err(|e| MapError::Invalid(e.to_string()))?;
         for file in &profile.values_files {
@@ -280,15 +341,18 @@ fn render(
     let mut new_prepared = Vec::new();
     let mut cell_values = Vec::new();
     let mut hydraulic_read_seconds = 0.0;
+    let mut hydraulic_reconstruction_seconds = 0.0;
     if !hydraulic_reused {
         for ((mesh, stencil), filename) in meshes.iter().zip(stencils).zip(&profile.values_files) {
             let read = Instant::now();
             let wse = values(&model::resolve(base, filename), mesh.cells.len())?;
             hydraulic_read_seconds += read.elapsed().as_secs_f64();
+            let reconstruction = Instant::now();
             new_prepared.push(sloping::prepare_profile_with_options(
                 mesh, stencil, &wse, 0.001, pool, options,
             )?);
-            if normals.is_some() {
+            hydraulic_reconstruction_seconds += reconstruction.elapsed().as_secs_f64();
+            if !not_velocity {
                 cell_values.push(wse);
             }
         }
@@ -297,7 +361,7 @@ fn render(
     if let (Some(key), Some(pin)) = (&cache_key, pinned) {
         *pin.lock().unwrap() = Some((key.clone(), prepared.clone()));
     }
-    if !hydraulic_reused && let (Some(key), Some(cache)) = (cache_key, hydraulic_cache) {
+    if !hydraulic_reused && let (Some(key), Some(cache)) = (cache_key.clone(), hydraulic_cache) {
         let bytes = prepared.iter().map(|p| p.retained_bytes()).sum::<u64>()
             + (prepared.capacity() * std::mem::size_of::<sloping::PreparedProfile>()) as u64
             + key.capacity() as u64
@@ -306,6 +370,52 @@ fn render(
                 + 2 * std::mem::size_of::<usize>()) as u64;
         cache.lock().unwrap().insert(key, prepared.clone(), bytes);
     }
+    Ok((
+        cache_key,
+        prepared,
+        cell_values,
+        hydraulic_read_seconds,
+        hydraulic_reconstruction_seconds,
+        hydraulic_reused,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)] // Explicit immutable geometry/window/cache borrows.
+fn render(
+    profile: &Profile,
+    base: &Path,
+    meshes: &[Mesh],
+    stencils: &[Vec<Option<sloping::CellStencil>>],
+    window: &sloping::RasterWindow<'_>,
+    pool: &rayon::ThreadPool,
+    options: sloping::Options,
+    weights: Option<&sloping::PixelWeights>,
+    normals: Option<&[Vec<crate::velocity::FaceNormal>]>,
+    foreign: &[usize],
+    hydraulic_cache: Option<&Mutex<Retained<String, Vec<sloping::PreparedProfile>>>>,
+    pinned: Option<&PinnedHydraulics>,
+    storage: Option<&crate::storage_area::StorageAreaPixels>,
+    products: &DerivedPlan<'_>,
+) -> Result<RenderedProfile, MapError> {
+    let tick = Instant::now();
+    let (
+        _,
+        prepared,
+        cell_values,
+        hydraulic_read_seconds,
+        hydraulic_reconstruction_seconds,
+        hydraulic_reused,
+    ) = prepare_hydraulics(
+        profile,
+        base,
+        meshes,
+        stencils,
+        pool,
+        options,
+        normals.is_none(),
+        hydraulic_cache,
+        pinned,
+    )?;
     crate::terrain_scope::deny_wet_foreign(foreign, window.owner, window.owner_cells, |m, c| {
         prepared[m].is_wet(c)
     })?;
@@ -379,6 +489,7 @@ fn render(
         derived,
         hydraulic_seconds,
         hydraulic_read_seconds,
+        hydraulic_reconstruction_seconds,
         render_seconds,
         finalize_seconds,
         hydraulic_reused,
@@ -658,16 +769,16 @@ pub(crate) fn run_to_sink(
     run_internal(req, base, out, Some(session), None, Some(consumer), false)
 }
 
-pub(crate) fn plan_with_session(
+pub(crate) fn plan_grouped_profiles(
     req: &Request,
     base: &Path,
     session: &mut PreparedSession,
-) -> Result<u64, MapError> {
-    Ok(
-        run_internal(req, base, Path::new(""), Some(session), None, None, true)?["planned_bytes"]
-            .as_u64()
-            .unwrap(),
-    )
+) -> Result<(u64, usize), MapError> {
+    let report = run_internal(req, base, Path::new(""), Some(session), None, None, true)?;
+    Ok((
+        report["planned_bytes"].as_u64().unwrap(),
+        report["effective_inflight_profiles"].as_u64().unwrap() as usize,
+    ))
 }
 
 fn validate_profiles(req: &Request) -> Result<bool, MapError> {
@@ -777,6 +888,7 @@ pub(crate) fn run_pinned_to_sink(
     .ok_or_else(|| MapError::Internal("grouped frame was not rendered".into()))?;
     let unit = json!({"id":profile.id,"status":"complete",
         "hydraulic_seconds":rendered.hydraulic_seconds,"render_seconds":rendered.render_seconds,
+        "hydraulic_reconstruction_seconds":rendered.hydraulic_reconstruction_seconds,
         "hydraulic_read_seconds":rendered.hydraulic_read_seconds,"finalize_seconds":rendered.finalize_seconds,
         "hydraulic_reused":rendered.hydraulic_reused});
     consumer(profile, rendered.depth, unit.clone())?;
@@ -926,7 +1038,10 @@ fn run_internal(
         .and_then(|v| v.checked_add(if storage { count as u64 * 28 } else { 0 }))
         .ok_or_else(|| MapError::Budget("sloping array plan overflow".into()))?;
     if planned > req.max_working_bytes {
-        return Err(MapError::Budget("sloping array plan exceeds budget".into()));
+        return Err(MapError::Budget(format!(
+            "sloping array plan: required {planned} bytes, allowed {} bytes",
+            req.max_working_bytes
+        )));
     }
     let key = if session.is_some() {
         geometry_key(req, base)?
@@ -1107,7 +1222,7 @@ fn run_internal(
         additional,
     )?;
     if plan_only {
-        return Ok(json!({"planned_bytes":admitted}));
+        return Ok(json!({"planned_bytes":admitted,"effective_inflight_profiles":effective}));
     }
     if deliver_files {
         fs::create_dir(out)?;
@@ -1242,6 +1357,8 @@ fn run_internal(
                     None,
                 )
             };
+            report["window_key_seconds"] = tick.elapsed().as_secs_f64().into();
+            let tick = Instant::now();
             let pinned_index = session
                 .as_ref()
                 .and_then(|s| s.pinned_windows.iter().position(|w| w.key == window_key));
@@ -1503,6 +1620,7 @@ fn run_internal(
                         derived,
                         hydraulic_seconds,
                         hydraulic_read_seconds,
+                        hydraulic_reconstruction_seconds,
                         render_seconds,
                         finalize_seconds,
                         hydraulic_reused,
@@ -1512,6 +1630,7 @@ fn run_internal(
                     if let Some(consumer) = consumer.as_mut() {
                         let unit = json!({"id":profile.id,"status":"complete",
                             "hydraulic_seconds":hydraulic_seconds,"render_seconds":render_seconds,
+                            "hydraulic_reconstruction_seconds":hydraulic_reconstruction_seconds,
                             "hydraulic_read_seconds":hydraulic_read_seconds,"finalize_seconds":finalize_seconds,
                             "hydraulic_reused":hydraulic_reused});
                         drop(wse);
