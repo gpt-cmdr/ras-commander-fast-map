@@ -567,6 +567,100 @@ fn native_timers_are_exclusive_and_account_for_the_whole_call() {
 }
 
 #[test]
+fn bounded_profile_preparation_preserves_all_output_bits_and_budgets() {
+    let (f, model) = fixture();
+    let mut baseline = None;
+    for cache in [0, 64u64 << 20] {
+        for cap in [0, 1024] {
+            for inflight in [1, 2, 4] {
+                let mut wire = grouped(model.clone());
+                wire["model"]["window_cache_bytes"] = cache.into();
+                let mut extra = wire["model"]["profiles"][0].clone();
+                extra["id"] = "again".into();
+                wire["model"]["profiles"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(extra);
+                wire["source_indices"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(13.into());
+                wire["jobs"][0]["groups"][0]["timesteps"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(13.into());
+                wire["model"]["threads"] = 4.into();
+                wire["model"]["max_inflight_profiles"] = inflight.into();
+                wire["max_accumulator_bytes"] = cap.into();
+                wire["scratch"] = json!({"path":f.0,"node_local":true,"max_bytes":1024});
+                let req: Request = serde_json::from_value(wire).unwrap();
+                let out = f.0.join(format!("parallel-{cache}-{cap}-{inflight}"));
+                let report = depth_groups::run(&req, &f.0, &out).unwrap();
+                assert_eq!(report["status"], "complete", "{report}");
+                assert_eq!(report["effective_inflight_profiles"], inflight);
+                assert_eq!(report["geometry_preparations"], 1);
+                assert_eq!(report["terrain_preparations"], 1);
+                assert_eq!(report["hydraulic_preparations"], 5);
+                assert!(report["planned_bytes"].as_u64().unwrap() <= req.model.max_working_bytes);
+                let outputs: Vec<_> = [
+                    "left/max.tif",
+                    "left/dry.tif",
+                    "left/equal.tif",
+                    "left/high.tif",
+                    "right/max.tif",
+                ]
+                .iter()
+                .map(|path| fs::read(out.join(path)).unwrap())
+                .collect();
+                if let Some(expected) = &baseline {
+                    assert_eq!(&outputs, expected);
+                } else {
+                    baseline = Some(outputs);
+                }
+                let sum: f64 = report["native_timers"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .map(|v| v.as_f64().unwrap())
+                    .sum();
+                assert!((sum - report["total_seconds"].as_f64().unwrap()).abs() < 1e-6);
+                if inflight > 1 {
+                    assert!(
+                        report["native_timers"]["profile_prepare_wall_seconds"]
+                            .as_f64()
+                            .unwrap()
+                            > 0.0
+                    );
+                    assert_eq!(report["parallel_profile_durations"]["cache_misses"], 4);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn profile_admission_reduces_concurrency_instead_of_exceeding_working_memory() {
+    let (f, model) = fixture();
+    let mut wire = grouped(model);
+    wire["model"]["threads"] = 4.into();
+    let serial: Request = serde_json::from_value(wire.clone()).unwrap();
+    let report = depth_groups::run(&serial, &f.0, &f.0.join("serial-budget")).unwrap();
+    let serial_budget = report["planned_bytes"].as_u64().unwrap();
+    wire["model"]["max_working_bytes"] = serial_budget.into();
+    wire["model"]["max_inflight_profiles"] = 4.into();
+    let bounded: Request = serde_json::from_value(wire).unwrap();
+    let report = depth_groups::run(&bounded, &f.0, &f.0.join("bounded-budget")).unwrap();
+    assert_eq!(report["status"], "complete", "{report}");
+    assert_eq!(report["requested_inflight_profiles"], 4);
+    assert_eq!(report["effective_inflight_profiles"], 1);
+    assert!(report["planned_bytes"].as_u64().unwrap() <= serial_budget);
+    assert_eq!(
+        fs::read(f.0.join("serial-budget/left/max.tif")).unwrap(),
+        fs::read(f.0.join("bounded-budget/left/max.tif")).unwrap()
+    );
+}
+
+#[test]
 fn persistent_server_dispatches_grouped_requests_and_retains_parent() {
     use std::io::Write;
     use std::process::Stdio;

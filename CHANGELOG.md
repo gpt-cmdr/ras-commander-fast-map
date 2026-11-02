@@ -20,6 +20,15 @@ frames skip replanning and polygon rereads. Pinned windows share the
 fit keep the per-frame route. Inputs are re-identified once before delivery. Reports
 add `window_retention` counters and exclusive `native_timers`.
 
+Grouped requests also admit bounded parallel hydraulic preparation on the existing
+Rayon pool. Rendering and maximum reduction retain source order. Additional profile
+slots count inside working memory; reports distinguish batch elapsed time from
+summed worker durations, and retain hydraulic and terrain cache evidence. Window-key
+and hydraulic reconstruction timers are separate. Accumulator receipts report both
+the requested resident ceiling and full payload, allowing callers to budget spill
+explicitly. Generated fixtures compare complete raster bytes at one, two, and four
+profile slots, with resident and spilled groups and retained and unretained windows.
+
 ## 0.12.0 — 2026-10-31
 
 ### Storage-area level pools
