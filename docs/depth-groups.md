@@ -112,9 +112,20 @@ The receipt records both requested feet and effective model-unit threshold.
 Execution uses one worker, one in-flight rendered frame and the model's bounded
 Rayon pool. For each source selector, hydraulic state is pinned while every
 requesting reach renders its own window. LRU eviction cannot force hydraulic
-reconstruction between these reaches. Windows and terrain use the existing
-bounded caches. A session accepts successive grouped requests and retains
-compatible parent preparation; source staging/waves are the caller's job.
+reconstruction between these reaches.
+
+Each job's first requested frame takes the ordinary admitted route. If its
+ownership, terrain and pixel-weight window fits the remaining `window_cache_bytes`,
+that window stays pinned for the rest of the request. Later frames then render
+directly from it, without replanning, rereading polygon files or re-checking input
+identities. Pinned windows and the LRU share the one ceiling, so retention adds
+no memory beyond the plan. A window that does not fit, and any request with storage
+areas or terrain scope, stays on the full per-frame route with the same pixels; zero
+`window_cache_bytes` still disables retention. Terrain, geometry and AOI file
+identities are compared once after the profile loop, and a change fails the request
+before delivery. Pinned windows return to the LRU when the request ends, so a session
+accepts successive grouped requests and retains compatible parent preparation;
+source staging/waves are the caller's job.
 
 The plan includes mapping state, cache ceilings, resident accumulators, output
 and transfer allowances, row-writer metadata and receipt/index overhead. Admission
@@ -162,6 +173,18 @@ integrity identity, not a cryptographic provenance guarantee. The report pins
 engine version/revision and terrio, and reports native preparation counts,
 prepare/render/reduce/write timers and logical scratch peak/read/write bytes.
 `preparation_waves` is one staged request; it does not measure upstream HDF waves.
+
+`window_retention` counts windows pinned, their bytes, frames served by a pinned
+window, LRU hits, misses, frames that stayed unretained and hydraulic reuses.
+`native_timers` lists exclusive phases that sum with `unattributed_seconds` to
+`total_seconds`: admission, setup, accumulator initialization, geometry, ownership,
+terrain and weight preparation, hydraulic read and other hydraulic work, render,
+finalize, resident reduction, spill read/merge/write, frame accounting, per-frame
+route overhead on the full and pinned routes, the input recheck, and delivery spill
+read, sink and other delivery time. Ownership time includes the window-key read on a
+miss; on a hit that read is full-route overhead. The older `prepare_seconds` and
+`reduce_seconds` totals are unchanged and overlap these phases. Spill and sink timers
+measure blocking calls, not storage device waits.
 
 Only aggregate `status: complete` is success. Pending frames, failed groups,
 unknown statuses, an aborted report or nonzero process exit must be rejected.

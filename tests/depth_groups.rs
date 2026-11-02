@@ -450,6 +450,122 @@ fn metres_owned_buffers_and_consumer_failure_are_explicit() {
     );
 }
 
+fn run_cached(f: &Fixture, model: &Value, name: &str, cache: u64, hydraulic: u64) -> Value {
+    let mut wire = grouped(model.clone());
+    wire["model"]["window_cache_bytes"] = cache.into();
+    wire["model"]["hydraulic_cache_bytes"] = hydraulic.into();
+    let req: Request = serde_json::from_value(wire).unwrap();
+    let report = depth_groups::run(&req, &f.0, &f.0.join(name)).unwrap();
+    assert_eq!(report["status"], "complete", "{report}");
+    report
+}
+
+fn assert_retention(report: &Value, pinned: u64, frames: u64, lru: u64, misses: u64, rest: u64) {
+    let retention = &report["window_retention"];
+    assert_eq!(retention["windows_pinned"], pinned, "{retention}");
+    assert_eq!(retention["pinned_frames"], frames, "{retention}");
+    assert_eq!(retention["lru_hits"], lru, "{retention}");
+    assert_eq!(retention["misses"], misses, "{retention}");
+    assert_eq!(retention["unretained_frames"], rest, "{retention}");
+}
+
+#[test]
+fn retained_windows_keep_bits_and_stay_inside_the_window_budget() {
+    let (f, model) = fixture();
+    // Left renders four samples and right two. No retention rebuilds every frame.
+    let uncached = run_cached(&f, &model, "uncached", 0, 0);
+    assert_retention(&uncached, 0, 0, 0, 6, 6);
+    assert_eq!(uncached["window_retention"]["pinned_bytes"], 0);
+    let pinned = run_cached(&f, &model, "pinned", 64 << 20, 0);
+    assert_retention(&pinned, 2, 4, 0, 2, 0);
+    assert_eq!(pinned["hydraulic_preparations"], 4);
+    assert_eq!(pinned["window_retention"]["hydraulic_reuses"], 2);
+    let with_hydraulics = run_cached(&f, &model, "hydraulics", 64 << 20, 1 << 20);
+    assert_retention(&with_hydraulics, 2, 4, 0, 2, 0);
+    assert_eq!(with_hydraulics["hydraulic_preparations"], 4);
+
+    // A budget that holds only the first window leaves the second on the full route.
+    let mut left = grouped(model.clone());
+    left["jobs"].as_array_mut().unwrap().truncate(1);
+    left["model"]["window_cache_bytes"] = (64u64 << 20).into();
+    let left: Request = serde_json::from_value(left).unwrap();
+    let left = depth_groups::run(&left, &f.0, &f.0.join("left-only")).unwrap();
+    let bytes = left["window_retention"]["pinned_bytes"].as_u64().unwrap();
+    let partial = run_cached(&f, &model, "partial", bytes + 8, 0);
+    assert_retention(&partial, 1, 3, 0, 3, 2);
+    assert_eq!(partial["window_retention"]["pinned_bytes"], bytes);
+
+    for name in ["pinned", "hydraulics", "partial"] {
+        for raster in [
+            "left/max.tif",
+            "left/dry.tif",
+            "left/equal.tif",
+            "left/high.tif",
+            "right/max.tif",
+        ] {
+            bits(
+                &read_tiff(&f.0.join(name).join(raster)),
+                &read_tiff(&f.0.join("uncached").join(raster)),
+            );
+        }
+    }
+}
+
+#[test]
+fn pinned_windows_serve_the_next_compatible_request_from_the_session() {
+    let (f, mut model) = fixture();
+    model["window_cache_bytes"] = (64u64 << 20).into();
+    let req: Request = serde_json::from_value(grouped(model)).unwrap();
+    let mut session = sloping_session::PreparedSession::default();
+    let first = depth_groups::run_with_session(&req, &f.0, &f.0.join("one"), &mut session, None);
+    let first = first.unwrap();
+    assert_retention(&first, 2, 4, 0, 2, 0);
+    let second = depth_groups::run_with_session(&req, &f.0, &f.0.join("two"), &mut session, None);
+    let second = second.unwrap();
+    assert_retention(&second, 2, 4, 2, 0, 0);
+    assert_eq!(second["geometry_preparations"], 0);
+    assert_eq!(second["terrain_preparations"], 0);
+    assert_eq!(
+        first["window_retention"]["pinned_bytes"],
+        second["window_retention"]["pinned_bytes"]
+    );
+    bits(
+        &read_tiff(&f.0.join("one/left/max.tif")),
+        &read_tiff(&f.0.join("two/left/max.tif")),
+    );
+}
+
+#[test]
+fn native_timers_are_exclusive_and_account_for_the_whole_call() {
+    let (f, model) = fixture();
+    let mut wire = grouped(model);
+    wire["model"]["window_cache_bytes"] = (64u64 << 20).into();
+    wire["max_accumulator_bytes"] = 0.into();
+    wire["scratch"] = json!({"path":f.0,"node_local":true,"max_bytes":1024});
+    let req: Request = serde_json::from_value(wire).unwrap();
+    let report = depth_groups::run(&req, &f.0, &f.0.join("timed")).unwrap();
+    let timers = report["native_timers"].as_object().unwrap();
+    let mut sum = 0.0;
+    for (name, value) in timers {
+        let value = value.as_f64().unwrap();
+        assert!(value.is_finite(), "{name}");
+        assert!(name == "unattributed_seconds" || value >= 0.0, "{name}");
+        sum += value;
+    }
+    assert!((sum - report["total_seconds"].as_f64().unwrap()).abs() < 1e-6);
+    for name in [
+        "admission_seconds",
+        "render_seconds",
+        "spill_read_seconds",
+        "spill_write_seconds",
+        "delivery_spill_read_seconds",
+        "delivery_sink_seconds",
+        "pinned_route_overhead_seconds",
+    ] {
+        assert!(timers[name].as_f64().unwrap() > 0.0, "{name}");
+    }
+}
+
 #[test]
 fn persistent_server_dispatches_grouped_requests_and_retains_parent() {
     use std::io::Write;

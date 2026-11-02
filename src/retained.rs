@@ -65,6 +65,11 @@ impl<K: PartialEq, V> Retained<K, V> {
         self.entries.push_back((key, value, bytes));
         self.bytes += bytes;
     }
+    pub fn remove(&mut self, key: &K) {
+        if let Some(index) = self.entries.iter().position(|(k, _, _)| k == key) {
+            self.bytes -= self.entries.remove(index).unwrap().2;
+        }
+    }
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -89,6 +94,10 @@ mod tests {
         assert_eq!(c.bytes(), 9);
         c.insert(4, Arc::new(4), 11);
         assert_eq!(c.len(), 2);
+        c.remove(&3);
+        assert_eq!((c.len(), c.bytes()), (1, 5));
+        c.insert(3, Arc::new(3), 4);
+        c.get(&1);
         c.resize(5);
         assert!(c.get(&3).is_none());
         assert_eq!(*c.get(&1).unwrap(), 11);

@@ -36,6 +36,14 @@ struct WindowData {
     ground: Vec<f32>,
     weights: Option<sloping::PixelWeights>,
 }
+/// One grouped window held for a whole request, charged to its window budget.
+struct PinnedWindow {
+    key: WindowKey,
+    data: Arc<WindowData>,
+    geometry: Arc<CachedGeometry>,
+    terrain: Arc<NativeTerrain>,
+    bytes: u64,
+}
 
 /// One explicitly owned, serialized native session. One complete geometry and
 /// terrain share bounded LRU window and hydraulic caches. Dropping releases all.
@@ -48,6 +56,8 @@ pub struct PreparedSession {
     terrain: Option<(String, Arc<NativeTerrain>)>,
     geometry: Option<(String, Arc<CachedGeometry>)>,
     windows: Retained<WindowKey, WindowData>,
+    pinned_windows: Vec<PinnedWindow>,
+    pinned_window_bytes: u64,
     hydraulics: Mutex<Retained<String, Vec<sloping::PreparedProfile>>>,
     pool: Option<(usize, Arc<rayon::ThreadPool>)>,
 }
@@ -74,6 +84,16 @@ impl PreparedSession {
     pub(crate) fn end_grouped_profile(&mut self) {
         self.grouped_profile = false;
         *self.pinned_hydraulics.lock().unwrap() = None;
+    }
+    /// Pinned windows return to the bounded LRU for later compatible requests.
+    pub(crate) fn release_pinned_windows(&mut self, window_cache_bytes: u64) -> (u64, u64) {
+        let released = (self.pinned_windows.len() as u64, self.pinned_window_bytes);
+        self.pinned_window_bytes = 0;
+        self.windows.resize(window_cache_bytes);
+        for pinned in std::mem::take(&mut self.pinned_windows) {
+            self.windows.insert(pinned.key, pinned.data, pinned.bytes);
+        }
+        released
     }
 }
 
@@ -209,7 +229,9 @@ struct RenderedProfile {
     velocity: Option<Vec<f32>>,
     derived: Vec<Vec<f32>>,
     hydraulic_seconds: f64,
+    hydraulic_read_seconds: f64,
     render_seconds: f64,
+    finalize_seconds: f64,
     hydraulic_reused: bool,
     finite_pixels: usize,
     flooded_pixels: usize,
@@ -257,9 +279,12 @@ fn render(
     let hydraulic_reused = cached.is_some();
     let mut new_prepared = Vec::new();
     let mut cell_values = Vec::new();
+    let mut hydraulic_read_seconds = 0.0;
     if !hydraulic_reused {
         for ((mesh, stencil), filename) in meshes.iter().zip(stencils).zip(&profile.values_files) {
+            let read = Instant::now();
             let wse = values(&model::resolve(base, filename), mesh.cells.len())?;
+            hydraulic_read_seconds += read.elapsed().as_secs_f64();
             new_prepared.push(sloping::prepare_profile_with_options(
                 mesh, stencil, &wse, 0.001, pool, options,
             )?);
@@ -289,8 +314,10 @@ fn render(
     let (mut depth, mut wse) =
         sloping::render_profile_cached(stencils, &prepared, window, 0.001, pool, weights)?;
     let render_seconds = tick.elapsed().as_secs_f64();
+    let tick = Instant::now();
     let (mut finite_pixels, mut flooded_pixels) =
         crate::finalize::apply(&mut depth, &mut wse, pool);
+    let finalize_seconds = tick.elapsed().as_secs_f64();
     if let Some(storage) = storage {
         let path = profile
             .storage_area_values_file
@@ -351,7 +378,9 @@ fn render(
         velocity,
         derived,
         hydraulic_seconds,
+        hydraulic_read_seconds,
         render_seconds,
+        finalize_seconds,
         hydraulic_reused,
         finite_pixels,
         flooded_pixels,
@@ -641,6 +670,121 @@ pub(crate) fn plan_with_session(
     )
 }
 
+fn validate_profiles(req: &Request) -> Result<bool, MapError> {
+    if req.profiles.iter().any(|p| {
+        p.face_velocity_files.is_some() != req.velocity_normals_files.is_some()
+            || p.face_velocity_files
+                .as_ref()
+                .is_some_and(|f| f.len() != req.mesh_files.len())
+    }) {
+        return Err(MapError::Invalid(
+            "velocity_normals_files and every profile's face_velocity_files (one per mesh) go together".into(),
+        ));
+    }
+    let storage = crate::horizontal::validate_storage_fields(
+        req.storage_areas_file.as_ref(),
+        req.storage_area_count,
+        req.profiles
+            .iter()
+            .map(|p| p.storage_area_values_file.as_ref()),
+    )?;
+    if storage && req.velocity_normals_files.is_some() {
+        return Err(MapError::Unsupported(
+            "velocity is not qualified with storage-area surfaces".into(),
+        ));
+    }
+    let mut ids = HashSet::new();
+    for profile in &req.profiles {
+        model::validate_id(&profile.id)?;
+        if !ids.insert(model::id_key(&profile.id))
+            || profile.values_files.len() != req.mesh_files.len()
+        {
+            return Err(MapError::Invalid(
+                "duplicate sloping profile id or mesh value count mismatch".into(),
+            ));
+        }
+    }
+    Ok(storage)
+}
+
+/// Render one profile through a retained window, skipping per-frame replanning
+/// and key reads. Admission and identities were settled by the window's first frame.
+pub(crate) fn run_pinned_to_sink(
+    req: &Request,
+    base: &Path,
+    session: &PreparedSession,
+    index: usize,
+    consumer: &mut FrameSink<'_>,
+) -> Result<Value, MapError> {
+    validate_profiles(req)?;
+    let [col, row, width, height] = req.window;
+    let pinned = session
+        .pinned_windows
+        .get(index)
+        .ok_or_else(|| MapError::Internal("missing pinned group window".into()))?;
+    let pool = &session
+        .pool
+        .as_ref()
+        .ok_or_else(|| MapError::Internal("session has no pool".into()))?
+        .1;
+    let (meshes, stencils) = &*pinned.geometry;
+    let terrain = &pinned.terrain;
+    let window = sloping::RasterWindow {
+        source_transform: terrain.gt,
+        source_tile: [terrain.block.0, terrain.block.1],
+        width,
+        height,
+        transform: [
+            terrain.gt[0] + col as f64 * terrain.gt[1],
+            terrain.gt[1],
+            0.,
+            terrain.gt[3] + row as f64 * terrain.gt[5],
+            0.,
+            terrain.gt[5],
+        ],
+        owner: &pinned.data.owner,
+        terrain: &pinned.data.ground,
+        owner_cells: &req.owner_cells,
+    };
+    let plan = DerivedPlan {
+        depth: req.velocity_depth,
+        names: &req.derived_products,
+        gravity: req.gravity.unwrap_or(f32::NAN),
+    };
+    let profile = req
+        .profiles
+        .first()
+        .ok_or_else(|| MapError::Internal("grouped frame has no profile".into()))?;
+    let rendered = map_batch(std::slice::from_ref(profile), pool, |profile| {
+        render(
+            profile,
+            base,
+            meshes,
+            stencils,
+            &window,
+            pool,
+            req.options,
+            pinned.data.weights.as_ref(),
+            None,
+            &[],
+            (req.hydraulic_cache_bytes > 0).then_some(&session.hydraulics),
+            Some(&session.pinned_hydraulics),
+            None,
+            &plan,
+        )
+    })?
+    .pop()
+    .ok_or_else(|| MapError::Internal("grouped frame was not rendered".into()))?;
+    let unit = json!({"id":profile.id,"status":"complete",
+        "hydraulic_seconds":rendered.hydraulic_seconds,"render_seconds":rendered.render_seconds,
+        "hydraulic_read_seconds":rendered.hydraulic_read_seconds,"finalize_seconds":rendered.finalize_seconds,
+        "hydraulic_reused":rendered.hydraulic_reused});
+    consumer(profile, rendered.depth, unit.clone())?;
+    Ok(json!({"status":"complete","profiles":[unit],
+        "geometry_prepare_seconds":0.0,"ownership_prepare_seconds":0.0,"terrain_prepare_seconds":0.0,
+        "session":{"terrain_reused":true,"geometry_reused":true,"window_reused":true,"pinned_window":index}}))
+}
+
 fn run_internal(
     req: &Request,
     base: &Path,
@@ -700,39 +844,7 @@ fn run_internal(
             "velocity_normals_files needs one file per mesh".into(),
         ));
     }
-    if req.profiles.iter().any(|p| {
-        p.face_velocity_files.is_some() != req.velocity_normals_files.is_some()
-            || p.face_velocity_files
-                .as_ref()
-                .is_some_and(|f| f.len() != req.mesh_files.len())
-    }) {
-        return Err(MapError::Invalid(
-            "velocity_normals_files and every profile's face_velocity_files (one per mesh) go together".into(),
-        ));
-    }
-    let storage = crate::horizontal::validate_storage_fields(
-        req.storage_areas_file.as_ref(),
-        req.storage_area_count,
-        req.profiles
-            .iter()
-            .map(|p| p.storage_area_values_file.as_ref()),
-    )?;
-    if storage && req.velocity_normals_files.is_some() {
-        return Err(MapError::Unsupported(
-            "velocity is not qualified with storage-area surfaces".into(),
-        ));
-    }
-    let mut ids = HashSet::new();
-    for profile in &req.profiles {
-        model::validate_id(&profile.id)?;
-        if !ids.insert(model::id_key(&profile.id))
-            || profile.values_files.len() != req.mesh_files.len()
-        {
-            return Err(MapError::Invalid(
-                "duplicate sloping profile id or mesh value count mismatch".into(),
-            ));
-        }
-    }
+    let storage = validate_profiles(req)?;
     let geometry_bytes = req
         .mesh_files
         .iter()
@@ -765,8 +877,11 @@ fn run_internal(
     } else {
         0
     };
+    // Pinned windows and the LRU share one ceiling, so neither can exceed the plan.
+    let window_budget =
+        persistent_bytes.saturating_sub(session.as_ref().map_or(0, |s| s.pinned_window_bytes));
     if let Some(s) = session.as_mut() {
-        s.windows.resize(persistent_bytes);
+        s.windows.resize(window_budget);
         s.hydraulics.lock().unwrap().resize(hydraulic_bytes);
     }
     let aoi_scratch = crate::aoi::scratch_bytes(
@@ -1127,7 +1242,13 @@ fn run_internal(
                     None,
                 )
             };
-            let cached_window = session.as_mut().and_then(|s| s.windows.get(&window_key));
+            let pinned_index = session
+                .as_ref()
+                .and_then(|s| s.pinned_windows.iter().position(|w| w.key == window_key));
+            let cached_window = match pinned_index {
+                Some(index) => Some(session.as_ref().unwrap().pinned_windows[index].data.clone()),
+                None => session.as_mut().and_then(|s| s.windows.get(&window_key)),
+            };
             let window_reused = cached_window.is_some();
             let mut data = if let Some(data) = cached_window {
                 data
@@ -1225,7 +1346,7 @@ fn run_internal(
                 + (window_key.3.len() * std::mem::size_of::<[usize; 2]>()) as u64
                 + window_key.4.len() as u64
                 + window_key.5.as_ref().map_or(0, |v| v.len()) as u64;
-            let weight_budget = persistent_bytes
+            let weight_budget = window_budget
                 .saturating_sub(window_base_bytes)
                 .min(32 << 20);
             let (bw, bh) = terrain.block;
@@ -1244,6 +1365,7 @@ fn run_internal(
                     terrain: &data.ground,
                     owner_cells: &req.owner_cells,
                 };
+                let tick = Instant::now();
                 let weights = sloping::PixelWeights::prepare(
                     stencils,
                     &window,
@@ -1251,15 +1373,41 @@ fn run_internal(
                     &pool,
                 )?;
                 Arc::get_mut(&mut data).unwrap().weights = Some(weights);
+                report["weights_prepare_seconds"] = tick.elapsed().as_secs_f64().into();
             }
             let weight_bytes = data.weights.as_ref().map_or(0, |w| w.bytes());
             report["session"]["window_reused"] = window_reused.into();
             report["session"]["pixel_weight_cache_bytes"] = weight_bytes.into();
             let window_bytes = window_base_bytes + weight_bytes as u64;
             if let Some(s) = session.as_mut() {
-                s.windows.insert(window_key, data.clone(), window_bytes);
-                report["session"]["retained_window_bytes"] = s.windows.bytes().into();
-                report["session"]["retained_window_count"] = s.windows.len().into();
+                let pinnable = s.grouped_profile
+                    && req.storage_areas_file.is_none()
+                    && req.terrain_scope.is_none()
+                    && window_bytes <= window_budget;
+                let pinned_index = match pinned_index {
+                    Some(index) => Some(index),
+                    None if pinnable => {
+                        s.windows.remove(&window_key);
+                        s.pinned_windows.push(PinnedWindow {
+                            key: window_key,
+                            data: data.clone(),
+                            geometry: geometry.clone(),
+                            terrain: terrain.clone(),
+                            bytes: window_bytes,
+                        });
+                        s.pinned_window_bytes += window_bytes;
+                        Some(s.pinned_windows.len() - 1)
+                    }
+                    None => {
+                        s.windows.insert(window_key, data.clone(), window_bytes);
+                        None
+                    }
+                };
+                report["session"]["pinned_window"] = json!(pinned_index);
+                report["session"]["retained_window_bytes"] =
+                    (s.windows.bytes() + s.pinned_window_bytes).into();
+                report["session"]["retained_window_count"] =
+                    (s.windows.len() + s.pinned_windows.len()).into();
             }
             let window = sloping::RasterWindow {
                 source_transform: terrain.gt,
@@ -1354,7 +1502,9 @@ fn run_internal(
                         velocity,
                         derived,
                         hydraulic_seconds,
+                        hydraulic_read_seconds,
                         render_seconds,
+                        finalize_seconds,
                         hydraulic_reused,
                         finite_pixels,
                         flooded_pixels,
@@ -1362,6 +1512,7 @@ fn run_internal(
                     if let Some(consumer) = consumer.as_mut() {
                         let unit = json!({"id":profile.id,"status":"complete",
                             "hydraulic_seconds":hydraulic_seconds,"render_seconds":render_seconds,
+                            "hydraulic_read_seconds":hydraulic_read_seconds,"finalize_seconds":finalize_seconds,
                             "hydraulic_reused":hydraulic_reused});
                         drop(wse);
                         consumer(profile, depth, unit.clone())?;
