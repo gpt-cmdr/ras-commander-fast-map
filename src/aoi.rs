@@ -106,7 +106,7 @@ fn burn(edges: &[Edge], window: [usize; 4]) -> Result<Vec<u32>, MapError> {
                 }
             }
             crossings.sort_unstable_by(f64::total_cmp);
-            for pair in crossings.chunks_exact(2) {
+            for pair in crossings.as_chunks::<2>().0 {
                 // Left inclusive, right exclusive, in source pixel coordinates.
                 let start = (pair[0] - 0.5)
                     .ceil()
