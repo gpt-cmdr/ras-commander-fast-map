@@ -4,7 +4,7 @@
 //! 1 invalid request or session error. When this run created the output directory, a session
 //! error still leaves `report.json` with `status: "aborted"` (best effort, see `session::run`);
 //! no report exists when the request was rejected before the directory was created.
-use ras_commander_fast_map::{method_record, model::SessionRequest, session, terrain};
+use ras_commander_fast_map::{model::SessionRequest, session, terrain};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -153,7 +153,7 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
             Ok(0)
         }
         ("method", 1) => {
-            let m = serde_json::json!({"engine": {"package": "ras-commander-fast-map", "version": ras_commander_fast_map::ENGINE_VERSION, "source_commit": ras_commander_fast_map::ENGINE_COMMIT}, "coupled_diagnostic": ras_commander_fast_map::coupled::method_record(), "coupled_storage_diagnostic": ras_commander_fast_map::coupled::storage_method_record(), "one_d_diagnostic": ras_commander_fast_map::one_d::method_record(), "one_d_native_diagnostic": ras_commander_fast_map::one_d_native::method_record(), "one_d_clipped_diagnostic": ras_commander_fast_map::one_d_native::clipped_method_record(), "batch_session_r1": method_record(), "step05_r2": ras_commander_fast_map::step05::method_record(), "horizontal": ras_commander_fast_map::horizontal::method_record(), "sloping":ras_commander_fast_map::sloping_session::method_record(), "depth_groups":ras_commander_fast_map::depth_groups::method_record(), "boundary":ras_commander_fast_map::boundary_session::method_record(), "whole_simulation":ras_commander_fast_map::whole_simulation::method_record(), "effective_terrain":ras_commander_fast_map::effective_terrain::method_record()});
+            let m = ras_commander_fast_map::engine_method_record();
             println!("{}", serde_json::to_string_pretty(&m)?);
             Ok(0)
         }

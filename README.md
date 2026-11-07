@@ -28,9 +28,19 @@ cargo add ras-commander-fast-map
 ```
 
 ```rust
-let methods = ras_commander_fast_map::method_record();
-assert!(methods.is_object());
+let methods = ras_commander_fast_map::engine_method_record();
+assert!(methods["sloping"].is_object());
 ```
+
+`engine_method_record()` returns the same engine and method registry as
+`ras2fim-batch method`, including each method's capabilities and qualification
+limits. The existing `method_record()` describes only the original batch method,
+available in the registry as `batch_session_r1`.
+The additive `capabilities` list separates the stable versioned API contract
+from each method's numerical qualification and intended use. Diagnostic 1D and
+coupled transports remain unqualified; a stable transport does not imply
+production model preparation or native parity. See the
+[method discovery contract](docs/method-contract.md).
 
 See [Rust API documentation](https://docs.rs/ras-commander-fast-map) and the
 [RasFim guide](https://rascommander.info/ras/api/fim/) for request contracts and
