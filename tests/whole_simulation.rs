@@ -88,6 +88,11 @@ fn capability_is_advertised() {
     let record = whole_simulation::method_record();
     assert_eq!(record["method_id"], "native-whole-simulation-horizontal/1");
     assert_eq!(
+        record["storage_area_products"],
+        json!(["arrival_time", "percent_inundated"])
+    );
+    assert_eq!(record["storage_area_requires_2d"], true);
+    assert_eq!(
         record["unqualified_refused"],
         json!(["irregular_intervals"])
     );

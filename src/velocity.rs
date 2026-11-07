@@ -1,8 +1,7 @@
-//! Research kernel: RAS Mapper velocity reconstruction (`rasmapper-sloping-velocity/0`).
+//! RAS Mapper velocity reconstruction (`rasmapper-sloping-velocity/0`).
 //!
-//! **Not wired into any mapping request.** It reproduces the native structure
-//! of RAS Mapper's stored-map velocity so that the remaining differences can be
-//! closed before a product is exposed:
+//! Used by sloping mapping requests that select velocity or derived products.
+//! It reproduces the native structure of RAS Mapper's stored-map velocity:
 //!
 //! 1. face classification: the sloping face water surfaces already used by the
 //!    WSE renderer (`Mesh::reconstruct`); "connected" excludes `None`/`Levee`;
@@ -17,12 +16,13 @@
 //!    face vectors in binary32, magnitude `sqrt(x*x + y*y)`.
 //!
 //! Max velocity uses `Maximum Face Velocity` and maximum WSE as one profile.
-//! Velocity does not depend on the WSE render mode. [`interior`] is the
-//! candidate qualification scope; measurements are in the PR.
+//! Velocity values do not depend on the WSE render mode; the selected depth
+//! controls their valid mask. Qualification limits are recorded by [`method_record`].
 use crate::{
     MapError,
     sloping::{CellStencil, Corner, FaceWater, Mesh, WeightScratch},
 };
+use rayon::prelude::*;
 
 pub const METHOD_ID: &str = "rasmapper-sloping-velocity/0";
 
@@ -34,8 +34,9 @@ pub fn method_record() -> serde_json::Value {
         "faces": "normal velocity plus a tangential component from an unweighted least-squares fit of the face and its two ring neighbours in each cell (when a neighbour is hydraulically connected); connected faces take the mean of both sides",
         "corners": "inverse polyline-length weighted mean of the face vectors over each hydraulically connected arc; zero where every incident face is dry",
         "pixels": "cell-face sloping donated weights in binary32, native donation history replayed in source-tile order; drawn where the clipping depth > 0",
+        "source_grid_arithmetic": "full-source extent and per-tile coordinate rounding, with normalized row stepping for square cells, on square terrain pixels and square source tiles; other supported layouts retain the legacy Rust point-coordinate path",
         "clipping_depth": "velocity_depth: rendered (this request's render mode, default) or horizontal (cell-constant WSE, RAS Mapper's horizontal render); RAS Mapper clips velocity with the depth of the active render mode and its values do not depend on it",
-        "qualified": "native HEC-RAS 7.0.1: BaldEagleCrkMulti2D bridges p05 (Max sloping and slopingPretty, one output time sloping), dam-break p07 2D cells (Max, one output time), Spring Creek eBFE AOI (one output time) bit for bit, masks included; Davis p02 Max all but 5 of 20,560 pixels (within 2 ulp)",
+        "qualified": "native HEC-RAS 7.0.1: Davis p02 sloping Max, complete masks and Float32 bits exact (22,041 valid pixels) on the original 256-square source tile lattice; historical BaldEagleCrkMulti2D bridges p05, dam-break p07 2D cells and Spring Creek AOI gates predate the source-grid arithmetic fix and await fixture recheck",
         "derived": {
             "method_id": DERIVED_METHOD_ID,
             "products": DERIVED,
@@ -95,6 +96,40 @@ pub fn horizontal_depth(
     Ok(depth)
 }
 
+/// Pixel-independent horizontal clipping inside the caller's bounded pool.
+/// Cell and pixel arithmetic is identical to [`horizontal_depth`].
+pub fn horizontal_depth_in_pool(
+    window: &crate::sloping::RasterWindow<'_>,
+    meshes: &[Mesh],
+    cell_values: &[Vec<f32>],
+    pool: &rayon::ThreadPool,
+) -> Result<Vec<f32>, MapError> {
+    let mut depth = vec![f32::NAN; window.owner.len()];
+    pool.install(|| {
+        depth
+            .par_iter_mut()
+            .enumerate()
+            .try_for_each(|(i, d)| -> Result<(), MapError> {
+                let label = window.owner[i] as usize;
+                if label == 0 {
+                    return Ok(());
+                }
+                let [m, cell] = window.owner_cells[label - 1];
+                let value = *cell_values
+                    .get(m)
+                    .and_then(|v| v.get(cell))
+                    .ok_or_else(|| MapError::Internal("horizontal depth cell".into()))?;
+                if value > meshes[m].cells[cell].minimum + 0.001_f32
+                    && let Some(delta) = crate::horizontal::plot(value, window.terrain[i])?
+                {
+                    *d = delta;
+                }
+                Ok(())
+            })
+    })?;
+    Ok(depth)
+}
+
 /// One derived product from a pixel's depth and velocity (`None` if unknown).
 pub fn derived(name: &str, depth: f32, velocity: f32, gravity: f32) -> Option<f32> {
     match name {
@@ -103,6 +138,70 @@ pub fn derived(name: &str, depth: f32, velocity: f32, gravity: f32) -> Option<f3
         "froude" => Some(froude(depth, velocity, gravity)),
         _ => None,
     }
+}
+
+fn derive_pixels(depth: &[f32], velocity: &[f32], evaluate: impl Fn(f32, f32) -> f32) -> Vec<f32> {
+    depth
+        .iter()
+        .zip(velocity)
+        .map(|(&d, &v)| {
+            if d.is_nan() || v.is_nan() {
+                f32::NAN
+            } else {
+                evaluate(d, v)
+            }
+        })
+        .collect()
+}
+
+fn derive_pixels_parallel(
+    depth: &[f32],
+    velocity: &[f32],
+    evaluate: impl Fn(f32, f32) -> f32 + Sync + Send,
+) -> Vec<f32> {
+    depth
+        .par_iter()
+        .zip(velocity.par_iter())
+        .map(|(&d, &v)| {
+            if d.is_nan() || v.is_nan() {
+                f32::NAN
+            } else {
+                evaluate(d, v)
+            }
+        })
+        .collect()
+}
+
+/// Derived products inside the existing request pool. Pixels remain scalar;
+/// neither profile order nor any per-pixel floating-point expression changes.
+pub fn derive_all_in_pool(
+    names: &[String],
+    depth: &[f32],
+    velocity: &[f32],
+    gravity: f32,
+    pool: &rayon::ThreadPool,
+) -> Result<Vec<Vec<f32>>, MapError> {
+    pool.install(|| {
+        names
+            .iter()
+            .map(|name| {
+                Ok(match name.as_str() {
+                    "depth_x_velocity" => derive_pixels_parallel(depth, velocity, depth_x_velocity),
+                    "depth_x_velocity_squared" => {
+                        derive_pixels_parallel(depth, velocity, depth_x_velocity_squared)
+                    }
+                    "froude" => {
+                        derive_pixels_parallel(depth, velocity, |d, v| froude(d, v, gravity))
+                    }
+                    // Keep the public helper's historical all-nodata/unknown-name behavior.
+                    _ => {
+                        return derive_all(std::slice::from_ref(name), depth, velocity, gravity)
+                            .map(|mut products| products.remove(0));
+                    }
+                })
+            })
+            .collect()
+    })
 }
 
 /// Derived product arrays, NaN where depth or velocity is not drawn.
@@ -115,6 +214,20 @@ pub fn derive_all(
     names
         .iter()
         .map(|name| {
+            // Choose the operation once per frame, before the pixel loop.
+            match name.as_str() {
+                "depth_x_velocity" => {
+                    return Ok(derive_pixels(depth, velocity, depth_x_velocity));
+                }
+                "depth_x_velocity_squared" => {
+                    return Ok(derive_pixels(depth, velocity, depth_x_velocity_squared));
+                }
+                "froude" => {
+                    return Ok(derive_pixels(depth, velocity, |d, v| froude(d, v, gravity)));
+                }
+                _ => {}
+            }
+            // Preserve the public helper's existing unknown-name error behavior.
             depth
                 .iter()
                 .zip(velocity)
@@ -140,6 +253,20 @@ pub fn accumulate_max(acc: &mut [f32], values: &[f32]) {
     }
 }
 
+/// Independent pixels only; profile ordering and NaN/signed-zero ties remain
+/// those of [`accumulate_max`]. Uses no pool beyond the supplied request pool.
+pub fn accumulate_max_in_pool(acc: &mut [f32], values: &[f32], pool: &rayon::ThreadPool) {
+    pool.install(|| {
+        acc.par_iter_mut()
+            .zip(values.par_iter())
+            .for_each(|(a, &v)| {
+                if !v.is_nan() && (a.is_nan() || v > *a) {
+                    *a = v;
+                }
+            })
+    });
+}
+
 /// Face geometry the native velocity stencils need: HDF `Faces NormalUnitVector
 /// and Length` (unit normal from cell A to cell B, and face length).
 #[derive(Clone, Copy, Debug)]
@@ -154,6 +281,7 @@ struct Coef {
     a11: f32,
     a12: f32,
     a22: f32,
+    count: usize,
 }
 
 impl Coef {
@@ -161,10 +289,22 @@ impl Coef {
         self.a11 += n[0] * n[0] * w;
         self.a12 += n[0] * n[1] * w;
         self.a22 += n[1] * n[1] * w;
+        self.count += 1;
     }
     /// Scaled inverse through one binary32 reciprocal of the determinant.
     fn complete(&mut self) {
-        let inverse = 1.0 / (self.a11 * self.a22 - self.a12 * self.a12);
+        let determinant = self.a11 * self.a22 - self.a12 * self.a12;
+        // Collinear face normals have no two-dimensional inverse. Native
+        // reconstruction uses the number of contributing faces in this case,
+        // including for weighted coefficients.
+        if determinant == 0.0 {
+            assert!(self.count > 0, "velocity coefficient matrix has no inputs");
+            self.a11 = 1.0 / self.count as f32;
+            self.a12 = 0.0;
+            self.a22 = self.a11;
+            return;
+        }
+        let inverse = 1.0 / determinant;
         self.a11 *= inverse;
         self.a12 *= inverse;
         self.a22 *= inverse;
@@ -172,7 +312,7 @@ impl Coef {
     fn solve(&self, bx: f32, by: f32) -> [f32; 2] {
         [
             self.a22 * bx - self.a12 * by,
-            -self.a12 * bx + self.a11 * by,
+            (0.0 - self.a12) * bx + self.a11 * by,
         ]
     }
 }
@@ -333,7 +473,7 @@ pub fn pixel(
     scratch: &mut WeightScratch,
 ) -> Result<f32, MapError> {
     let weights = stencil.donated_weights(point, scratch)?;
-    Ok(paint(stencil, cell, mesh, nodes, &weights))
+    Ok(paint(stencil, cell, mesh, nodes, weights))
 }
 
 fn paint(stencil: &CellStencil, cell: usize, mesh: &Mesh, nodes: &Nodes, weights: &[f32]) -> f32 {
@@ -365,6 +505,29 @@ pub(crate) fn replay_cell(
     source_transform: [f64; 6],
     tile: [usize; 2],
     window: [usize; 4],
+) -> Result<Vec<(usize, f32)>, MapError> {
+    replay_cell_on_lattice(
+        stencil,
+        cell,
+        mesh,
+        nodes,
+        source_transform,
+        tile,
+        window,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_cell_on_lattice(
+    stencil: &CellStencil,
+    cell: usize,
+    mesh: &Mesh,
+    nodes: &Nodes,
+    source_transform: [f64; 6],
+    tile: [usize; 2],
+    window: [usize; 4],
+    lattice: Option<SourceLattice>,
 ) -> Result<Vec<(usize, f32)>, MapError> {
     let ring = &stencil.physical_ring;
     if ring.is_empty() {
@@ -404,7 +567,7 @@ pub(crate) fn replay_cell(
     }
     for ty in r0 / th..=(r1 - 1) / th {
         for tx in c0 / tw..=(c1 - 1) / tw {
-            let tile_gt = [
+            let mut tile_gt = [
                 gt[0] + (tx * tw) as f64 * gt[1],
                 gt[1],
                 0.,
@@ -412,6 +575,9 @@ pub(crate) fn replay_cell(
                 0.,
                 gt[5],
             ];
+            if let Some(lattice) = lattice {
+                tile_gt = lattice.tile_transform(tx, ty);
+            }
             let owned = crate::ownership::burn_ring(
                 ring,
                 terrio::ops::rasterize::Grid {
@@ -435,12 +601,18 @@ pub(crate) fn replay_cell(
                     tile_gt[0] + (i % tw) as f64 * gt[1] + 0.5 * gt[1],
                     tile_gt[3] + (i / tw) as f64 * gt[5] + 0.5 * gt[5],
                 ];
+                let point = lattice.map_or(point, |_| {
+                    [
+                        tile_gt[0] + ((i % tw) as f64 + 0.5) * tile_gt[1],
+                        tile_gt[3] + ((i / tw) as f64 + 0.5) * tile_gt[5],
+                    ]
+                });
                 let weights = stencil.donated_weights_with_history(point, &mut scratch, true)?;
                 let (c, r) = (tx * tw + i % tw, ty * th + i / tw);
                 if (col..col + width).contains(&c) && (row..row + height).contains(&r) {
                     output.push((
                         (r - row) * width + c - col,
-                        paint(stencil, cell, mesh, nodes, &weights),
+                        paint(stencil, cell, mesh, nodes, weights),
                     ));
                 }
             }
@@ -510,6 +682,158 @@ pub fn read_face_velocity(path: &std::path::Path, faces: usize) -> Result<Vec<f3
     Ok(values)
 }
 
+#[derive(Clone, Copy)]
+struct SourceLattice {
+    origin: [f64; 2],
+    tile: usize,
+    pitch: f64,
+}
+
+impl SourceLattice {
+    fn new(gt: [f64; 6], tile: [usize; 2], shape: [usize; 2]) -> Result<Self, MapError> {
+        let [width, height] = shape;
+        if width == 0
+            || height == 0
+            || tile[0] == 0
+            || tile[0] != tile[1]
+            || gt[1] <= 0.0
+            || (gt[1] + gt[5]).abs() > gt[1].abs() * 1e-12
+            || gt[2] != 0.0
+            || gt[4] != 0.0
+            || !gt.iter().all(|v| v.is_finite())
+        {
+            return Err(MapError::Unsupported(
+                "native velocity lattice requires a square north-up source grid and square tiles"
+                    .into(),
+            ));
+        }
+        let max_x = gt[0] + width as f64 * gt[1];
+        let min_y = gt[3] + height as f64 * gt[5];
+        let cell = ((max_x - gt[0]) / width as f64).max((gt[3] - min_y) / height as f64);
+        let pitch0 = tile[0] as f64 * cell;
+        let columns = width.div_ceil(tile[0]);
+        let rows = height.div_ceil(tile[0]);
+        let right = gt[0] + columns as f64 * pitch0;
+        let bottom = gt[3] - rows as f64 * pitch0;
+        let pitch = ((right - gt[0]) / columns as f64).max((gt[3] - bottom) / rows as f64);
+        if !pitch.is_finite() || pitch <= 0.0 {
+            return Err(MapError::Invalid("native velocity lattice overflow".into()));
+        }
+        Ok(Self {
+            origin: [gt[0], gt[3]],
+            tile: tile[0],
+            pitch,
+        })
+    }
+
+    fn tile_transform(self, col: usize, row: usize) -> [f64; 6] {
+        let min_x = self.origin[0] + self.pitch * col as f64;
+        let max_x = self.origin[0] + self.pitch * (col + 1) as f64;
+        let max_y = self.origin[1] - self.pitch * row as f64;
+        let min_y = self.origin[1] - self.pitch * (row + 1) as f64;
+        let cell = ((max_x - min_x) / self.tile as f64).max((max_y - min_y) / self.tile as f64);
+        [min_x, cell, 0.0, max_y, 0.0, -cell]
+    }
+
+    fn point(self, col: usize, row: usize) -> [f64; 2] {
+        let gt = self.tile_transform(col / self.tile, row / self.tile);
+        [
+            gt[0] + ((col % self.tile) as f64 + 0.5) * gt[1],
+            gt[3] + ((row % self.tile) as f64 + 0.5) * gt[5],
+        ]
+    }
+}
+
+/// Square cells use a raster-row fast path: normalize the first covered
+/// centre, then step in normalized coordinates. Subtracting the cell origin
+/// independently at each centre changes Float32 ties at large coordinates.
+fn square_pixel(
+    stencil: &CellStencil,
+    cell: usize,
+    mesh: &Mesh,
+    nodes: &Nodes,
+    lattice: SourceLattice,
+    col: usize,
+    row: usize,
+) -> Option<f32> {
+    let [left, bottom, right, top] = stencil.square_bounds()?;
+    let gt = lattice.tile_transform(col / lattice.tile, row / lattice.tile);
+    let mut first_col = ((left - gt[0]) / gt[1]).floor() as i64;
+    if left > gt[0] + gt[1] * (first_col as f64 + 0.5) {
+        first_col += 1;
+    }
+    let mut first_row = ((gt[3] - top) / gt[1]).floor() as i64;
+    if top < gt[3] - gt[1] * (first_row as f64 + 0.5) {
+        first_row += 1;
+    }
+    first_col = first_col.max(0);
+    first_row = first_row.max(0);
+    let x0 = (gt[0] + gt[1] * (first_col as f64 + 0.5) - left) / (right - left);
+    let y0 = (gt[3] - gt[1] * (first_row as f64 + 0.5) - bottom) / (top - bottom);
+    let mut x = x0 + (gt[1] / (right - left)) * ((col % lattice.tile) as i64 - first_col) as f64;
+    let mut y = y0 + (-gt[1] / (top - bottom)) * ((row % lattice.tile) as i64 - first_row) as f64;
+    if x <= 0.0 {
+        x = 0.00001;
+    }
+    if x >= 1.0 {
+        x = 0.99999;
+    }
+    if y <= 0.0 {
+        y = 0.00001;
+    }
+    if y >= 1.0 {
+        y = 0.99999;
+    }
+    let mut weights = [0.0_f32; 8];
+    for (i, [vertex, _]) in stencil.corner_slots().enumerate() {
+        let point = mesh.corners[vertex].point;
+        let wx = if point[0] <= (left + right) * 0.5 {
+            1.0 - x
+        } else {
+            x
+        };
+        let wy = if point[1] <= (bottom + top) * 0.5 {
+            1.0 - y
+        } else {
+            y
+        };
+        weights[i] = (wx * wy) as f32;
+    }
+    let mut clockwise = [0.0_f32; 4];
+    let mut counterclockwise = [0.0_f32; 4];
+    for i in 0..4 {
+        let previous = (i + 3) % 4;
+        let next = (i + 1) % 4;
+        let fraction = weights[i] / (weights[previous] + weights[next]);
+        clockwise[i] = fraction * weights[previous];
+        counterclockwise[i] = fraction * weights[next];
+    }
+    for i in 0..4 {
+        let next = (i + 1) % 4;
+        let donation = counterclockwise[i].min(clockwise[next]);
+        weights[i] -= donation;
+        weights[next] -= donation;
+        weights[4 + i] = donation * 2.0;
+    }
+    Some(paint(stencil, cell, mesh, nodes, &weights))
+}
+
+/// Experimental qualification entry point using the full original source grid.
+#[allow(clippy::type_complexity)]
+pub fn render_on_source_grid(
+    meshes: &[(&Mesh, &[Option<CellStencil>], &[f32], &[FaceNormal], &[f32])],
+    window: &crate::sloping::RasterWindow<'_>,
+    depth: &[f32],
+    pool: &rayon::ThreadPool,
+    source_shape: [usize; 2],
+) -> Result<Vec<f32>, MapError> {
+    match SourceLattice::new(window.source_transform, window.source_tile, source_shape) {
+        Ok(lattice) => render_impl(meshes, window, depth, pool, Some(lattice)),
+        Err(MapError::Unsupported(_)) => render(meshes, window, depth, pool),
+        Err(error) => Err(error),
+    }
+}
+
 /// Velocity magnitude for a rendered window: drawn where `depth > 0` (NaN
 /// elsewhere), from each mesh's cell WSE and face-normal velocities. Cells whose
 /// clipped weights expose native donation history are replayed in source-tile
@@ -521,7 +845,17 @@ pub fn render(
     depth: &[f32],
     pool: &rayon::ThreadPool,
 ) -> Result<Vec<f32>, MapError> {
-    use rayon::prelude::*;
+    render_impl(meshes, window, depth, pool, None)
+}
+
+#[allow(clippy::type_complexity)]
+fn render_impl(
+    meshes: &[(&Mesh, &[Option<CellStencil>], &[f32], &[FaceNormal], &[f32])],
+    window: &crate::sloping::RasterWindow<'_>,
+    depth: &[f32],
+    pool: &rayon::ThreadPool,
+    lattice: Option<SourceLattice>,
+) -> Result<Vec<f32>, MapError> {
     let mut nodes = Vec::with_capacity(meshes.len());
     for &(mesh, stencils, wse, normals, velocity) in meshes {
         let water = mesh.reconstruct(wse, 0.001, pool)?.faces;
@@ -535,6 +869,9 @@ pub fn render(
         return Err(MapError::Internal("velocity window size mismatch".into()));
     }
     let width = window.width;
+    let gt = window.source_transform;
+    let col = ((window.transform[0] - gt[0]) / gt[1]).round() as usize;
+    let row = ((window.transform[3] - gt[3]) / gt[5]).round() as usize;
     let flagged: Vec<std::sync::atomic::AtomicBool> = (0..window.owner_cells.len())
         .map(|_| std::sync::atomic::AtomicBool::new(false))
         .collect();
@@ -553,10 +890,27 @@ pub fn render(
                     let Some(stencil) = &meshes[m].1[cell] else {
                         continue;
                     };
+                    if let Some(value) = lattice.and_then(|lattice| {
+                        square_pixel(
+                            stencil,
+                            cell,
+                            meshes[m].0,
+                            &nodes[m],
+                            lattice,
+                            col + i % width,
+                            row + i / width,
+                        )
+                    }) {
+                        *v = value;
+                        continue;
+                    }
                     let point = [
                         window.transform[0] + ((i % width) as f64 + 0.5) * window.transform[1],
                         window.transform[3] + ((i / width) as f64 + 0.5) * window.transform[5],
                     ];
+                    let point = lattice.map_or(point, |lattice| {
+                        lattice.point(col + i % width, row + i / width)
+                    });
                     *v = pixel(stencil, cell, meshes[m].0, &nodes[m], point, scratch)?;
                     if stencil.history_sensitive(scratch) {
                         flagged[label - 1].store(true, std::sync::atomic::Ordering::Relaxed);
@@ -575,7 +929,7 @@ pub fn render(
         }
         let [m, cell] = window.owner_cells[label];
         let stencil = meshes[m].1[cell].as_ref().unwrap();
-        for (i, value) in replay_cell(
+        for (i, value) in replay_cell_on_lattice(
             stencil,
             cell,
             meshes[m].0,
@@ -583,6 +937,7 @@ pub fn render(
             gt,
             window.source_tile,
             [col, row, window.width, window.height],
+            lattice,
         )? {
             if window.owner[i] as usize == label + 1 && depth[i] > 0.0 {
                 output[i] = value;
@@ -742,6 +1097,108 @@ mod tests {
     use super::*;
 
     #[test]
+    fn horizontal_pool_matches_serial_visibility_bits() {
+        let meshes = [Mesh {
+            cells: vec![crate::sloping::Cell {
+                minimum: 1.,
+                virtual_cell: false,
+            }],
+            faces: vec![],
+            corners: vec![],
+        }];
+        let owner = [0, 1, 1, 1, 1, 1];
+        let terrain = [0., 1., 2., 2.001, crate::sloping::NODATA, 0.];
+        let window = crate::sloping::RasterWindow {
+            source_transform: [0., 1., 0., 1., 0., -1.],
+            source_tile: [256, 256],
+            width: 6,
+            height: 1,
+            transform: [0., 1., 0., 1., 0., -1.],
+            owner: &owner,
+            terrain: &terrain,
+            owner_cells: &[[0, 0]],
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for level in [1.0005, 2., 2.1] {
+            let values = [vec![level]];
+            let scalar = horizontal_depth(&window, &meshes, &values).unwrap();
+            let parallel = horizontal_depth_in_pool(&window, &meshes, &values, &pool).unwrap();
+            assert_eq!(
+                scalar.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                parallel.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn pool_products_and_max_preserve_scalar_bits_and_short_zip() {
+        let depth = [f32::NAN, -0.0, 0.0, 1.0, 1.00001, f32::INFINITY, -1.0, 3.7];
+        let speed = [1.0, -0.0, 0.0, 2.3, 4.56789, 1.0, 1.0];
+        let names: Vec<String> = DERIVED.iter().map(|s| (*s).into()).collect();
+        let expected = derive_all(&names, &depth, &speed, 32.174).unwrap();
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let result = derive_all_in_pool(&names, &depth, &speed, 32.174, &pool).unwrap();
+            for (a, b) in expected.iter().zip(&result) {
+                assert_eq!(
+                    a.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    b.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                );
+            }
+            let mut scalar = depth;
+            let mut parallel = scalar;
+            accumulate_max(&mut scalar, &speed);
+            accumulate_max_in_pool(&mut parallel, &speed, &pool);
+            assert_eq!(scalar.map(f32::to_bits), parallel.map(f32::to_bits));
+            assert!(derive_all_in_pool(&["unknown".into()], &depth, &speed, 1., &pool).is_err());
+            assert!(derive_all_in_pool(&["unknown".into()], &[f32::NAN], &[1.], 1., &pool).is_ok());
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode scalar/parallel microbenchmark; not a native qualification"]
+    fn benchmark_independent_product_passes() {
+        let n = 2_000_000;
+        let depth: Vec<_> = (0..n).map(|i| (i % 1000) as f32 * 0.01).collect();
+        let speed: Vec<_> = (0..n).map(|i| (i % 53) as f32 * 0.07).collect();
+        let names = DERIVED.map(String::from);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for round in 0..6 {
+            let timed = |parallel| {
+                let t = std::time::Instant::now();
+                let values = if parallel {
+                    derive_all_in_pool(&names, &depth, &speed, 32.174, &pool).unwrap()
+                } else {
+                    derive_all(&names, &depth, &speed, 32.174).unwrap()
+                };
+                (values, t.elapsed().as_secs_f64())
+            };
+            let ((scalar, scalar_seconds), (parallel, parallel_seconds)) = if round % 2 == 0 {
+                (timed(false), timed(true))
+            } else {
+                let p = timed(true);
+                (timed(false), p)
+            };
+            for (a, b) in scalar.iter().zip(&parallel) {
+                assert!(a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()));
+            }
+            println!(
+                "round={round} pixels={n} scalar_seconds={scalar_seconds} parallel_seconds={parallel_seconds}"
+            );
+            std::hint::black_box((scalar, parallel));
+        }
+    }
+
+    #[test]
     fn coefficient_inverse_solves_two_normals() {
         let mut c = Coef::default();
         c.add([1.0, 0.0], 1.0);
@@ -753,6 +1210,81 @@ mod tests {
         c.add([0.0, 1.0], 2.0);
         c.complete();
         assert_eq!(c.solve(1.5, 8.0), [3.0, 4.0]);
+    }
+
+    #[test]
+    fn collinear_coefficients_use_contributor_count() {
+        let mut c = Coef::default();
+        c.add([1.0, 0.0], 0.5);
+        c.add([-1.0, 0.0], 2.0);
+        c.add([1.0, 0.0], 4.0);
+        c.complete();
+        assert_eq!(c.solve(6.0, 3.0), [2.0, 1.0]);
+    }
+
+    #[test]
+    fn source_lattice_retains_global_and_tile_rounding() {
+        // Davis source grid; the extent and padded-tile recomputations each
+        // round in binary64 before the pixel centre is formed.
+        let lattice = SourceLattice::new(
+            [
+                6624608.910591285,
+                28.84524488389443,
+                0.0,
+                1973648.6808886456,
+                0.0,
+                -28.84524488389443,
+            ],
+            [256, 256],
+            [681, 569],
+        )
+        .unwrap();
+        let point = lattice.point(173, 339);
+        assert_eq!(point[0].to_bits(), 0x41594a3b63e0853c);
+        assert_eq!(point[1].to_bits(), 0x413df74fb8625747);
+        assert!(
+            SourceLattice::new([0.0, 1.0, 0.0, 10.0, 0.0, -1.0], [256, 128], [681, 569]).is_err()
+        );
+    }
+
+    #[test]
+    fn source_lattice_accepts_admitted_near_square_pixels() {
+        assert!(
+            SourceLattice::new(
+                [0.0, 1.0, 0.0, 10.0, 0.0, -1.0 - 5e-13],
+                [256, 256],
+                [681, 569],
+            )
+            .is_ok()
+        );
+        assert!(
+            SourceLattice::new(
+                [0.0, 30.0, 0.0, 10.0, 0.0, -30.0 - 1e-11],
+                [256, 256],
+                [681, 569],
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn rectangular_tiles_retain_legacy_velocity_support() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let window = crate::sloping::RasterWindow {
+            source_transform: [0.0, 1.0, 0.0, 10.0, 0.0, -1.0],
+            source_tile: [256, 128],
+            width: 1,
+            height: 1,
+            transform: [0.0, 1.0, 0.0, 10.0, 0.0, -1.0],
+            owner: &[0],
+            terrain: &[0.0],
+            owner_cells: &[],
+        };
+        let result = render_on_source_grid(&[], &window, &[f32::NAN], &pool, [681, 569]).unwrap();
+        assert!(result[0].is_nan());
     }
 
     #[test]

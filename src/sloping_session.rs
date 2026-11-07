@@ -20,6 +20,8 @@ use std::{
     time::Instant,
 };
 
+type PinnedHydraulics = Mutex<Option<(String, Arc<Vec<sloping::PreparedProfile>>)>>;
+
 type CachedGeometry = (Vec<Mesh>, Vec<Vec<Option<sloping::CellStencil>>>);
 type WindowKey = (
     String,
@@ -28,10 +30,12 @@ type WindowKey = (
     Vec<[usize; 2]>,
     Vec<u8>,
     Option<Vec<u8>>,
+    bool,
 );
 struct WindowData {
     owner: Vec<u32>,
     ground: Vec<f32>,
+    validity: Option<Vec<bool>>,
     weights: Option<sloping::PixelWeights>,
 }
 
@@ -39,6 +43,10 @@ struct WindowData {
 /// terrain share bounded LRU window and hydraulic caches. Dropping releases all.
 #[derive(Default)]
 pub struct PreparedSession {
+    pinned_hydraulics: PinnedHydraulics,
+    grouped_profile: bool,
+    terrain_preparations: u64,
+    geometry_preparations: u64,
     terrain: Option<(String, Arc<NativeTerrain>)>,
     geometry: Option<(String, Arc<CachedGeometry>)>,
     windows: Retained<WindowKey, WindowData>,
@@ -46,7 +54,32 @@ pub struct PreparedSession {
     pool: Option<(usize, Arc<rayon::ThreadPool>)>,
 }
 
-fn identity(path: &Path) -> Result<String, MapError> {
+impl PreparedSession {
+    pub(crate) fn preparation_counts(&self) -> (u64, u64) {
+        (self.terrain_preparations, self.geometry_preparations)
+    }
+
+    pub(crate) fn install<R: Send>(
+        &self,
+        work: impl FnOnce() -> Result<R, MapError> + Send,
+    ) -> Result<R, MapError> {
+        self.pool
+            .as_ref()
+            .ok_or_else(|| MapError::Internal("session has no pool".into()))?
+            .1
+            .install(work)
+    }
+    pub(crate) fn begin_grouped_profile(&mut self) {
+        self.grouped_profile = true;
+        *self.pinned_hydraulics.lock().unwrap() = None;
+    }
+    pub(crate) fn end_grouped_profile(&mut self) {
+        self.grouped_profile = false;
+        *self.pinned_hydraulics.lock().unwrap() = None;
+    }
+}
+
+pub(crate) fn identity(path: &Path) -> Result<String, MapError> {
     let path = path.canonicalize()?;
     let metadata = path.metadata()?;
     Ok(format!(
@@ -56,7 +89,7 @@ fn identity(path: &Path) -> Result<String, MapError> {
         metadata.modified()?
     ))
 }
-fn geometry_key(req: &Request, base: &Path) -> Result<String, MapError> {
+pub(crate) fn geometry_key(req: &Request, base: &Path) -> Result<String, MapError> {
     let mut key = String::new();
     for filename in &req.mesh_files {
         let path = model::resolve(base, filename);
@@ -76,7 +109,7 @@ fn geometry_key(req: &Request, base: &Path) -> Result<String, MapError> {
 
 pub const SCHEMA: &str = "ras-commander-sloping-request/1";
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub schema: String,
@@ -179,6 +212,10 @@ struct RenderedProfile {
     derived: Vec<Vec<f32>>,
     hydraulic_seconds: f64,
     render_seconds: f64,
+    finalize_seconds: f64,
+    velocity_seconds: f64,
+    derived_seconds: f64,
+    storage_render_seconds: f64,
     hydraulic_reused: bool,
     finite_pixels: usize,
     flooded_pixels: usize,
@@ -197,11 +234,13 @@ fn render(
     normals: Option<&[Vec<crate::velocity::FaceNormal>]>,
     foreign: &[usize],
     hydraulic_cache: Option<&Mutex<Retained<String, Vec<sloping::PreparedProfile>>>>,
+    pinned: Option<&PinnedHydraulics>,
     storage: Option<&crate::storage_area::StorageAreaPixels>,
     products: &DerivedPlan<'_>,
+    source_shape: [usize; 2],
 ) -> Result<RenderedProfile, MapError> {
     let tick = Instant::now();
-    let cache_key = if hydraulic_cache.is_some() && normals.is_none() {
+    let cache_key = if (hydraulic_cache.is_some() || pinned.is_some()) && normals.is_none() {
         let mut key =
             serde_json::to_string(&options).map_err(|e| MapError::Invalid(e.to_string()))?;
         for file in &profile.values_files {
@@ -211,10 +250,17 @@ fn render(
     } else {
         None
     };
-    let cached = match (&cache_key, hydraulic_cache) {
+    let pinned_value = pinned.and_then(|p| {
+        let guard = p.lock().unwrap();
+        guard
+            .as_ref()
+            .filter(|(key, _)| Some(key) == cache_key.as_ref())
+            .map(|(_, p)| p.clone())
+    });
+    let cached = pinned_value.or_else(|| match (&cache_key, hydraulic_cache) {
         (Some(key), Some(cache)) => cache.lock().unwrap().get(key),
         _ => None,
-    };
+    });
     let hydraulic_reused = cached.is_some();
     let mut new_prepared = Vec::new();
     let mut cell_values = Vec::new();
@@ -230,6 +276,9 @@ fn render(
         }
     }
     let prepared = cached.unwrap_or_else(|| Arc::new(new_prepared));
+    if let (Some(key), Some(pin)) = (&cache_key, pinned) {
+        *pin.lock().unwrap() = Some((key.clone(), prepared.clone()));
+    }
     if !hydraulic_reused && let (Some(key), Some(cache)) = (cache_key, hydraulic_cache) {
         let bytes = prepared.iter().map(|p| p.retained_bytes()).sum::<u64>()
             + (prepared.capacity() * std::mem::size_of::<sloping::PreparedProfile>()) as u64
@@ -247,9 +296,15 @@ fn render(
     let (mut depth, mut wse) =
         sloping::render_profile_cached(stencils, &prepared, window, 0.001, pool, weights)?;
     let render_seconds = tick.elapsed().as_secs_f64();
+    let tick = Instant::now();
     let (mut finite_pixels, mut flooded_pixels) =
         crate::finalize::apply(&mut depth, &mut wse, pool);
+    let finalize_seconds = tick.elapsed().as_secs_f64();
+    // Keep render_seconds scoped to the existing 2D render. Pool timing includes
+    // profile-value reads, rendering and the storage flooded-pixel count.
+    let mut storage_render_seconds = 0.0;
     if let Some(storage) = storage {
+        let tick = Instant::now();
         let path = profile
             .storage_area_values_file
             .as_ref()
@@ -261,10 +316,14 @@ fn render(
             .iter()
             .filter(|&&p| depth[p] > 0.0 && depth[p] <= 10000.0)
             .count();
+        storage_render_seconds = tick.elapsed().as_secs_f64();
     }
     let mut derived = Vec::new();
+    let mut velocity_seconds = 0.0;
+    let mut derived_seconds = 0.0;
     let velocity = match (normals, &profile.face_velocity_files) {
         (Some(normals), Some(files)) => {
+            let velocity_tick = Instant::now();
             let mut face_velocity = Vec::new();
             for (mesh, file) in meshes.iter().zip(files) {
                 face_velocity.push(crate::velocity::read_face_velocity(
@@ -292,13 +351,27 @@ fn render(
             let clip = match products.depth {
                 crate::velocity::VelocityDepth::Rendered => &depth,
                 crate::velocity::VelocityDepth::Horizontal => {
-                    horizontal = crate::velocity::horizontal_depth(window, meshes, &cell_values)?;
+                    horizontal = crate::velocity::horizontal_depth_in_pool(
+                        window,
+                        meshes,
+                        &cell_values,
+                        pool,
+                    )?;
                     &horizontal
                 }
             };
-            let velocity = crate::velocity::render(&inputs, window, clip, pool)?;
-            derived =
-                crate::velocity::derive_all(products.names, clip, &velocity, products.gravity)?;
+            let velocity =
+                crate::velocity::render_on_source_grid(&inputs, window, clip, pool, source_shape)?;
+            velocity_seconds = velocity_tick.elapsed().as_secs_f64();
+            let derived_tick = Instant::now();
+            derived = crate::velocity::derive_all_in_pool(
+                products.names,
+                clip,
+                &velocity,
+                products.gravity,
+                pool,
+            )?;
+            derived_seconds = derived_tick.elapsed().as_secs_f64();
             Some(velocity)
         }
         _ => None,
@@ -310,6 +383,10 @@ fn render(
         derived,
         hydraulic_seconds,
         render_seconds,
+        finalize_seconds,
+        velocity_seconds,
+        derived_seconds,
+        storage_render_seconds,
         hydraulic_reused,
         finite_pixels,
         flooded_pixels,
@@ -360,7 +437,7 @@ fn validate_derived(req: &Request) -> Result<(), MapError> {
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     pub id: String,
@@ -490,8 +567,12 @@ pub fn method_record() -> Value {
         "enhanced_options":true,"enhanced_method_id":"rasmapper-sloping-with-faces/1",
         "depth_weighted_faces":true,
         "native_donation_history":true,
+        "native_row_streaming":{"control":"row_stream_rows","default":0,"max":4096,
+            "render_mode":"sloping","products":["depth","wse"],
+            "unsupported":["slopingPretty","velocity","storage","reduce_max","consumer"],
+            "retained_full_window_buffers":["ownership","terrain"]},
         "bounded_profile_concurrency":true,
-        "persistent_session":true,"multi_window_cache":true,"hydraulic_cache":true,"native_geotiff_outputs":true,"bounded_pixel_weights":true,
+        "persistent_session":true,"multi_window_cache":true,"hydraulic_cache":true,"native_geotiff_outputs":true,"native_output_products":["depth","wse"],"native_output_compression":["NONE","LZW"],"bounded_pixel_weights":true,
         "velocity":crate::velocity::METHOD_ID,
         "velocity_depth":["rendered","horizontal"],
         "velocity_render_modes":["horizontal","sloping","slopingPretty"],
@@ -559,8 +640,79 @@ pub fn run_with_session(
     req: &Request,
     base: &Path,
     out: &Path,
-    mut session: Option<&mut PreparedSession>,
+    session: Option<&mut PreparedSession>,
 ) -> Result<Value, MapError> {
+    run_with_output_options(req, base, out, session, None)
+}
+
+/// Run with optional GeoTIFF product/compression controls. Existing callers keep defaults.
+pub fn run_with_output_options(
+    req: &Request,
+    base: &Path,
+    out: &Path,
+    session: Option<&mut PreparedSession>,
+    output: Option<&crate::native_output::OutputOptions>,
+) -> Result<Value, MapError> {
+    run_internal(req, base, out, session, output, None, false)
+}
+
+pub(crate) type FrameSink<'a> = dyn FnMut(&Profile, Vec<f32>, Value) -> Result<(), MapError> + 'a;
+
+pub(crate) fn run_to_sink(
+    req: &Request,
+    base: &Path,
+    out: &Path,
+    session: &mut PreparedSession,
+    consumer: &mut FrameSink<'_>,
+) -> Result<Value, MapError> {
+    run_internal(req, base, out, Some(session), None, Some(consumer), false)
+}
+
+pub(crate) fn plan_with_session(
+    req: &Request,
+    base: &Path,
+    session: &mut PreparedSession,
+) -> Result<u64, MapError> {
+    Ok(
+        run_internal(req, base, Path::new(""), Some(session), None, None, true)?["planned_bytes"]
+            .as_u64()
+            .unwrap(),
+    )
+}
+
+fn run_internal(
+    req: &Request,
+    base: &Path,
+    out: &Path,
+    mut session: Option<&mut PreparedSession>,
+    output: Option<&crate::native_output::OutputOptions>,
+    mut consumer: Option<&mut FrameSink<'_>>,
+    plan_only: bool,
+) -> Result<Value, MapError> {
+    if let Some(output) = output {
+        output.validate()?;
+        if !req.geotiff_outputs {
+            return Err(MapError::Unsupported(
+                "output options require native geotiff_outputs".into(),
+            ));
+        }
+    }
+    let defaults = crate::native_output::OutputOptions::default();
+    let selected = output.unwrap_or(&defaults);
+    let deliver_files = consumer.is_none();
+    let row_stream_rows = selected.row_stream_rows;
+    if row_stream_rows > 0
+        && (!req.geotiff_outputs
+            || !req.stream_outputs
+            || req.options.render_mode != sloping::RenderMode::Corners
+            || req.velocity_normals_files.is_some()
+            || req.storage_areas_file.is_some()
+            || req.reduce_max
+            || consumer.is_some())
+    {
+        return Err(MapError::Unsupported("row streaming requires plain-corner native GeoTIFF without velocity, storage, reduction or consumer".into()));
+    }
+
     req.options.validate()?;
     validate_derived(req)?;
     if req.geotiff_outputs && (!req.stream_outputs || req.velocity_normals_files.is_some()) {
@@ -680,6 +832,8 @@ pub fn run_with_session(
         .checked_mul(
             if req.options.render_mode == sloping::RenderMode::WithFaces {
                 56
+            } else if row_stream_rows > 0 {
+                32
             } else {
                 40
             },
@@ -694,6 +848,16 @@ pub fn run_with_session(
                     },
                 )
                 .and_then(|g| v.checked_add(g))
+        })
+        .and_then(|v| {
+            v.checked_add(if row_stream_rows > 0 {
+                (width as u64)
+                    .checked_mul(height.min(row_stream_rows) as u64)?
+                    .checked_mul(8)?
+                    .checked_add((width as u64).checked_mul(8)?.max(2 * 256 * 1024))?
+            } else {
+                0
+            })
         })
         .and_then(|v| v.checked_add(cache))
         .and_then(|v| v.checked_add(persistent_bytes))
@@ -723,6 +887,7 @@ pub fn run_with_session(
         && s.geometry.as_ref().is_some_and(|(old, _)| old != &key)
     {
         s.geometry = None;
+        *s.pinned_hydraulics.lock().unwrap() = None;
         s.hydraulics.lock().unwrap().clear();
         s.windows.clear();
     }
@@ -747,6 +912,34 @@ pub fn run_with_session(
         s.terrain = None;
         s.windows.clear();
     }
+    if !terrain_reused && let Some(s) = session.as_mut() {
+        s.terrain_preparations += 1;
+    }
+    if let Some(s) = session.as_mut()
+        && s.pool
+            .as_ref()
+            .is_some_and(|(threads, _)| *threads != req.threads)
+    {
+        s.pool = None;
+    }
+    let pool = if let Some((threads, pool)) = session
+        .as_ref()
+        .and_then(|s| s.pool.as_ref())
+        .filter(|(threads, _)| *threads == req.threads)
+    {
+        let _ = threads;
+        pool.clone()
+    } else {
+        Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(req.threads)
+                .build()
+                .map_err(|e| MapError::Internal(e.to_string()))?,
+        )
+    };
+    if let Some(s) = session.as_mut() {
+        s.pool = Some((req.threads, pool.clone()));
+    }
     let terrain = if terrain_reused {
         session
             .as_ref()
@@ -757,16 +950,18 @@ pub fn run_with_session(
             .1
             .clone()
     } else {
-        Arc::new(NativeTerrain::open(
-            model::resolve(base, &req.terrain)
-                .to_str()
-                .ok_or_else(|| MapError::Invalid("terrain path is not UTF8".into()))?,
-            req.epsg,
-            &req.crs_identity,
-            QueryConvention::PixelCenter,
-            NodataPolicy::Dry,
-            cache,
-        )?)
+        Arc::new(pool.install(|| {
+            NativeTerrain::open(
+                model::resolve(base, &req.terrain)
+                    .to_str()
+                    .ok_or_else(|| MapError::Invalid("terrain path is not UTF8".into()))?,
+                req.epsg,
+                &req.crs_identity,
+                QueryConvention::PixelCenter,
+                NodataPolicy::Dry,
+                cache,
+            )
+        })?)
     };
     if let Some(s) = session.as_mut() {
         s.terrain = Some((terrain_key.clone(), terrain.clone()));
@@ -853,46 +1048,32 @@ pub fn run_with_session(
         .checked_add(per_profile)
         .ok_or_else(|| MapError::Budget("velocity product plan overflow".into()))?;
     let (effective, admitted) = admit_profiles(
-        req.max_inflight_profiles,
+        if row_stream_rows > 0 {
+            1
+        } else {
+            req.max_inflight_profiles
+        },
         req.threads,
         req.profiles.len(),
         req.max_working_bytes,
         admitted,
         additional,
     )?;
-    fs::create_dir(out)?;
+    if plan_only {
+        return Ok(json!({"planned_bytes":admitted}));
+    }
+    if deliver_files {
+        fs::create_dir(out)?;
+    }
     let mut report = json!({"schema":"ras-commander-sloping-report/1","status":"in_progress", "method":selected_method(req.options),
         "threads":req.threads,"window":req.window,"planned_bytes":admitted,
         "requested_inflight_profiles":req.max_inflight_profiles,"effective_inflight_profiles":effective,
         "additional_profile_planned_bytes":additional,"profiles":[]});
-    sink::write_json(&out.join("report.json"), &report)?;
+    if deliver_files {
+        sink::write_json(&out.join("report.json"), &report)?;
+    }
     let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || -> Result<(), MapError> {
-            if let Some(s) = session.as_mut()
-                && s.pool
-                    .as_ref()
-                    .is_some_and(|(threads, _)| *threads != req.threads)
-            {
-                s.pool = None;
-            }
-            let pool = if let Some((threads, pool)) = session
-                .as_ref()
-                .and_then(|s| s.pool.as_ref())
-                .filter(|(threads, _)| *threads == req.threads)
-            {
-                let _ = threads;
-                pool.clone()
-            } else {
-                Arc::new(
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(req.threads)
-                        .build()
-                        .map_err(|e| MapError::Internal(e.to_string()))?,
-                )
-            };
-            if let Some(s) = session.as_mut() {
-                s.pool = Some((req.threads, pool.clone()));
-            }
             let tick = Instant::now();
             let geometry_reused = session
                 .as_ref()
@@ -901,6 +1082,9 @@ pub fn run_with_session(
                 s.geometry = None;
                 s.hydraulics.lock().unwrap().clear();
                 s.windows.clear();
+            }
+            if !geometry_reused && let Some(s) = session.as_mut() {
+                s.geometry_preparations += 1;
             }
             let geometry = if geometry_reused {
                 session
@@ -1000,6 +1184,7 @@ pub fn run_with_session(
                         .as_ref()
                         .map(|p| fs::read(model::resolve(base, p)))
                         .transpose()?,
+                    req.terrain_scope.is_some(),
                 )
             } else {
                 (
@@ -1009,6 +1194,7 @@ pub fn run_with_session(
                     Vec::new(),
                     Vec::new(),
                     None,
+                    req.terrain_scope.is_some(),
                 )
             };
             let cached_window = session.as_mut().and_then(|s| s.windows.get(&window_key));
@@ -1041,18 +1227,27 @@ pub fn run_with_session(
                 let tick = Instant::now();
                 let mut ground = vec![sloping::NODATA; count];
                 let (bw, bh) = terrain.block;
-                // Row stripes own disjoint output slices. Decodes run inside the same
-                // bounded pool, and the shared single-flight cache handles boundary
-                // blocks seen by adjacent stripes. Skip blocks outside ownership/AOI.
-                let stripe_pixels = width
-                    .checked_mul(bh)
-                    .ok_or_else(|| MapError::Budget("sloping terrain stripe overflow".into()))?;
+                // Disjoint stripes end on original source block rows, even when
+                // the request starts partway through a block.
+                let mut validity = req.terrain_scope.as_ref().map(|_| vec![false; count]);
+                let mut remaining_ground = ground.as_mut_slice();
+                let mut remaining_validity = validity.as_deref_mut();
+                let mut stripes = Vec::new();
+                for (offset, rows) in source_row_stripes(row, height, bh) {
+                    let (destination, rest) = remaining_ground.split_at_mut(rows * width);
+                    remaining_ground = rest;
+                    let flags = if let Some(values) = remaining_validity.take() {
+                        let (flags, rest) = values.split_at_mut(rows * width);
+                        remaining_validity = Some(rest);
+                        Some(flags)
+                    } else {
+                        None
+                    };
+                    stripes.push((row + offset, destination, flags));
+                }
                 pool.install(|| {
-                    ground
-                        .par_chunks_mut(stripe_pixels)
-                        .enumerate()
-                        .try_for_each(|(stripe, destination)| -> Result<(), MapError> {
-                            let first = row + stripe * bh;
+                    stripes.into_par_iter().try_for_each(
+                        |(first, destination, mut validity)| -> Result<(), MapError> {
                             let last = first + destination.len() / width;
                             for by in first / bh..=(last - 1) / bh {
                                 for bx in col / bw..=(col + width - 1) / bw {
@@ -1083,24 +1278,29 @@ pub fn run_with_session(
                                                         "nonfinite sloping terrain".into(),
                                                     ));
                                                 }
-                                                destination[(r - first) * width + c - col] =
-                                                    value as f32;
+                                                let index = (r - first) * width + c - col;
+                                                destination[index] = value as f32;
+                                                if let Some(flags) = validity.as_mut() {
+                                                    flags[index] = true;
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
                             Ok(())
-                        })
+                        },
+                    )
                 })?;
                 report["terrain_prepare_seconds"] = tick.elapsed().as_secs_f64().into();
                 Arc::new(WindowData {
                     owner,
                     ground,
+                    validity,
                     weights: None,
                 })
             };
-            let window_base_bytes = count as u64 * 8
+            let window_base_bytes = count as u64 * (8 + u64::from(req.terrain_scope.is_some()))
                 + (2 * std::mem::size_of::<(WindowKey, Arc<WindowData>, u64)>()
                     + std::mem::size_of::<WindowData>()
                     + 2 * std::mem::size_of::<usize>()) as u64
@@ -1115,6 +1315,7 @@ pub fn run_with_session(
             let (bw, bh) = terrain.block;
             if session.is_some()
                 && !window_reused
+                && row_stream_rows == 0
                 && weight_budget > 0
                 && req.options.render_mode != sloping::RenderMode::WithFaces
             {
@@ -1179,7 +1380,9 @@ pub fn run_with_session(
                         aoi.as_deref(),
                         &pool,
                     )?;
+                    let ground_tick = Instant::now();
                     crate::storage_area::read_ground(&mut pixels, &terrain, req.window)?;
+                    report["storage_ground_seconds"] = ground_tick.elapsed().as_secs_f64().into();
                     report["storage_areas"] = json!({
                         "method": crate::storage_area::method_record(),
                         "count": req.storage_area_count,
@@ -1191,20 +1394,61 @@ pub fn run_with_session(
                 .transpose()?;
             let foreign = match &req.terrain_scope {
                 Some(scope) => {
-                    let scoped = crate::terrain_scope::check(
+                    let tick = Instant::now();
+                    let scoped = crate::terrain_scope::check_with_validity(
                         scope,
                         base,
                         &terrain,
                         req.window,
                         &data.owner,
                         storage.as_ref().map_or(&[], |s| &s.pixels),
+                        |p| {
+                            if data.owner[p] != 0 {
+                                data.validity.as_ref().unwrap()[p]
+                            } else {
+                                storage
+                                    .as_ref()
+                                    .and_then(|s| {
+                                        s.pixels
+                                            .binary_search(&p)
+                                            .ok()
+                                            .map(|i| s.ground[i].is_finite())
+                                    })
+                                    .unwrap_or(false)
+                            }
+                        },
                     )?;
+                    report["terrain_scope_seconds"] = tick.elapsed().as_secs_f64().into();
                     report["terrain_scope"] = scoped.record;
                     scoped.foreign
                 }
                 None => Vec::new(),
             };
             for batch in req.profiles.chunks(effective) {
+                if row_stream_rows > 0 {
+                    for profile in batch {
+                        let dir = out.join(&profile.id);
+                        fs::create_dir(&dir)?;
+                        let unit = render_native_rows(
+                            profile,
+                            base,
+                            meshes,
+                            stencils,
+                            &window,
+                            &pool,
+                            req.options,
+                            &foreign,
+                            selected,
+                            &dir,
+                            transform,
+                            req.epsg,
+                        )?;
+                        sink::write_json(&dir.join("unit.json"), &unit)?;
+                        report["profiles"].as_array_mut().unwrap().push(unit);
+                        sink::write_json(&out.join("report.json"), &report)?;
+                    }
+                    continue;
+                }
                 let results = map_batch(batch, &pool, |profile| {
                     render(
                         profile,
@@ -1221,8 +1465,13 @@ pub fn run_with_session(
                             .as_ref()
                             .filter(|_| hydraulic_bytes > 0)
                             .map(|s| &s.hydraulics),
+                        session
+                            .as_ref()
+                            .filter(|s| s.grouped_profile)
+                            .map(|s| &s.pinned_hydraulics),
                         storage.as_ref(),
                         &plan,
+                        [terrain.width, terrain.height],
                     )
                 })?;
                 // Indexed collection and ordered emission preserve the pipe/report
@@ -1235,21 +1484,38 @@ pub fn run_with_session(
                         derived,
                         hydraulic_seconds,
                         render_seconds,
+                        finalize_seconds,
+                        velocity_seconds,
+                        derived_seconds,
+                        storage_render_seconds,
                         hydraulic_reused,
                         finite_pixels,
                         flooded_pixels,
                     } = rendered;
+                    if let Some(consumer) = consumer.as_mut() {
+                        let unit = json!({"id":profile.id,"status":"complete",
+                            "hydraulic_seconds":hydraulic_seconds,"render_seconds":render_seconds,"finalize_seconds":finalize_seconds,
+                            "velocity_seconds":velocity_seconds,"derived_seconds":derived_seconds,
+                            "storage_render_seconds":storage_render_seconds,
+                            "hydraulic_reused":hydraulic_reused});
+                        drop(wse);
+                        consumer(profile, depth, unit.clone())?;
+                        report["profiles"].as_array_mut().unwrap().push(unit);
+                        continue;
+                    }
                     let dir = out.join(&profile.id);
                     fs::create_dir(&dir)?;
                     if req.reduce_max {
                         for (acc, values) in maxima.iter_mut().zip(&derived) {
-                            crate::velocity::accumulate_max(acc, values);
+                            crate::velocity::accumulate_max_in_pool(acc, values, &pool);
                         }
                     } else if req.stream_outputs {
+                        let stream_tick = Instant::now();
                         let mut stream =
                             std::io::BufWriter::with_capacity(65536, std::io::stdout().lock());
                         let mut header =
                             json!({"id":profile.id,"status":"complete","pixels":count});
+                        header["storage_render_seconds"] = storage_render_seconds.into();
                         if velocity.is_some() {
                             header["velocity"] = true.into();
                         }
@@ -1261,22 +1527,36 @@ pub fn run_with_session(
                             header["products"] = "native-geotiff/1".into();
                             header["depth_finite_pixels"] = finite_pixels.into();
                             header["flooded_pixels"] = flooded_pixels.into();
-                            crate::geotiff::write(
-                                &dir.join("depth.tif"),
-                                depth,
-                                width,
-                                height,
-                                transform,
-                                req.epsg,
-                            )?;
-                            crate::geotiff::write(
-                                &dir.join("wse.tif"),
-                                wse,
-                                width,
-                                height,
-                                transform,
-                                req.epsg,
-                            )?;
+                            if selected.products.iter().any(|p| p == "depth") {
+                                pool.install(|| {
+                                    crate::geotiff::write(
+                                        &dir.join("depth.tif"),
+                                        depth,
+                                        width,
+                                        height,
+                                        transform,
+                                        req.epsg,
+                                        selected.compression,
+                                    )
+                                })?;
+                            }
+                            if selected.products.iter().any(|p| p == "wse") {
+                                pool.install(|| {
+                                    crate::geotiff::write(
+                                        &dir.join("wse.tif"),
+                                        wse,
+                                        width,
+                                        height,
+                                        transform,
+                                        req.epsg,
+                                        selected.compression,
+                                    )
+                                })?;
+                            }
+                            if output.is_some() {
+                                header["selected_products"] = json!(selected.products);
+                                header["compression"] = json!(selected.compression);
+                            }
                             header["write_seconds"] = tick.elapsed().as_secs_f64().into();
                             writeln!(stream, "{header}")?;
                             stream.flush()?;
@@ -1292,6 +1572,10 @@ pub fn run_with_session(
                             }
                             stream.flush()?;
                         }
+                        report["stream_seconds"] =
+                            (report["stream_seconds"].as_f64().unwrap_or(0.0)
+                                + stream_tick.elapsed().as_secs_f64())
+                            .into();
                     } else {
                         crate::horizontal::write_values(&dir.join("depth.bin"), &depth)?;
                         crate::horizontal::write_values(&dir.join("wse.bin"), &wse)?;
@@ -1305,10 +1589,12 @@ pub fn run_with_session(
                             )?;
                         }
                     }
-                    let unit = json!({"id":profile.id,"status":"complete","hydraulic_seconds":hydraulic_seconds,"render_seconds":render_seconds,"hydraulic_reused":hydraulic_reused});
+                    let unit = json!({"id":profile.id,"status":"complete","hydraulic_seconds":hydraulic_seconds,"render_seconds":render_seconds,"finalize_seconds":finalize_seconds,"velocity_seconds":velocity_seconds,"derived_seconds":derived_seconds,"storage_render_seconds":storage_render_seconds,"hydraulic_reused":hydraulic_reused});
                     sink::write_json(&dir.join("unit.json"), &unit)?;
                     report["profiles"].as_array_mut().unwrap().push(unit);
-                    sink::write_json(&out.join("report.json"), &report)?;
+                    if deliver_files {
+                        sink::write_json(&out.join("report.json"), &report)?;
+                    }
                 }
             }
             if req.reduce_max {
@@ -1343,7 +1629,7 @@ pub fn run_with_session(
                 _ => "sloping internal panic".into(),
             }
             .into();
-            for profile in &req.profiles {
+            for profile in req.profiles.iter().filter(|_| deliver_files) {
                 let dir = out.join(&profile.id);
                 for filename in [
                     "depth.bin",
@@ -1377,7 +1663,9 @@ pub fn run_with_session(
     }
     report["total_seconds"] = started.elapsed().as_secs_f64().into();
     report["terrain_cache"] = json!(terrain.stats());
-    sink::write_json(&out.join("report.json"), &report)?;
+    if deliver_files {
+        sink::write_json(&out.join("report.json"), &report)?;
+    }
     Ok(report)
 }
 
@@ -1433,4 +1721,181 @@ mod tests {
             .is_err()
         );
     }
+}
+
+/// Source-lattice aligned output stripes, expressed as (window row, row count).
+fn source_row_stripes(row: usize, height: usize, block_rows: usize) -> Vec<(usize, usize)> {
+    let mut stripes = Vec::new();
+    let mut offset = 0;
+    while offset < height {
+        let rows = (block_rows - (row + offset) % block_rows).min(height - offset);
+        stripes.push((offset, rows));
+        offset += rows;
+    }
+    stripes
+}
+
+#[cfg(test)]
+mod stripe_tests {
+    use super::source_row_stripes;
+    #[test]
+    fn stripes_are_source_aligned_and_cover_partial_edges_once() {
+        for row in [0, 1, 255, 256, 7787] {
+            for height in [1, 17, 256, 513, 18228] {
+                let stripes = source_row_stripes(row, height, 256);
+                let mut next = 0;
+                for (offset, rows) in stripes {
+                    assert_eq!(offset, next);
+                    assert!(rows > 0 && rows <= 256);
+                    assert_eq!((row + offset) / 256, (row + offset + rows - 1) / 256);
+                    next += rows;
+                }
+                assert_eq!(next, height);
+            }
+        }
+    }
+
+    #[test]
+    fn row_stream_refusals_happen_before_input_reads() {
+        use super::*;
+        let baseline: Request = serde_json::from_value(json!({
+            "schema":SCHEMA,"terrain":"not-present.tif","epsg":3433,
+            "crs_identity":{"kind":"epsg"},"terrain_transform":[0,1,0,256,0,-1],
+            "window":[0,0,256,256],"geometry_file":"not-present.wkb",
+            "mesh_files":["not-present.mesh"],"owner_cells":[[0,0]],
+            "profiles":[{"id":"max","values_files":["not-present.f32"]}],
+            "threads":1,"max_working_bytes":268435456,"stream_outputs":true,
+            "geotiff_outputs":true
+        }))
+        .unwrap();
+        let output = crate::native_output::OutputOptions {
+            row_stream_rows: 7,
+            ..Default::default()
+        };
+        for case in 0..4 {
+            let mut request = baseline.clone();
+            match case {
+                0 => request.options.render_mode = sloping::RenderMode::WithFaces,
+                1 => request.storage_areas_file = Some("not-present-storage.wkb".into()),
+                2 => request.velocity_normals_files = Some(vec!["not-present.f32".into()]),
+                _ => request.stream_outputs = false,
+            }
+            let error = run_with_output_options(
+                &request,
+                Path::new("."),
+                Path::new("not-created"),
+                None,
+                Some(&output),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), "unsupported");
+            assert!(error.to_string().contains("row streaming"));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_native_rows(
+    profile: &Profile,
+    base: &Path,
+    meshes: &[Mesh],
+    stencils: &[Vec<Option<sloping::CellStencil>>],
+    window: &sloping::RasterWindow<'_>,
+    pool: &rayon::ThreadPool,
+    options: sloping::Options,
+    foreign: &[usize],
+    output: &crate::native_output::OutputOptions,
+    dir: &Path,
+    transform: [f64; 6],
+    epsg: u32,
+) -> Result<Value, MapError> {
+    let tick = Instant::now();
+    let mut prepared = Vec::new();
+    for ((mesh, stencil), filename) in meshes.iter().zip(stencils).zip(&profile.values_files) {
+        let values = values(&model::resolve(base, filename), mesh.cells.len())?;
+        prepared.push(sloping::prepare_profile_with_options(
+            mesh, stencil, &values, 0.001, pool, options,
+        )?);
+    }
+    crate::terrain_scope::deny_wet_foreign(foreign, window.owner, window.owner_cells, |m, c| {
+        prepared[m].is_wet(c)
+    })?;
+    let hydraulic_seconds = tick.elapsed().as_secs_f64();
+    let mut depth_writer = output
+        .products
+        .iter()
+        .any(|p| p == "depth")
+        .then(|| {
+            crate::geotiff::RowWriter::create(
+                &dir.join("depth.tif"),
+                window.width,
+                window.height,
+                transform,
+                epsg,
+                output.compression,
+            )
+        })
+        .transpose()?;
+    let mut wse_writer = output
+        .products
+        .iter()
+        .any(|p| p == "wse")
+        .then(|| {
+            crate::geotiff::RowWriter::create(
+                &dir.join("wse.tif"),
+                window.width,
+                window.height,
+                transform,
+                epsg,
+                output.compression,
+            )
+        })
+        .transpose()?;
+    let mut render_seconds = 0.0;
+    let mut finalize_seconds = 0.0;
+    let mut write_seconds = 0.0;
+    let mut finite_pixels = 0;
+    let mut flooded_pixels = 0;
+    for row in (0..window.height).step_by(output.row_stream_rows) {
+        let rows = output.row_stream_rows.min(window.height - row);
+        let tick = Instant::now();
+        let (mut depth, mut wse) =
+            sloping::render_profile_rows(stencils, &prepared, window, 0.001, pool, row, rows)?;
+        render_seconds += tick.elapsed().as_secs_f64();
+        let tick = Instant::now();
+        let (finite, flooded) = crate::finalize::apply(&mut depth, &mut wse, pool);
+        finite_pixels += finite;
+        flooded_pixels += flooded;
+        finalize_seconds += tick.elapsed().as_secs_f64();
+        let tick = Instant::now();
+        if let Some(writer) = depth_writer.as_mut() {
+            writer.write_rows(&depth)?;
+        }
+        if let Some(writer) = wse_writer.as_mut() {
+            writer.write_rows(&wse)?;
+        }
+        write_seconds += tick.elapsed().as_secs_f64();
+    }
+    let tick = Instant::now();
+    if let Some(writer) = depth_writer {
+        writer.finish()?;
+    }
+    if let Some(writer) = wse_writer {
+        writer.finish()?;
+    }
+    write_seconds += tick.elapsed().as_secs_f64();
+    let header = json!({"id":profile.id,"status":"complete","pixels":window.owner.len(),
+        "products":"native-geotiff/1","depth_finite_pixels":finite_pixels,"flooded_pixels":flooded_pixels,
+        "selected_products":output.products,"compression":output.compression,
+        "row_stream_rows":output.row_stream_rows,"write_seconds":write_seconds,"storage_render_seconds":0.0});
+    let tick = Instant::now();
+    let mut stream = std::io::stdout().lock();
+    writeln!(stream, "{header}")?;
+    stream.flush()?;
+    Ok(
+        json!({"id":profile.id,"status":"complete","hydraulic_seconds":hydraulic_seconds,
+        "render_seconds":render_seconds,"finalize_seconds":finalize_seconds,"write_seconds":write_seconds,
+        "stream_seconds":tick.elapsed().as_secs_f64(),"row_stream_rows":output.row_stream_rows,
+        "storage_render_seconds":0.0,"hydraulic_reused":false}),
+    )
 }

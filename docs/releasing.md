@@ -40,3 +40,15 @@ dispatch release.yml at that tag with `publish_existing=true`. It verifies the
 tag/version and existing release checksums, then publishes to each enabled
 registry without rebuilding or replacing the release assets. Enable only the
 registries that have not yet received this version when retrying publication.
+
+## 0.13.0 integration gates
+
+This release ports the bounded diagnostic/performance delta onto public 0.12,
+retaining unmodified effective-terrain schema /1. It does not include private
+terrain-modification schema /2. Row streaming is opt-in (0 default, at most
+4096 rows), restricted to plain corner/native TIFF output; full ownership and
+ground remain resident. Installed-wheel/native prepared-fixture checks must
+identify the integrated artifact, separately from historical 0.11 measurements.
+Windows local evidence does not replace Linux CI/wheel qualification or review.
+The unresolved Creek native-repeat variation remains a release limitation;
+no Creek median or all-model parity claim is made.
