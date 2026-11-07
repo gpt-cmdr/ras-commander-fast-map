@@ -73,6 +73,8 @@ pub fn method_record() -> Value {
         "method_id": METHOD_ID,
         "render": "horizontal-cell-constant/2 per stored output time; physical 2D cells and optional storage-area level pools",
         "storage_area_surfaces": crate::storage_area::METHOD_ID,
+        "storage_area_products": ["arrival_time", "percent_inundated"],
+        "storage_area_requires_2d": true,
         "storage_area_wet": "rendered pool depth > threshold (float32, strict); no cell gate",
         "wet": "rendered depth valid and depth > threshold (float32, strict)",
         "percent_inundated": "float32(100 * wet_count / n_times)",
@@ -88,7 +90,7 @@ pub fn method_record() -> Value {
         "unqualified_refused": ["irregular_intervals"],
         "reported": ["initially_wet_pixels", "multiple_period_pixels", "threshold_equal_samples"],
         "duration_memory": "per cell: its local extrema (8 bytes each), admitted against max_working_bytes as they are found",
-        "not_implemented": "sloping rendering; recession product; subinterval interpolation"
+        "not_implemented": "sloping rendering; recession product; subinterval interpolation; duration with storage areas; storage-only models"
     })
 }
 

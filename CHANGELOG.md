@@ -1,6 +1,121 @@
 # Changelog
 
-## 0.12.0 — 2026-10-31
+## 0.13.0  - 2026-11-07
+
+### Bounded native delivery and performance qualification
+
+Align terrain preparation to original source block rows and reuse classified
+source validity in terrain-scope checks while preserving footprint counts and
+refusals. Borrow donation scratch and run independent velocity/derived pixel
+passes in the existing request pool without changing per-pixel arithmetic.
+Add separate scope, storage-ground, finalize, velocity, derived and delivery
+timers.
+
+Add bounded native TIFF strips and opt-in `row_stream_rows` for plain corner
+sloping Depth/WSE. Preserve original global coordinates and legacy defaults;
+refuse unsupported storage/velocity/reduction combinations. Full ownership and
+terrain remain resident. Streaming trades lower output memory for throughput.
+
+Record matched RASMapper reruns with six qualified configurations and three
+warm pairs each. Creek's native raw exports varied on repetition, so its
+exactness gate stopped the run and no Creek median is qualified. See
+[the rerun evidence and limits](docs/performance-comparison-rerun.md).
+
+### Derived-map operation selection and measured profile concurrency
+
+Select known derived-map operations once per frame and directly collect their
+Float32 buffers, preserving the existing formulas, masks and unknown-product
+helper behavior. Private CLB09 Windows tests retain complete native masks and
+bits. A small paired wall-time reduction was observed; CPU benefit was
+inconclusive. Independently measured profile concurrency improves the tested
+Davis reduction without changing the global thread budget. Defaults remain
+unchanged; see [performance qualification](docs/performance-qualification.md)
+for the fixture, artifact identity, settings and measurement limits.
+
+### Experimental stored-surface 1D diagnostic
+
+Add a separate `one-d-xs-surface-diagnostic/3` Rust kernel and
+`one-d-diagnostic` CLI. Preserve caller-supplied global XS TIN ordering and
+segment-local indices; bind reusable geometry to ordered cross-section WSE
+profiles. Admit allocations before binary payload reads, reject invalid
+geometry, and emit aligned Float32 Depth/WSE buffers with common masks.
+Synthetic tests cover local indices, edge ordering, missing data, binary32
+visibility, budgets and CLI transport. Native parity is explicitly unqualified;
+existing mapping methods and their numerical behavior are unchanged.
+
+Early native comparisons suggested last-stored-segment ownership at XS
+overlaps, including dry suppression. Preserve that legacy diagnostic; broader
+junction-aware evidence motivates the explicit native-layout method below. Remaining
+private XS fixture A rounding, storage and terrain-layout gaps keep this method experimental.
+Add `coupled-diagnostic` for explicitly aligned single-profile 1D/2D component
+buffers. Physical 2D coverage wins before visibility, preserving selected
+Float32 bits and preventing wet-only fallback. Reject mismatched grids, CRS,
+profiles, masks and owner labels; cap diagnostic JSON and admit output/writer
+scratch before binary reads. Neither diagnostic is a public Commander mixed
+mapping API or a general native qualification claim.
+
+Add explicit coupled schema `/2` and method
+`one-d-two-d-storage-coverage-first-diagnostic/1` for prepared storage products.
+Storage coverage overrides XS even when dry; copy selected Float32 bits.
+Reject physical storage/2D overlap, mismatched storage metadata and invalid
+products before output mutation. Admit the additional storage arrays before
+reads. Preserve schema `/1` and its method semantics.
+
+### Explicit XS clipping and qualified private XS fixture A inputs
+
+Add 1D schema `/3` and method `one-d-xs-surface-diagnostic/5` with required
+normalized Float64 strip M and per-XS Float32 barrier records. Preserve original
+claim order and tile scan history while applying levees, default strip limits,
+and native XS-end obstruction tests. Keep schemas `/1` and `/2` unchanged.
+Allocation admission includes M planes, staged records, decoded barriers and
+retained barrier copies. Reject incomplete/nonfinite inputs and unsupported
+clipping scopes before creating outputs. No HDF or HEC runtime enters Rust.
+
+Private installed-wheel private XS fixture A checks cover three steady profiles across five
+registered terrain sources. Storage composition, clipping and independently
+qualified terrain-read masks match complete native Depth/WSE masks and bits in
+all fifteen cases. Terrain masks come from terrain-HDF metadata/stitch geometry,
+never flood-reference masks; raw source masks alone were rejected. This does not
+qualify arbitrary terrain collections, blocked polygons or encroachments.
+
+### Native-layout XS diagnostic
+
+Add explicit 1D request schema `/2` and method `one-d-xs-surface-diagnostic/4`.
+Caller-prepared native render ranks select ownership before wet/dry filtering.
+Scan-convert stored triangles using global double plane/edge increments restarted
+at original terrain tiles, then cast unclamped weights to Float32. Preserve
+schema `/1` and method `/3`. Global source windows keep original tile history;
+rank payloads, geometry, tile scratch and output allocations are admitted before
+reads. Add a pure staging helper for confluence/split promotion from XS endpoints
+and caller-decoded River names. No HDF or native runtime dependency enters Rust.
+
+Coupled storage schema `/2` permits zero physical 2D cells only with an entirely
+unowned dry 2D component. Storage still suppresses XS before visibility. Coupled
+schema `/1` retains its positive-cell requirement. Full native qualification and
+known clipping limits are recorded in the private roadmap; no speedup is claimed.
+
+### Storage-area qualification groundwork
+
+Clarify that current storage-area mapping requires 2D inputs and whole-simulation
+storage products exclude duration. Advertise those restrictions explicitly and
+test duration refusal. Sloping profile reports add `storage_render_seconds`
+without changing existing render timing or numerical behavior. Add an external
+Float32 GeoTIFF mask/bit qualification runner and private-development roadmap
+in `docs/storage-roadmap.md`; no new native parity or speedup is claimed.
+
+### Selected native products and grouped depth maxima
+
+Add optional native GeoTIFF product selection and explicit NONE/LZW compression,
+preserving existing Rust request structs, entry points and omitted-field defaults.
+Add versioned `depth-groups` requests, ordered per-sample receipts, per-reach AOI
+reduction of finalized Float32 depths, shared hydraulic preparation, bounded
+accumulator spill to explicit local scratch, row-based GeoTIFF delivery and a
+length-delimited grouped-buffer sink. Grouped scope initially covers saved
+timesteps with plain sloping and explicit feet/metres depth units. No grouped
+real-model hydraulic or performance qualification is claimed. See
+`docs/depth-groups.md` for capability checks, resource controls and failure rules.
+
+## 0.12.0  - 2026-10-31
 
 ### Storage-area level pools
 

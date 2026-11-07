@@ -40,6 +40,38 @@ Commander. The CLI does not read a plan HDF directly.
 
 ## Methods and resource controls
 
+Experimental 1D work is available through `ras2fim-batch
+one-d-diagnostic <request.json> <new-output-dir>` and the Rust `one_d` module.
+It maps caller-prepared stored cross-section TINs and aligned terrain buffers
+to Depth/WSE buffers, with allocation admission and reusable geometry. Its
+method record explicitly reports `native_parity_qualified=false`. It is not
+production 1D support: native interpolation arithmetic, structures, junctions
+and mixed-model ownership still need qualification. See the
+[1D contract and remaining work](docs/storage-roadmap.md#experimental-1d-contract).
+
+`coupled-diagnostic` composes explicitly aligned XS and 2D component buffers
+using physical 2D coverage before wet/dry filtering. It is experimental and
+requires externally prepared global component geometry and ownership; existing
+Commander 2D-only API guards remain intact. Native comparisons and known gaps
+are recorded in the [private roadmap](docs/storage-roadmap.md).
+1D request schema `fast-map-one-d-diagnostic/2` selects experimental method
+`one-d-xs-surface-diagnostic/4`: caller-staged native render ranks, first-claim
+ownership and terrain-tile scanline interpolation. The original 1D schema `/1`
+retains method `/3` unchanged. Record the original full terrain grid and tile
+size; optional windows retain global tile history. See the
+[native-layout contract](docs/storage-roadmap.md#native-layout-xs-diagnostic).
+
+Explicit 1D schema `fast-map-one-d-diagnostic/3` selects method `/5` for
+caller-prepared normalized-strip M, levees and XS-end obstructions. It also
+applies native default strip bounds. Claims remain fixed when clipping removes
+a pixel. Blocked-obstruction polygons and steady encroachments are excluded.
+Schemas `/1` and `/2` retain their previous behavior; see the
+[clipping contract](docs/storage-roadmap.md#explicit-xs-clipping).
+
+Explicit coupled schema `/2` additionally composes prepared storage products, including
+dry storage suppression of XS. Physical storage/2D overlap is rejected until
+qualified; schema `/1` behavior remains unchanged.
+
 ### Polygon AOI edge rule (0.10.1)
 
 Horizontal/sloping method records advertise `aoi_mask="global-terrain-lattice/1"`.
@@ -101,6 +133,20 @@ statuses, preserve partial receipts and use a fresh output folder for retries.
 
 ### Retained reach state (0.11)
 
+Native sloping GeoTIFF requests also accept optional `products` (unique selections
+of `"depth"` and `"wse"`) and `compression` (`"NONE"` or `"LZW"`). Omission retains
+both products and LZW. These controls require `stream_outputs=true` and
+`geotiff_outputs=true`; inspect `native_output_products` and
+`native_output_compression` capabilities before sending them to older engines.
+
+The additive `depth-groups` command reduces finalized, individually masked saved
+timestep depths into one native-grid Float32 maximum per reach/group, with an
+inclusive cutoff, bounded resident accumulators, explicit local spill and ordered
+sample receipts. It also supports length-delimited binary delivery. See the
+[grouped depth contract](docs/depth-groups.md). The native command consumes staged
+inputs, not HDF; downstream applications own preparation and orchestration.
+Real-model hydraulic and performance qualification of grouped output is pending.
+
 The persistent sloping server additionally advertises `hydraulic_cache`,
 `multi_window_cache` and `native_geotiff_outputs`. Requests can set
 `hydraulic_cache_bytes` (default 0) and `window_cache_bytes` (default 64 MiB).
@@ -138,6 +184,17 @@ horizontal depth (`velocity_depth`), and D x V, D x V^2 and Froude with their
 Max over output times (`derived_products`, `derived_max` `reduce_max/1`).
 Existing method IDs and request schemas are unchanged; inspect the advertised
 flags before using these fields.
+
+Opt-in `row_stream_rows` (1 through 4096, default 0) bounds the
+Depth/WSE output buffers while writing native GeoTIFFs. It requires both
+stream/output flags above and plain corner sloping, without velocity, storage,
+Max reduction or a grouped consumer. Ownership and ground remain full-window
+buffers; source coordinates and tile history are unchanged. Unsupported
+combinations are refused before payload reads. Completion records retain the
+existing `native-geotiff/1` framing. Inspect `native_row_streaming` and the
+[performance implementation evaluation](docs/performance-improvements.md)
+before enabling this option. Commander callers must explicitly stage the wire
+option; it is not enabled by the existing `product_writer="native"` default.
 
 Binary32 operation order and method identifiers are preserved. `MIGRATION.json`
 retains the immutable 0.8.0 extraction receipt; `SOURCE_MANIFEST.json` binds this
@@ -249,7 +306,18 @@ Max D x V, D x V^2 and Froude are per-output-time products reduced this way
 The sloping method record advertises `velocity_depth`, `velocity_render_modes`,
 `derived_products`, `derived_method_id` and `derived_max` (`reduce_max/1`).
 
-Native HEC-RAS 7.0.1 comparison: BaldEagleCrkMulti2D bridges p05 (973,532 Max
+Current private exactness work and its bounded acceptance gates are recorded
+in [other-map qualification](docs/other-map-qualification.md), including the
+Davis square-cell velocity correction, complete temporal tests and remaining
+public-wrapper terrain metadata qualification.
+The [private performance qualification](docs/performance-qualification.md)
+records CLB09 measurements, profile-concurrency settings and their limits.
+The [expanded corpus qualification](docs/expanded-corpus-qualification.md)
+records larger-model native comparisons, storage coverage and remaining gaps.
+
+Historical native HEC-RAS 7.0.1 comparison, before the source-grid velocity
+correction (these fixtures require a post-correction recheck):
+BaldEagleCrkMulti2D bridges p05 (973,532 Max
 and 402,500 output-time pixels), dam-break p07 2D cells (Max and one output
 time, valid masks equal to depth) and a 2,500 x 2,500 Spring Creek eBFE AOI
 (1,101,529 pixels) match bit for bit; Davis p02 Max differs in 5 of 20,560
@@ -279,14 +347,14 @@ horizontal request whose profiles are the stored output times in order, plus
 `cell_minimum_file` (float32 cell minimum elevations in cell order), optional
 `products` (default `arrival_time`, `percent_inundated`) and
 `allow_unqualified` (required for irregular intervals). Output times are evaluated sequentially over
-the mapped 2D-owned pixels only, in parallel, with 32
+the mapped 2D-owned and optional storage-area pixels, in parallel, with 32
 bytes per mapped pixel. Products are written to `whole_simulation/<product>.bin`
 (float32, NaN = never wet).
 
 A pixel is wet when its horizontal depth is `> threshold` and its cell passes
-RAS Mapper's thresholded gate `wse > minimum + threshold`. Storage areas are
-rendered as level pools (see Storage-area surfaces) for arrival and percent;
-duration with storage areas is refused. Arrival is the first wet time and percent is
+RAS Mapper's thresholded gate `wse > minimum + threshold`. Optional storage-area
+pixels use depth `> threshold` without a cell gate for arrival and percent
+inundated; duration requests containing storage areas are rejected. Arrival is the first wet time and percent is
 `100 * wet / n`. Duration runs from arrival to RAS Mapper's recession time
 (`duration_rule` `rasmapper-backward-window-recession/1`): each cell's WSE
 series is split into monotone windows at its local extrema (PostProcessing's
@@ -340,9 +408,12 @@ reproduced), so a native mosaic is unqualified.
 
 ## Storage-area surfaces
 
-`sloping`, `horizontal` and `whole-simulation` requests can render standalone
-storage areas as level pools (method `storage-area-level-pool/1`, advertised as
-`storage_area_surfaces` in `ras2fim-batch method`). Supply all three together:
+`sloping`, `horizontal` and `whole-simulation` requests can render separate
+storage-area polygons as level pools (method `storage-area-level-pool/1`, advertised as
+`storage_area_surfaces` in `ras2fim-batch method`). These requests still require
+2D cell inputs; models containing only storage areas are not supported.
+Whole-simulation support covers arrival time and percent inundated, not duration.
+Supply all three together:
 
 | Field | Contract |
 |---|---|
@@ -370,10 +441,10 @@ export, valid masks and float32 bits):
 | BaldEagleCrkMulti2D p04 (15,503 cells, 2D levee structures) | Max Depth/WSE: horizontal, sloping, slopingPretty (both); 13:00 sloping | 461,639 (Max), 421,927 (13:00) | identical |
 | p07 and p04 | Arrival time and percent inundated, 0.5 ft (865 output times) | 464,106 / 458,764 | identical |
 
-Duration with storage areas is refused: the recession search indexes cells,
-and level-pool pixels have no cell position. (A pre-recession-rule prototype
-matched every storage-area duration; its 8 (p07) and 46 (p04) one-interval
-differences were all 2D pixels.) Both models have one
+Duration requests containing storage areas are rejected by the current engine.
+Historical duration comparisons found 8 (p07) and 46 (p04) one-interval differences,
+all in 2D pixels, with matching storage-area pixels; that evidence does not
+establish an implemented or qualified duration capability. Both models have one
 storage area connected to the 2D area; multiple storage areas and
 storage-area-to-storage-area connections are not covered by this evidence.
 

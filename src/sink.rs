@@ -176,6 +176,26 @@ fn sync_dir(dir: &Path) -> Result<bool, MapError> {
     }
 }
 
+/// Preserve atomic replacement while allowing a short-lived Windows/SMB
+/// sharing lock to drain. Never delete the previous receipt to make room.
+fn rename_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
+    let delays_ms = [10, 20, 40, 80, 160];
+    let mut attempt = 0;
+    loop {
+        match fs::rename(from, to) {
+            Err(error)
+                if cfg!(windows)
+                    && matches!(error.raw_os_error(), Some(5 | 32 | 33))
+                    && attempt < delays_ms.len() =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(delays_ms[attempt]));
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Writes `<path>.partial`, fsyncs it (errors propagate) and renames it over `path`.
 fn write_atomic(
     path: &Path,
@@ -191,7 +211,7 @@ fn write_atomic(
         }
         f.sync_all().map_err(|e| io_at(&tmp, e))?;
         drop(f);
-        fs::rename(&tmp, path).map_err(|e| io_at(path, e))
+        rename_atomic(&tmp, path).map_err(|e| io_at(path, e))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -708,5 +728,51 @@ mod tests {
             serde_json::to_vec_pretty(&serde_json::json!({"a": 2})).unwrap()
         );
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn atomic_receipt_survives_temporary_delete_sharing_lock() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = scratch("json-sharing-lock");
+        fs::create_dir_all(&d).unwrap();
+        let p = d.join("r.json");
+        let old = serde_json::json!({"status": "running"});
+        write_json(&p, &old).unwrap();
+        // A reader that permits other readers but temporarily denies replacement.
+        let locked = OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&p)
+            .unwrap();
+        let original = p.clone();
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&fs::read(original).unwrap()).unwrap(),
+                old
+            );
+            drop(locked);
+        });
+        let result = write_json(&p, &serde_json::json!({"status": "complete"}));
+        reader.join().unwrap();
+        result.unwrap();
+        assert_eq!(names(&d), ["r.json"]);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&p).unwrap()).unwrap(),
+            serde_json::json!({"status": "complete"})
+        );
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn missing_atomic_source_does_not_replace_receipt() {
+        let d = scratch("json-missing-source");
+        fs::create_dir_all(&d).unwrap();
+        let p = d.join("r.json");
+        fs::write(&p, b"previous receipt").unwrap();
+        assert!(rename_atomic(&d.join("missing.partial"), &p).is_err());
+        assert_eq!(fs::read(&p).unwrap(), b"previous receipt");
+        fs::remove_dir_all(d).unwrap();
     }
 }

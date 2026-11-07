@@ -505,14 +505,17 @@ pub(crate) fn run_with(
                 .transpose()?;
             drop(aoi_mask);
             if let Some(scope) = &req.terrain_scope {
-                let scoped = crate::terrain_scope::check(
+                let scope_tick = Instant::now();
+                let scoped = crate::terrain_scope::check_with_validity(
                     scope,
                     base,
                     &terrain,
                     req.window,
                     &owner,
                     storage_pixels.as_ref().map_or(&[], |s| &s.pixels),
+                    |p| ground[p].is_finite(),
                 )?;
+                report["terrain_scope_seconds"] = scope_tick.elapsed().as_secs_f64().into();
                 report["terrain_scope"] = scoped.record;
                 // Horizontal requests carry no cell minimum, so a foreign pixel's
                 // visibility cannot be bounded without its terrain: refuse.

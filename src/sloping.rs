@@ -767,6 +767,11 @@ pub fn prepare_stencils(
 }
 
 impl CellStencil {
+    /// Axis-aligned square bounds for native velocity scan conversion.
+    pub(crate) fn square_bounds(&self) -> Option<[f64; 4]> {
+        self.square
+    }
+
     /// Corner (vertex, incident-face slot) pairs in ring order.
     pub(crate) fn corner_slots(&self) -> impl Iterator<Item = [usize; 2]> + '_ {
         self.corners.iter().copied()
@@ -777,11 +782,11 @@ impl CellStencil {
     }
     /// Native face-donation node weights at `point`: `n` corner weights then
     /// `n` face weights, binary32, as used by cell-face sloping painting.
-    pub(crate) fn donated_weights(
+    pub(crate) fn donated_weights<'a>(
         &self,
         point: [f64; 2],
-        scratch: &mut WeightScratch,
-    ) -> Result<Vec<f32>, MapError> {
+        scratch: &'a mut WeightScratch,
+    ) -> Result<&'a [f32], MapError> {
         self.donated_weights_with_history(point, scratch, false)
     }
 
@@ -797,12 +802,12 @@ impl CellStencil {
     /// As `donated_weights`; with `retain`, clockwise/counter-clockwise
     /// donations of corners with zero-weight neighbours keep the previous
     /// pixel's values (native scratch history).
-    pub(crate) fn donated_weights_with_history(
+    pub(crate) fn donated_weights_with_history<'a>(
         &self,
         point: [f64; 2],
-        scratch: &mut WeightScratch,
+        scratch: &'a mut WeightScratch,
         retain: bool,
-    ) -> Result<Vec<f32>, MapError> {
+    ) -> Result<&'a [f32], MapError> {
         let n = self.corners.len();
         scratch.resize(n);
         if let Some(bounds) = self.square {
@@ -832,7 +837,7 @@ impl CellStencil {
             scratch.donated[next] -= donation;
             scratch.donated[n + i] = donation * 2.0;
         }
-        Ok(scratch.donated[..2 * n].to_vec())
+        Ok(&scratch.donated[..2 * n])
     }
 }
 
@@ -1238,11 +1243,68 @@ pub(crate) fn render_profile_cached(
     pool: &rayon::ThreadPool,
     cache: Option<&PixelWeights>,
 ) -> Result<(Vec<f32>, Vec<f32>), MapError> {
+    render_profile_range(
+        stencils,
+        profiles,
+        window,
+        tolerance,
+        pool,
+        cache,
+        0,
+        window.height,
+    )
+}
+
+/// Plain-corner sloping rows using the original window's affine arithmetic.
+/// Output buffers contain only the requested rows; global hydraulic inputs,
+/// ownership and source coordinates are unchanged.
+pub fn render_profile_rows(
+    stencils: &[Vec<Option<CellStencil>>],
+    profiles: &[PreparedProfile],
+    window: &RasterWindow<'_>,
+    tolerance: f32,
+    pool: &rayon::ThreadPool,
+    row_start: usize,
+    row_count: usize,
+) -> Result<(Vec<f32>, Vec<f32>), MapError> {
+    if profiles
+        .iter()
+        .any(|p| p.options.render_mode == RenderMode::WithFaces)
+    {
+        return Err(MapError::Unsupported(
+            "row streaming requires plain corner sloping".into(),
+        ));
+    }
+    render_profile_range(
+        stencils, profiles, window, tolerance, pool, None, row_start, row_count,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_profile_range(
+    stencils: &[Vec<Option<CellStencil>>],
+    profiles: &[PreparedProfile],
+    window: &RasterWindow<'_>,
+    tolerance: f32,
+    pool: &rayon::ThreadPool,
+    cache: Option<&PixelWeights>,
+    row_start: usize,
+    row_count: usize,
+) -> Result<(Vec<f32>, Vec<f32>), MapError> {
     let count = window
         .width
         .checked_mul(window.height)
         .filter(|&n| n > 0)
         .ok_or_else(|| MapError::Invalid("empty sloping raster window".into()))?;
+    if row_count == 0
+        || row_start
+            .checked_add(row_count)
+            .is_none_or(|end| end > window.height)
+    {
+        return Err(MapError::Invalid("sloping row range out of bounds".into()));
+    }
+    let start = row_start * window.width;
+    let output_count = row_count * window.width;
     if window.owner.len() != count
         || window.terrain.len() != count
         || stencils.len() != profiles.len()
@@ -1266,15 +1328,14 @@ pub(crate) fn render_profile_cached(
             ));
         }
     }
-    if window
-        .owner
+    if window.owner[start..start + output_count]
         .iter()
         .any(|&i| i as usize > window.owner_cells.len())
     {
         return Err(MapError::Invalid("sloping owner label out of range".into()));
     }
-    let mut depth = vec![NODATA; count];
-    let mut wse = vec![NODATA; count];
+    let mut depth = vec![NODATA; output_count];
+    let mut wse = vec![NODATA; output_count];
     let repair: Vec<_> = window
         .owner_cells
         .iter()
@@ -1289,7 +1350,7 @@ pub(crate) fn render_profile_cached(
                 || WeightScratch::new(0),
                 |scratch, (chunk, (d, w))| {
                     for j in 0..d.len() {
-                        let i = chunk * 4096 + j;
+                        let i = start + chunk * 4096 + j;
                         let label = window.owner[i] as usize;
                         if label == 0 {
                             continue;
@@ -1493,8 +1554,10 @@ pub(crate) fn render_profile_cached(
     })?;
     for cell in repaired {
         for (index, [d, w]) in cell {
-            depth[index] = d;
-            wse[index] = w;
+            if (start..start + output_count).contains(&index) {
+                depth[index - start] = d;
+                wse[index - start] = w;
+            }
         }
     }
     Ok((depth, wse))
@@ -1524,6 +1587,73 @@ mod tests {
             value.to_bits(),
             fresh.paint_with_faces(&corners, &faces, None).to_bits()
         );
+    }
+
+    #[test]
+    fn general_polygon_donation_borrows_reused_scratch() {
+        let points = vec![[0., 0.], [0., 4.], [2., 5.], [5., 3.], [4., 0.]];
+        let polygon = PolygonStencil::new(points.clone()).unwrap();
+        let stencil = CellStencil {
+            square: None,
+            polygon,
+            physical_ring: points,
+            corners: vec![[0, 0]; 5],
+            faces: vec![[0, 0]; 5],
+            elevations: None,
+        };
+        let mut scratch = WeightScratch::new(5);
+        let allocation = scratch.donated.as_ptr();
+        for point in [[1., 1.], [2., 3.], [4., 2.], [1., 1.]] {
+            let borrowed = stencil.donated_weights(point, &mut scratch).unwrap();
+            assert_eq!(borrowed.as_ptr(), allocation);
+            assert_eq!(borrowed.len(), 10);
+            assert!(borrowed.iter().all(|x| x.is_finite()));
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode borrowed versus former copied-weight microbenchmark"]
+    fn benchmark_borrowed_general_donation() {
+        let points = vec![[0., 0.], [0., 4.], [2., 5.], [5., 3.], [4., 0.]];
+        let polygon = PolygonStencil::new(points.clone()).unwrap();
+        let stencil = CellStencil {
+            square: None,
+            polygon,
+            physical_ring: points,
+            corners: vec![[0, 0]; 5],
+            faces: vec![[0, 0]; 5],
+            elevations: None,
+        };
+        for round in 0..6 {
+            let mut result = [(0.0, 0); 2];
+            for copied in if round % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            } {
+                let mut scratch = WeightScratch::new(5);
+                let mut checksum = 0_u64;
+                let start = std::time::Instant::now();
+                for i in 0..250_000 {
+                    let point = [1. + (i % 17) as f64 * 0.05, 1. + (i % 13) as f64 * 0.07];
+                    let weights = stencil.donated_weights(point, &mut scratch).unwrap();
+                    let bits = if copied {
+                        // The former return expression allocated this identical copy.
+                        let old = std::hint::black_box(weights.to_vec());
+                        old[0].to_bits()
+                    } else {
+                        std::hint::black_box(weights)[0].to_bits()
+                    };
+                    checksum = checksum.wrapping_add(u64::from(bits));
+                }
+                result[usize::from(!copied)] = (start.elapsed().as_secs_f64(), checksum);
+            }
+            assert_eq!(result[0].1, result[1].1);
+            println!(
+                "round={round} pixels=250000 copied_seconds={} borrowed_seconds={}",
+                result[0].0, result[1].0
+            );
+        }
     }
 
     #[test]
@@ -1700,6 +1830,78 @@ mod boundary_surface_tests {
             options: Options::default(),
         };
         (vec![vec![Some(stencil)]], vec![profile])
+    }
+    #[test]
+    fn streamed_rows_are_full_window_crops_without_affine_reassociation() {
+        let (mut stencils, mut profiles) = fixture();
+        let transform = [
+            10_000_000.1234567,
+            0.0037,
+            0.,
+            2_000_000.7654321,
+            0.,
+            -0.0037,
+        ];
+        let (width, height) = (17, 19);
+        let bounds = [
+            transform[0],
+            transform[3] + height as f64 * transform[5],
+            transform[0] + width as f64 * transform[1],
+            transform[3],
+        ];
+        let points = vec![
+            [bounds[0], bounds[1]],
+            [bounds[0], bounds[3]],
+            [bounds[2], bounds[3]],
+            [bounds[2], bounds[1]],
+        ];
+        let polygon = PolygonStencil::new(points.clone()).unwrap();
+        stencils[0][0] = Some(CellStencil {
+            square: polygon.square_bounds(),
+            polygon,
+            physical_ring: points,
+            corners: vec![[0, 0]; 4],
+            faces: vec![],
+            elevations: None,
+        });
+        profiles[0].local_values[0] = vec![2., 3., 4., 5.];
+        let owner: Vec<u32> = (0..width * height)
+            .map(|i| u32::from(i % 11 != 0))
+            .collect();
+        let terrain: Vec<f32> = (0..width * height)
+            .map(|i| if i % 7 == 0 { 4.5 } else { 0. })
+            .collect();
+        let window = RasterWindow {
+            source_transform: transform,
+            source_tile: [256, 256],
+            width,
+            height,
+            transform,
+            owner: &owner,
+            terrain: &terrain,
+            owner_cells: &[[0, 0]],
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        let full = render_profile(&stencils, &profiles, &window, 0.001, &pool).unwrap();
+        for (row, rows) in [(0, 1), (7, 5), (18, 1)] {
+            let part = render_profile_rows(&stencils, &profiles, &window, 0.001, &pool, row, rows)
+                .unwrap();
+            for (expected, actual) in [(&full.0, &part.0), (&full.1, &part.1)] {
+                assert_eq!(
+                    expected[row * width..(row + rows) * width]
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                );
+            }
+        }
+        assert!(render_profile_rows(&stencils, &profiles, &window, 0.001, &pool, 18, 2).is_err());
+        profiles[0].options.render_mode = RenderMode::WithFaces;
+        assert!(render_profile_rows(&stencils, &profiles, &window, 0.001, &pool, 0, 1).is_err());
     }
     #[test]
     fn signed_boundary_surface_preserves_dry_side_without_changing_raster_visibility() {

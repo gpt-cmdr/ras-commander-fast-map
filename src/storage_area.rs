@@ -1,10 +1,12 @@
-//! Standalone storage-area level-pool surfaces (`storage-area-level-pool/1`).
+//! Storage-area level-pool surfaces alongside required 2D inputs (`storage-area-level-pool/1`).
 //!
 //! RAS Mapper draws a storage area as a horizontal pool: the storage area's
 //! water surface (Max or one output time) applied to every terrain pixel whose
 //! centre lies inside the storage-area polygon. Qualified against native
 //! HEC-RAS 7.0.1 stored maps on BaldEagleCrkMulti2D p07 and p04 in every render
-//! mode and the whole-simulation products: every storage-area pixel, valid mask and float32 bits.
+//! mode and whole-simulation arrival time and percent inundated: every storage-area
+//! pixel, valid mask and float32 bits. Whole-simulation duration with storage areas
+//! is rejected; models containing only storage areas are not supported.
 //!
 //! The pixel rule is the native float32 plot test shared with the 2D cell
 //! renderers: visible when `wse >= terrain + 0.001_f32`, depth `wse - terrain`.

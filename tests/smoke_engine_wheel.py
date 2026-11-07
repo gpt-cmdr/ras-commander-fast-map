@@ -84,13 +84,114 @@ def sloping_smoke(engine, root, terrain):
     output=subprocess.run([engine,"sloping",str(path),str(folder/"stream")],check=True,capture_output=True).stdout
     stream=io.BytesIO(output)
     for name,value in [("a",1),("b",2)]:
-        assert json.loads(stream.readline())==dict(id=name,status="complete",pixels=16)
+        assert json.loads(stream.readline())==dict(id=name,status="complete",pixels=16,storage_render_seconds=0.0)
         for band,level in [("depth",value),("wse",100+value)]:
             actual=np.frombuffer(stream.read(64),dtype="<f4").reshape(4,4)
             expected=np.full((4,4),level,dtype="<f4");expected[:,2:]=np.nan
             np.testing.assert_array_equal(actual,expected,err_msg=band)
     assert not stream.read()
+    # Native output controls preserve decoded values and explicitly set compression.
+    request.update(geotiff_outputs=True, products=["depth"])
+    for compression in ("NONE", "LZW"):
+        request["compression"] = compression
+        path.write_text(json.dumps(request))
+        destination = folder / f"native-{compression}"
+        result = subprocess.run([engine, "sloping", str(path), str(destination)],
+                                check=True, capture_output=True)
+        headers = [json.loads(line) for line in result.stdout.splitlines()]
+        assert all(h["selected_products"] == ["depth"] for h in headers)
+        for name, level in [("a", 1), ("b", 2)]:
+            assert not (destination / name / "wse.tif").exists()
+            with rasterio.open(destination / name / "depth.tif") as ds:
+                expected = np.full((4, 4), level, dtype="<f4")
+                expected[:, 2:] = np.nan
+                np.testing.assert_array_equal(ds.read(1).view("<u4"), expected.view("<u4"))
+                assert (ds.compression is None) == (compression == "NONE")
+    model = dict(request)
+    for key in ("products", "compression", "stream_outputs", "geotiff_outputs", "aoi_file"):
+        model.pop(key, None)
+    model.update(options={}, max_inflight_profiles=1)
+    grouped = dict(schema="ras-commander-depth-groups-request/1", model=model,
+        source_indices=[0, 1], depth_units="feet", depth_cutoff_ft=1.5,
+        max_accumulator_bytes=0, compression="NONE",
+        scratch=dict(path=str(root), node_local=True, max_bytes=1024),
+        jobs=[dict(job_id="left", reach_id="left", window=[0, 4, 4, 4], aoi_file="aoi.wkb",
+                   groups=[dict(group_id="both", timesteps=[1, 0]),
+                           dict(group_id="below-cutoff", timesteps=[0])])])
+    path.write_text(json.dumps(grouped))
+    grouped_out = folder / "groups"
+    subprocess.run([engine, "depth-groups", str(path), str(grouped_out)], check=True, capture_output=True)
+    report = json.loads((grouped_out / "report.json").read_text())
+    assert report["status"] == "complete" and report["hydraulic_preparations"] == 2
+    assert report["geometry_preparations"] == 1 and report["scratch_peak_bytes"] == 128
+    assert report["jobs"][0]["groups"][0]["source_indices"] == [1, 0]
+    with rasterio.open(grouped_out / "left/both.tif") as ds:
+        expected = np.full((4, 4), 2, dtype="<f4"); expected[:, 2:] = np.nan
+        np.testing.assert_array_equal(ds.read(1).view("<u4"), expected.view("<u4"))
+        assert ds.crs.to_epsg() == 3857 and ds.transform == Affine(1, 0, 0, 0, -1, 4)
+    with rasterio.open(grouped_out / "left/below-cutoff.tif") as ds:
+        assert np.isnan(ds.read(1)).all() and ds.shape == (4, 4)
+    assert sorted(p.name for p in grouped_out.iterdir()) == ["left", "report.json"]
+    # Exact byte lengths keep newlines inside Float32 payloads out of JSON framing.
+    grouped["sink"] = "grouped-buffer"
+    path.write_text(json.dumps(grouped))
+    result = subprocess.run([engine, "depth-groups", str(path), str(folder / "group-buffers")],
+                            check=True, capture_output=True)
+    stream = io.BytesIO(result.stdout)
+    for name in ("both", "below-cutoff"):
+        header = json.loads(stream.readline())["group"]
+        assert header["group_id"] == name and header["byte_length"] == 64
+        data = np.frombuffer(stream.read(header["byte_length"]), dtype="<f4")
+        assert len(data) == 16
+    assert json.loads(stream.readline()) == {"command_status": "complete"}
+    assert not stream.read()
+    print("Installed wheel: native selection/compression, grouped maxima/spill/buffers PASS")
     print("Installed wheel: plain/enhanced sloping options, binary geometry, profiles, file/stream AOI PASS")
+
+
+def native_one_d_smoke(engine, root):
+    """Installed executable includes ranked scanlines and global crop transport."""
+    folder=root/"native-one-d";folder.mkdir()
+    payloads={
+        "points.bin":( [[0,0,1,0],[0,4,1,0],[4,0,0,0],[4,4,0,0]],"<f8"),
+        "triangles.bin":([[0,2,1],[1,2,3]],"<i4"),
+        "info.bin":([[0,4,0,2]],"<i4"),"ids.bin":([[0,1]],"<i4"),
+        "ranks.bin":([0],"<u4"),"levels.bin":([12,8],"<f4"),
+        "terrain.bin":([0]*16,"<f4"),"crop.bin":([0]*4,"<f4"),
+    }
+    for name,(values,dtype) in payloads.items():np.asarray(values,dtype=dtype).tofile(folder/name)
+    request=dict(schema="fast-map-one-d-diagnostic/2",scope="xs-surface-only",
+        points_file="points.bin",point_count=4,triangles_file="triangles.bin",triangle_count=2,
+        tin_info_file="info.bin",xs_ids_file="ids.bin",segment_count=1,cross_section_count=2,
+        levels_file="levels.bin",terrain_file="terrain.bin",width=4,height=4,
+        geo_transform=[0.,1.,0.,4.,0.,-1.],render_order_file="ranks.bin",tile_size=2,
+        max_working_bytes=1<<20)
+    for name in ["full","crop"]:
+        if name=="crop":request.update(window=dict(col=1,row=1,width=2,height=2),terrain_file="crop.bin")
+        path=folder/(name+".json");path.write_text(json.dumps(request))
+        subprocess.run([engine,"one-d-diagnostic",str(path),str(folder/name)],check=True,capture_output=True)
+        report=json.loads((folder/name/"report.json").read_text())
+        assert report["method"]["method_id"]=="one-d-xs-surface-diagnostic/4"
+    for product in ["depth","wse"]:
+        full=np.fromfile(folder/"full"/(product+".bin"),dtype="<f4").reshape(4,4)
+        crop=np.fromfile(folder/"crop"/(product+".bin"),dtype="<f4").reshape(2,2)
+        np.testing.assert_array_equal(full,np.tile([11.5,10.5,9.5,8.5],(4,1)))
+        np.testing.assert_array_equal(crop.view("u4"),full[1:3,1:3].view("u4"))
+    print("Installed wheel: native-ranked 1D scanlines and global AOI PASS")
+    np.asarray([-2.,2.,-2.,2.],dtype="<f8").tofile(folder/"normalized-m.bin")
+    clips=np.full((2,8),np.nan,dtype="<f4");clips[:,2]=0.;clips[:,3]=100.;clips.tofile(folder/"clips.bin")
+    request.pop("window")
+    request.update(schema="fast-map-one-d-diagnostic/3",terrain_file="terrain.bin",
+        normalized_m_file="normalized-m.bin",xs_clip_file="clips.bin",clipping_scope="levees-and-xs-end-obstructions-only")
+    path=folder/"clipped.json";path.write_text(json.dumps(request))
+    subprocess.run([engine,"one-d-diagnostic",str(path),str(folder/"clipped")],check=True,capture_output=True)
+    report=json.loads((folder/"clipped/report.json").read_text());assert report["method"]["method_id"]=="one-d-xs-surface-diagnostic/5"
+    for product in ["depth","wse"]:
+        clipped=np.fromfile(folder/"clipped"/(product+".bin"),dtype="<f4").reshape(4,4)
+        full=np.fromfile(folder/"full"/(product+".bin"),dtype="<f4").reshape(4,4)
+        assert np.isnan(clipped[:2]).all()
+        np.testing.assert_array_equal(clipped[2:].view("u4"),full[2:].view("u4"))
+    print("Installed wheel: explicit normalized-M levee clipping PASS")
 
 
 def main():
@@ -100,6 +201,8 @@ def main():
     assert "step05_r2" in method
     assert method["horizontal"]["method_id"] == "horizontal-cell-constant/2"
     assert method["sloping"]["method_id"] == "rasmapper-plain-sloping/1"
+    assert method["sloping"]["native_output_compression"] == ["NONE", "LZW"]
+    assert method["depth_groups"]["request_schema"] == "ras-commander-depth-groups-request/1"
     with tempfile.TemporaryDirectory(prefix="ras2fim-wheel-") as tmp:
         root = Path(tmp)
         terrain = root / "terrain.tif"
@@ -108,6 +211,7 @@ def main():
                            transform=Affine(1, 0, 0, 0, -1, 8), nodata=-9999) as ds:
             ds.write(np.full((8, 8), 100, dtype=np.float32), 1)
         sloping_smoke(engine,root,terrain)
+        native_one_d_smoke(engine,root)
         ownership=np.tile(np.array([1,1,1,2,2,0],dtype="<u4"),(4,1))
         ownership.tofile(root/"owner.bin")
         np.array([100.5,102.],dtype="<f4").tofile(root/"a.bin")
