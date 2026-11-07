@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.13.0 — 2026-11-07
+## 0.13.0  - 2026-11-07
 
 ### Bounded native delivery and performance qualification
 
@@ -115,7 +115,7 @@ timesteps with plain sloping and explicit feet/metres depth units. No grouped
 real-model hydraulic or performance qualification is claimed. See
 `docs/depth-groups.md` for capability checks, resource controls and failure rules.
 
-## 0.12.0 — 2026-10-31
+## 0.12.0  - 2026-10-31
 
 ### Storage-area level pools
 
