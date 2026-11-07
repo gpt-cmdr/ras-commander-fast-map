@@ -1429,20 +1429,24 @@ fn run_internal(
                     for profile in batch {
                         let dir = out.join(&profile.id);
                         fs::create_dir(&dir)?;
-                        let unit = render_native_rows(
-                            profile,
-                            base,
-                            meshes,
-                            stencils,
-                            &window,
-                            &pool,
-                            req.options,
-                            &foreign,
-                            selected,
-                            &dir,
-                            transform,
-                            req.epsg,
-                        )?;
+                        // TIFF encoding uses Rayon internally, so keep delivery in the
+                        // same bounded pool as rendering and hydraulic preparation.
+                        let unit = pool.install(|| {
+                            render_native_rows(
+                                profile,
+                                base,
+                                meshes,
+                                stencils,
+                                &window,
+                                &pool,
+                                req.options,
+                                &foreign,
+                                selected,
+                                &dir,
+                                transform,
+                                req.epsg,
+                            )
+                        })?;
                         sink::write_json(&dir.join("unit.json"), &unit)?;
                         report["profiles"].as_array_mut().unwrap().push(unit);
                         sink::write_json(&out.join("report.json"), &report)?;
