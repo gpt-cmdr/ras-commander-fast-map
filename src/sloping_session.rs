@@ -647,6 +647,7 @@ fn write_physical_ownership(path: &Path, owner: &[u32]) -> Result<(), MapError> 
     Ok(())
 }
 
+/// Commit a session report, removing exported ownership if publication fails.
 fn commit_report(out: &Path, report: &Value, exported_owners: bool) -> Result<(), MapError> {
     let result = sink::write_json(&out.join("report.json"), report);
     if result.is_err() && exported_owners {
@@ -1820,7 +1821,7 @@ fn run_internal(
     report["total_seconds"] = started.elapsed().as_secs_f64().into();
     report["terrain_cache"] = json!(terrain.stats());
     if deliver_files {
-        sink::write_json(&out.join("report.json"), &report)?;
+        commit_report(out, &report, req.export_physical_ownership)?;
     }
     Ok(report)
 }

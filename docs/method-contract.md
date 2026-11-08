@@ -94,7 +94,7 @@ intended-use and qualification fields, together with the original limitations.
 Step05 follows its named upstream reference algorithm; API stability does not
 turn that distinct reference into RAS Mapper stored-map parity.
 
-## Diagnostic 1D and mixed transports
+## Storage mapping and diagnostic 1D/mixed transports
 
 | Request schema | CLI command | Method ID |
 | --- | --- | --- |
@@ -105,8 +105,9 @@ turn that distinct reference into RAS Mapper stored-map parity.
 | `fast-map-coupled-diagnostic/1` | `coupled-diagnostic` | `one-d-two-d-coverage-first-diagnostic/1` |
 | `fast-map-coupled-diagnostic/2` | `coupled-diagnostic` | `one-d-two-d-storage-coverage-first-diagnostic/1` |
 
-These published transport contracts are frozen and remain diagnostic and
-numerically unqualified. The older 1D method retains its distinct ownership and
+These published transport contracts are frozen. Storage is a mapping transport
+with pending numerical qualification; the 1D and coupled transports remain
+diagnostic and numerically unqualified. The older 1D method retains its distinct ownership and
 interpolation; it is not an alias for the native-layout or clipped method.
 Ordinary Commander production preparation for 1D/mixed models remains unsupported.
 Callers must not treat raw stored TIN M as native-normalized M or infer barrier
