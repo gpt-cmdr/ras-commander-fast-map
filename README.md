@@ -2,7 +2,7 @@
 
 <p align="center"><img src="docs/images/logo/ras-commander-fast-map_logo.svg" alt="RAS Commander Fast-Map: Native Rust Mapping Engine" width="450"></p>
 
-Native Rust 2D flood inundation mapping, distributed as the
+Native Rust flood inundation mapping, distributed as the
 `ras-commander-fast-map` Rust crate and Python wheel. It maps computed hydraulic
 results; it does not run the HEC-RAS hydraulic solver.
 
@@ -50,20 +50,23 @@ Commander. The CLI does not read a plan HDF directly.
 
 ## Methods and resource controls
 
-Experimental 1D work is available through `ras2fim-batch
-one-d-diagnostic <request.json> <new-output-dir>` and the Rust `one_d` module.
-It maps caller-prepared stored cross-section TINs and aligned terrain buffers
-to Depth/WSE buffers, with allocation admission and reusable geometry. Its
-method record explicitly reports `native_parity_qualified=false`. It is not
-production 1D support: native interpolation arithmetic, structures, junctions
-and mixed-model ownership still need qualification. See the
-[1D contract and remaining work](docs/storage-roadmap.md#experimental-1d-contract).
+`ras2fim-batch one-d-diagnostic <request.json> <new-output-dir>` and the Rust
+`one_d` module render caller-prepared stored cross-section TINs and aligned
+terrain buffers to Depth/WSE, with allocation admission and reusable geometry.
+Commander supplies canonical preparation and mapping through
+`RasFim.prepare_one_d_model()` and `RasFim.map_one_d_profiles()`, including
+supported stored steady/unsteady profiles and disjoint storage pools.
 
-`coupled-diagnostic` composes explicitly aligned XS and 2D component buffers
-using physical 2D coverage before wet/dry filtering. It is experimental and
-requires externally prepared global component geometry and ownership; existing
-Commander 2D-only API guards remain intact. Native comparisons and known gaps
-are recorded in the [private roadmap](docs/storage-roadmap.md).
+`coupled-diagnostic` composes aligned XS and 2D buffers using physical 2D
+coverage before wet/dry filtering. Commander provides
+`RasFim.prepare_coupled_model()` and `RasFim.map_coupled_profiles()` for the
+supported unsteady plain-corner Depth/WSE scope. Both canonical workflows
+require explicit `allow_unqualified=True`, retain `qualified=False`, and
+refuse unsupported geometry and terrain. The ordinary 2D entry points retain
+their dimensional guards. Stable transport contracts and named native
+comparisons do not imply general numerical qualification. See the
+[mapping guide](https://rascommander.info/ras/native-mapping-engine/#prepare-and-map-stored-1d-surfaces)
+and [remaining scope](docs/storage-roadmap.md).
 1D request schema `fast-map-one-d-diagnostic/2` selects experimental method
 `one-d-xs-surface-diagnostic/4`: caller-staged native render ranks, first-claim
 ownership and terrain-tile scanline interpolation. The original 1D schema `/1`
@@ -82,7 +85,60 @@ Explicit coupled schema `/2` additionally composes prepared storage products, in
 dry storage suppression of XS. Physical storage/2D overlap is rejected until
 qualified; schema `/1` behavior remains unchanged.
 
-### Polygon AOI edge rule (0.10.1)
+The explicit `rasmapper-stored-tile-grid/1` contract retains the terrain TIFF's
+source identity while deriving logical sampling tiles and output framing from
+its rounded full extent. Sloping request `ras-commander-sloping-request/2`, XS
+request `fast-map-one-d-diagnostic/4`, and coupled request
+`fast-map-coupled-diagnostic/3` carry the same complete grid descriptor. Inspect
+their separate capability records before use. The admitted scope is one
+original 256-tiled north-up square source, plain corner Depth/WSE, and logical
+centers exactly representable on the derived full output lattice. Unsupported
+layouts, terrain scope, storage, velocity and face modes refuse. Commander
+exposes this choice on mixed preparation/direct mapping; prepared mixed models
+inherit the sealed choice. Standalone 1D/2D mapping and catalogs do not expose
+the keyword. These explicit transports retain numerically unqualified discovery
+and diagnostic opt-in even when the named fixture comparisons pass.
+
+### Native runtime comparison scope
+
+Within the stated coverage, the native-runtime checks below compare complete
+valid/nodata masks and every valid Float32 bit, with exact CRS and integer-window
+framing. They use the
+frozen Windows engine artifact, original terrain layouts and complete global
+hydraulic geometry. The criterion is numerical equality to the named native
+renderer, not calibration or general model qualification.
+Runtime versions identify the loaded Mapper, independently of the stored
+results' producer. These checks do not rerun the hydraulic solver or establish
+solver-version equivalence.
+
+| Fixture and options | Native runtime | Products and coverage | Result |
+|---|---|---|---|
+| Mixed XS/2D fixture; plain corners, original single source, explicit stored-tile-grid `/1`; saved 57/69/81 and Max | 6.6 and 7.0.1 | Depth/WSE, eight complete products per runtime | Exact |
+| Bald Eagle; original two-source terrain and priority-mask history; Max, saved 72 and all 145 saved times | 6.6 and 7.0.1 | Twelve complete spatial/velocity/derived-Max products per runtime | Exact; temporal products are outside this result |
+| Baxter; Big/Bigger/Biggest steady profiles and prepared storage/XS composition; GDAL one thread, 128 MiB cache, native CPU one | 6.6 and 7.0.1 | Six complete Depth/WSE products per runtime, 4,838,744 pixels each | Exact; fresh exports and actual loaded renderer hashes verified |
+| Lawson and White Oak; selected canonical 1D profiles, native-normalized M and obstruction records | 6.6 | Four stripe-pilot Depth/WSE products | Exact only within the recorded stripes |
+| Lawson and White Oak p19/p15; selected canonical 1D profiles | 7.0.1 | Six complete Depth/WSE products, contiguous stripes plus zero-valid exterior scans | Exact |
+
+The 7.0.1 mandatory matrix has **32 of 32 products exact**. These cases do not enable diagnostic defaults or
+qualify other profiles, terrain configurations, geometry variants or platforms.
+The 6.6 stripe pilots are not full-raster canonical 1D qualification.
+
+Davis original-source raw 7.0.1 stored-map framing remains blocked: its logical
+tile centers differ from its derived output-affine centers, so `/1` correctly
+refuses the layout. The fifteen fresh native references have no passing
+candidate pixel comparisons. Terrain export with modifications, arbitrary
+mosaics/stitches and unsupported geometry remain outside this release scope.
+See the [mapping qualification table](https://rascommander.info/ras/native-mapping-engine/#native-runtime-comparison-scope)
+for the API scope and comparison limits.
+
+Rust callers can construct `sloping::RasterWindow` with `RasterWindow::new()`;
+it selects ordinary source-affine sampling. `with_stored_grid()` explicitly
+selects logical tile sampling and checks source identity. The public struct's
+`native_grid` field is `None` for ordinary source-affine struct literals.
+
+<a id="polygon-aoi-edge-rule-0101"></a>
+
+### Polygon AOI edge rule
 
 Horizontal/sloping method records advertise `aoi_mask="global-terrain-lattice/1"`.
 AOI coverage is computed in source terrain pixel units, at global pixel centers,
@@ -127,8 +183,9 @@ workers for different models or low-sharing workloads within one global
 CPU/RAM allowance. Native in-flight timesteps share the same Rayon pool;
 additional processes can duplicate geometry, staged data and caches.
 
-Fast-Map 0.11.0 provides retained hydraulic/multiple-window caches and optional
-native terrio LZW output. Commander retains Rasterio as its default writer;
+Retained hydraulic/multiple-window caches and optional
+native terrio LZW output support repeated mapping. Commander retains Rasterio
+as its default writer;
 select `product_writer="native"` for supported sloping catalogs and inspect
 `RasFim.get_engine_info()` capability flags. Native cache ceilings count inside
 working-memory admission. The supervisor's per-worker prepared/headroom
@@ -141,7 +198,9 @@ speedup. Keep the qualified source TIFF layout; do not crop hydraulic arrays
 or retile cell-face terrain per reach. Inspect both overall and per-row
 statuses, preserve partial receipts and use a fresh output folder for retries.
 
-### Retained reach state (0.11)
+<a id="retained-reach-state-011"></a>
+
+### Retained reach state
 
 Native sloping GeoTIFF requests also accept optional `products` (unique selections
 of `"depth"` and `"wse"`) and `compression` (`"NONE"` or `"LZW"`). Omission retains
@@ -179,12 +238,14 @@ completion records instead of arrays. Records include pixel counts and native
 write timing. terrio owns encoding; no GDAL/Python dependency is added to the
 engine. This route requires an EPSG-identifiable CRS and excludes velocity.
 Commander validates output metadata before delivery. Ordinary array streams
-and binary-file output remain compatible. These capabilities are included
-in 0.11.0; inspect advertised flags when integrating older binaries.
+and binary-file output remain compatible. Inspect advertised capability flags
+before selecting a delivery path.
 
-### Fast-Map 0.12
+<a id="fast-map-012"></a>
 
-0.12.0 adds storage-area level pools (`storage_area_surfaces`
+### Additional mapped products and terrain
+
+Mapping supports storage-area level pools (`storage_area_surfaces`
 `storage-area-level-pool/1` on the `sloping`, `horizontal` and
 `whole_simulation` methods), `ras2fim-batch effective-terrain` for unmodified
 multi-source terrains (`effective_terrain` `rasmapper-effective-terrain/1`),
@@ -211,7 +272,9 @@ retains the immutable 0.8.0 extraction receipt; `SOURCE_MANIFEST.json` binds thi
 version's current sources. `ras2fim-batch method` reports package/build identity
 and capabilities.
 
-## Persistent reach sessions (0.9)
+<a id="persistent-reach-sessions-09"></a>
+
+## Persistent reach sessions
 
 `sloping-server` accepts serialized JSON-line commands with absolute `request`
 and `output` paths. Each request uses the existing sloping schema and streams
@@ -230,7 +293,9 @@ Plans include the retained payload budget and the original 64 MiB decoded tile
 cache; this is allocation admission, not a hard process RSS limit. Native
 `PreparedSession` objects provide the same reuse without the CLI.
 
-## Deterministic inundation boundaries (0.10)
+<a id="deterministic-inundation-boundaries-010"></a>
+
+## Deterministic inundation boundaries
 
 Generate projected-CRS inundation polygons from signed depths with the separate
 `deterministic-zero-depth-contours/1` method:
@@ -325,8 +390,9 @@ records CLB09 measurements, profile-concurrency settings and their limits.
 The [expanded corpus qualification](docs/expanded-corpus-qualification.md)
 records larger-model native comparisons, storage coverage and remaining gaps.
 
-Historical native HEC-RAS 7.0.1 comparison, before the source-grid velocity
-correction (these fixtures require a post-correction recheck):
+Retained native HEC-RAS 7.0.1 comparison records collected before the
+source-grid velocity correction (these scopes require a post-correction
+recheck; the frozen-runtime table above reports separately completed gates):
 BaldEagleCrkMulti2D bridges p05 (973,532 Max
 and 402,500 output-time pixels), dam-break p07 2D cells (Max and one output
 time, valid masks equal to depth) and a 2,500 x 2,500 Spring Creek eBFE AOI
@@ -342,8 +408,10 @@ sloping (402,616 pixels) and horizontal (402,500) bit for bit for all three;
 `reduce_max` over all 433 output times bridges Max sloping (973,956) and
 horizontal (973,531) bit for bit; Davis p02 (horizontal Max over 217 times and
 one sloping/horizontal output time) equal masks, at most 5 pixels within 2 ulp
-(the Davis velocity residual). Storage areas, boundary requests and shear
-stress are outside this method.
+(the Davis velocity residual). These Davis comparisons do not qualify the
+original-source raw native grid: fresh 7.0.1 comparison stops at framing before
+pixels, and stored-tile-grid `/1` does not admit this layout. Storage areas,
+boundary requests and shear stress are outside this method.
 
 ## Whole-simulation products (arrival time, duration, percent inundated)
 
@@ -386,6 +454,11 @@ same products in horizontal and sloping render modes on both models, so this
 horizontal pass covers sloping maps too. Duration matches the same references
 in every pixel (the earlier first-dry-time rule differed on 103 Davis and 11
 bridges pixels).
+These retained temporal comparisons do not qualify original-source raw native
+Davis framing. Fresh raw-grid arrival, duration and percent-inundated references
+remain uncompared because ordinary 2D has no compatible stored-tile-grid route.
+The top-priority original-source Bald Eagle temporal route separately refuses
+28 wet pixels dependent on lower-priority sources/stitches.
 Bridges runs in 8.9 s at 383 MiB peak against about 25 s for the native call.
 
 ## Top-priority source terrain (no RAS Mapper export)

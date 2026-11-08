@@ -108,11 +108,14 @@ pub(crate) fn geometry_key(req: &Request, base: &Path) -> Result<String, MapErro
 }
 
 pub const SCHEMA: &str = "ras-commander-sloping-request/1";
+pub const NATIVE_GRID_SCHEMA: &str = "ras-commander-sloping-request/2";
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub schema: String,
+    #[serde(default)]
+    pub grid_contract: Option<crate::stored_grid::Contract>,
     #[serde(default)]
     pub options: sloping::Options,
     pub terrain: String,
@@ -544,6 +547,7 @@ impl Geometry {
         let mut stencils = sloping::prepare_stencils(&mesh, &cell_faces)?;
         for (cell, stencil) in stencils.iter_mut().enumerate() {
             if let Some(stencil) = stencil {
+                stencil.square_center = Some(self.cells[cell].point);
                 for &face in &self.cells[cell].faces {
                     let f = &self.faces[face];
                     if f.cells[0] == cell {
@@ -591,6 +595,21 @@ pub fn method_record() -> Value {
         "native_plot_tolerance":0.001_f32,"extra_depth_cutoff":null,
         "scope":"2D cells; plain cell-corner sloping; optional storage-area level pools; no 1D, slopingPretty or additional rendering options",
         "reuse":"geometry, terrio ownership and terrain prepared once; bounded Rayon pixel and reconstruction workers"})
+}
+
+pub fn native_grid_method_record() -> Value {
+    json!({"method_id":"rasmapper-plain-sloping/2","backend":"rust","experimental":true,
+        "native_parity_qualified":false,"grid_contracts":[crate::stored_grid::ID],
+        "stream_outputs":true,"export_physical_ownership":true,"native_ownership":true,
+        "aoi_mask":crate::aoi::METHOD,"bounded_profile_concurrency":true,
+        "persistent_session":true,"multi_window_cache":true,"hydraulic_cache":true,
+        "bounded_pixel_weights":true,"native_geotiff_outputs":true,
+        "native_output_products":["depth","wse"],"native_output_compression":["NONE","LZW"],
+        "native_row_streaming":{"control":"row_stream_rows","default":0,"max":4096,
+            "render_mode":"sloping","products":["depth","wse"],
+            "unsupported":["slopingPretty","velocity","storage","reduce_max","consumer"],
+            "retained_full_window_buffers":["ownership","terrain"]},
+        "native_plot_tolerance":0.001_f32,"scope":"explicit original single-source 256-tile plain corner Depth/WSE; no terrain scope, storage or velocity"})
 }
 
 fn selected_method(options: sloping::Options) -> Value {
@@ -719,6 +738,33 @@ fn run_internal(
     mut consumer: Option<&mut FrameSink<'_>>,
     plan_only: bool,
 ) -> Result<Value, MapError> {
+    let native_grid = match (req.schema.as_str(), req.grid_contract.as_ref()) {
+        (SCHEMA, None) => None,
+        (NATIVE_GRID_SCHEMA, Some(contract)) => {
+            if !crate::stored_grid::same(contract.source_geo_transform, req.terrain_transform)
+                || req.options != sloping::Options::default()
+                || req.terrain_scope.is_some()
+                || req.storage_areas_file.is_some()
+                || req.storage_area_count != 0
+                || req.velocity_normals_files.is_some()
+                || !req.derived_products.is_empty()
+                || req.gravity.is_some()
+                || req.reduce_max
+                || consumer.is_some()
+                || req.profiles.iter().any(|p| {
+                    p.storage_area_values_file.is_some() || p.face_velocity_files.is_some()
+                })
+            {
+                return Err(MapError::Unsupported("stored tile grid requires original plain corner Depth/WSE without storage, terrain scope, velocity or consumer".into()));
+            }
+            Some(contract.validate(req.window)?)
+        }
+        _ => {
+            return Err(MapError::Unsupported(
+                "sloping schema and stored grid contract must be selected together".into(),
+            ));
+        }
+    };
     if req.export_physical_ownership
         && (req.aoi_file.is_some()
             || req.terrain_scope.is_some()
@@ -779,7 +825,7 @@ fn run_internal(
         .checked_mul(height)
         .filter(|&n| n > 0 && n <= model::MAX_PROFILE_PIXELS as usize)
         .ok_or_else(|| MapError::Budget("sloping window empty or too large".into()))?;
-    if req.schema != SCHEMA
+    if !matches!(req.schema.as_str(), SCHEMA | NATIVE_GRID_SCHEMA)
         || !(1..=64).contains(&req.threads)
         || !(1..=64).contains(&req.max_inflight_profiles)
         || req.epsg == 0
@@ -1029,6 +1075,16 @@ fn run_internal(
             "sloping terrain identity, square grid, block or window mismatch".into(),
         ));
     }
+    if let Some(layout) = native_grid
+        && (layout.width != terrain.width
+            || layout.height != terrain.height
+            || !crate::stored_grid::same(layout.source, terrain.gt)
+            || terrain.block != (256, 256))
+    {
+        return Err(MapError::Unsupported(
+            "stored grid source transform, dimensions or original tile layout mismatch".into(),
+        ));
+    }
     let admitted = planned
         .checked_add(
             if req.options.render_mode == sloping::RenderMode::WithFaces {
@@ -1117,10 +1173,16 @@ fn run_internal(
     if deliver_files {
         fs::create_dir(out)?;
     }
-    let mut report = json!({"schema":"ras-commander-sloping-report/1","status":"in_progress", "method":selected_method(req.options),
+    let mut report = json!({"schema":if native_grid.is_some(){"ras-commander-sloping-report/2"}else{"ras-commander-sloping-report/1"},"status":"in_progress", "method":if native_grid.is_some(){native_grid_method_record()}else{selected_method(req.options)},
         "threads":req.threads,"window":req.window,"planned_bytes":admitted,
         "requested_inflight_profiles":req.max_inflight_profiles,"effective_inflight_profiles":effective,
         "additional_profile_planned_bytes":additional,"profiles":[]});
+    if let Some(layout) = native_grid {
+        report["grid_contract"] = json!(req.grid_contract);
+        report["source_geo_transform"] = json!(terrain.gt);
+        report["output_geo_transform"] = json!(layout.output);
+        report["geo_transform"] = json!(layout.window_transform(req.window));
+    }
     if deliver_files {
         commit_report(out, &report, req.export_physical_ownership)?;
     }
@@ -1210,14 +1272,16 @@ fn run_internal(
             report["geometry_prepare_seconds"] = tick.elapsed().as_secs_f64().into();
             report["ownership_prepare_seconds"] = 0.0.into();
             report["terrain_prepare_seconds"] = 0.0.into();
-            let transform = [
-                terrain.gt[0] + col as f64 * terrain.gt[1],
-                terrain.gt[1],
-                0.,
-                terrain.gt[3] + row as f64 * terrain.gt[5],
-                0.,
-                terrain.gt[5],
-            ];
+            let transform = native_grid
+                .map(|layout| layout.window_transform(req.window))
+                .unwrap_or([
+                    terrain.gt[0] + col as f64 * terrain.gt[1],
+                    terrain.gt[1],
+                    0.,
+                    terrain.gt[3] + row as f64 * terrain.gt[5],
+                    0.,
+                    terrain.gt[5],
+                ]);
             let grid = terrio::ops::rasterize::Grid {
                 geo_transform: transform,
                 cols: width,
@@ -1227,7 +1291,7 @@ fn run_internal(
             let tick = Instant::now();
             let window_key = if session.is_some() {
                 (
-                    terrain_key.clone(),
+                    format!("{}:{:?}", terrain_key, req.grid_contract),
                     key.clone(),
                     req.window,
                     req.owner_cells.clone(),
@@ -1259,10 +1323,27 @@ fn run_internal(
                     req.owner_cells.len(),
                     false,
                 )?;
-                let mut owner = pool.install(|| crate::ownership::burn(cells, grid.clone()))?;
+                let mut owner = pool.install(|| {
+                    if let Some(layout) = native_grid {
+                        let squares: Vec<_> = req
+                            .owner_cells
+                            .iter()
+                            .map(|&[mesh, cell]| {
+                                stencils[mesh][cell].as_ref().and_then(|s| s.square)
+                            })
+                            .collect();
+                        crate::ownership::burn_stored(cells, &layout, req.window, &squares)
+                    } else {
+                        crate::ownership::burn(cells, grid.clone())
+                    }
+                })?;
                 if let Some(filename) = &req.aoi_file {
                     let mask = pool.install(|| {
-                        crate::aoi::mask(&model::resolve(base, filename), terrain.gt, req.window)
+                        crate::aoi::mask(
+                            &model::resolve(base, filename),
+                            native_grid.map_or(terrain.gt, |l| l.output),
+                            req.window,
+                        )
                     })?;
                     pool.install(|| {
                         owner
@@ -1384,6 +1465,7 @@ fn run_internal(
                 && req.options.render_mode != sloping::RenderMode::WithFaces
             {
                 let window = sloping::RasterWindow {
+                    native_grid: native_grid.map(|l| (l, [col, row])),
                     source_transform: terrain.gt,
                     source_tile: [bw, bh],
                     width,
@@ -1411,6 +1493,7 @@ fn run_internal(
                 report["session"]["retained_window_count"] = s.windows.len().into();
             }
             let window = sloping::RasterWindow {
+                native_grid: native_grid.map(|l| (l, [col, row])),
                 source_transform: terrain.gt,
                 source_tile: [bw, bh],
                 width,

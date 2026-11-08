@@ -105,6 +105,36 @@ impl Drop for Fixture {
     }
 }
 #[test]
+fn stored_grid_xs_changes_delivery_contract_without_changing_numerics() {
+    let f = Fixture::new();
+    let mut legacy = f.request.clone();
+    legacy["tile_size"] = json!(256);
+    f.run(legacy.clone(), "old-grid").unwrap();
+    let mut selected = legacy.clone();
+    selected["schema"] = json!("fast-map-one-d-diagnostic/4");
+    selected["grid_contract"] = json!({"id":"rasmapper-stored-tile-grid/1","source_width":4,"source_height":4,"tile_size":256,
+        "source_geo_transform":[0.,1.,0.,4.,0.,-1.],"output_geo_transform":[0.,1.,0.,4.,0.,-1.]});
+    let report = f.run(selected.clone(), "stored-grid").unwrap();
+    assert_eq!(
+        report["method"]["method_id"],
+        "one-d-xs-surface-diagnostic/5"
+    );
+    assert_eq!(report["grid_contract"], selected["grid_contract"]);
+    for product in ["depth", "wse"] {
+        assert_eq!(
+            fs::read(f.root.join("old-grid").join(format!("{product}.bin"))).unwrap(),
+            fs::read(f.root.join("stored-grid").join(format!("{product}.bin"))).unwrap()
+        );
+    }
+    selected["schema"] = legacy["schema"].clone();
+    assert!(matches!(
+        f.run(selected, "bad-legacy"),
+        Err(MapError::Unsupported(_))
+    ));
+    assert!(!f.root.join("bad-legacy").exists());
+}
+
+#[test]
 fn clipped_owner_retains_nodata_and_crop_uses_global_m_history() {
     let f = Fixture::new();
     let report = f.run(f.request.clone(), "full").unwrap();

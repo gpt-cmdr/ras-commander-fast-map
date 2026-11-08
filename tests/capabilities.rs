@@ -83,6 +83,27 @@ fn capabilities_preserve_dispatch_schemas_flags_and_qualification_limits() {
     let entries = registry["capabilities"].as_array().unwrap();
     let dispatch = [
         (
+            "sloping_native_grid",
+            "ras-commander-sloping-request/2",
+            "sloping",
+            "diagnostic",
+            "unqualified",
+        ),
+        (
+            "one_d_clipped_native_grid_diagnostic",
+            "fast-map-one-d-diagnostic/4",
+            "one-d-diagnostic",
+            "diagnostic",
+            "unqualified",
+        ),
+        (
+            "coupled_native_grid_diagnostic",
+            "fast-map-coupled-diagnostic/3",
+            "coupled-diagnostic",
+            "diagnostic",
+            "unqualified",
+        ),
+        (
             "storage",
             "fast-map-storage/1",
             "storage",

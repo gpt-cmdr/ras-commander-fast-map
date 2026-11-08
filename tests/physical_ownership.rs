@@ -119,6 +119,69 @@ fn fixture() -> (Fixture, Value) {
 }
 
 #[test]
+fn stored_grid_source_identity_rejects_signed_zero_substitution() {
+    let (f, mut wire) = fixture();
+    wire["schema"] = json!("ras-commander-sloping-request/2");
+    wire["terrain_transform"][2] = json!(-0.0_f64);
+    wire["grid_contract"] = json!({"id":"rasmapper-stored-tile-grid/1","source_width":4,"source_height":4,"tile_size":256,
+        "source_geo_transform":[0.,1.,-0.0_f64,4.,0.,-1.],"output_geo_transform":[0.,1.,0.,4.,0.,-1.]});
+    let request: Request = serde_json::from_value(wire).unwrap();
+    let output = f.0.join("signed-zero-source");
+    let error = sloping_session::run(&request, &f.0, &output).unwrap_err();
+    assert!(
+        error.to_string().contains("stored grid source transform"),
+        "{error}"
+    );
+    assert!(!output.exists());
+}
+
+#[test]
+fn stored_grid_owner_export_cache_and_report_are_separate_from_legacy_grid() {
+    let (f, mut wire) = fixture();
+    wire["schema"] = json!("ras-commander-sloping-request/2");
+    wire["grid_contract"] = json!({"id":"rasmapper-stored-tile-grid/1","source_width":4,"source_height":4,"tile_size":256,
+        "source_geo_transform":[0.,1.,0.,4.,0.,-1.],"output_geo_transform":[0.,1.,0.,4.,0.,-1.]});
+    wire["export_physical_ownership"] = json!(true);
+    wire["window_cache_bytes"] = json!(1u64 << 20);
+    let req: Request = serde_json::from_value(wire.clone()).unwrap();
+    let mut session = PreparedSession::default();
+    for folder in ["grid-first", "grid-cached"] {
+        let report =
+            sloping_session::run_with_session(&req, &f.0, &f.0.join(folder), Some(&mut session))
+                .unwrap();
+        assert_eq!(report["schema"], "ras-commander-sloping-report/2");
+        assert_eq!(report["method"]["method_id"], "rasmapper-plain-sloping/2");
+        assert_eq!(report["grid_contract"], wire["grid_contract"]);
+        assert_eq!(report["source_geo_transform"], wire["terrain_transform"]);
+        assert_eq!(report["session"]["window_reused"], folder == "grid-cached");
+        let owners = fs::read(f.0.join(folder).join("owners.bin")).unwrap();
+        assert!(
+            owners
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|b| u32::from_le_bytes(*b) == 1)
+        );
+    }
+    let mut legacy = wire.clone();
+    legacy["schema"] = json!(sloping_session::SCHEMA);
+    let req = serde_json::from_value(legacy).unwrap();
+    assert!(sloping_session::run(&req, &f.0, &f.0.join("bad-grid")).is_err());
+    assert!(!f.0.join("bad-grid").exists());
+    let mut bad = wire;
+    bad["grid_contract"]["output_geo_transform"][1] = json!(2.);
+    assert!(
+        sloping_session::run(
+            &serde_json::from_value(bad).unwrap(),
+            &f.0,
+            &f.0.join("forged-grid")
+        )
+        .is_err()
+    );
+    assert!(!f.0.join("forged-grid").exists());
+}
+
+#[test]
 fn physical_export_matches_burn_for_dry_nodata_and_cached_windows_without_changing_products() {
     let (f, mut model) = fixture();
     model["window_cache_bytes"] = json!(1u64 << 20);

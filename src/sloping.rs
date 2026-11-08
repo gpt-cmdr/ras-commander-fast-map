@@ -701,9 +701,10 @@ pub fn deliver_pixel(wse: f32, terrain: f32, native_tolerance: f32) -> Option<[f
 }
 
 pub struct CellStencil {
+    pub(crate) square_center: Option<[f64; 2]>,
     pub physical_ring: Vec<[f64; 2]>,
     polygon: PolygonStencil,
-    square: Option<[f64; 4]>,
+    pub(crate) square: Option<[f64; 4]>,
     corners: Vec<[usize; 2]>, // vertex, incident-face slot
     faces: Vec<[usize; 2]>,   // face, cell side
     elevations: Option<Vec<f32>>,
@@ -752,6 +753,7 @@ pub fn prepare_stencils(
             let polygon = PolygonStencil::new(points)?;
             let square = polygon.square_bounds();
             Ok(Some(CellStencil {
+                square_center: None,
                 physical_ring: Vec::new(),
                 polygon,
                 square,
@@ -1139,6 +1141,8 @@ pub(crate) fn boundary_surface_value(
 /// Geometry and terrain belong to the caller and can be reused across timesteps.
 /// Labels index `owner_cells` plus one; zero is outside the physical 2D footprint.
 pub struct RasterWindow<'a> {
+    /// Selected logical source layout and integer global [column,row] origin.
+    pub native_grid: Option<(crate::stored_grid::Layout, [usize; 2])>,
     pub source_transform: [f64; 6],
     pub source_tile: [usize; 2],
     pub width: usize,
@@ -1147,6 +1151,128 @@ pub struct RasterWindow<'a> {
     pub owner: &'a [u32],
     pub terrain: &'a [f32],
     pub owner_cells: &'a [[usize; 2]], // mesh, local cell
+}
+
+impl<'a> RasterWindow<'a> {
+    fn validate_native_grid(&self) -> Result<(), MapError> {
+        if let Some((layout, origin)) = self.native_grid {
+            let window = [origin[0], origin[1], self.width, self.height];
+            layout.validate_window(window)?;
+            if !crate::stored_grid::same(self.source_transform, layout.source)
+                || self.source_tile != [256, 256]
+                || !crate::stored_grid::same(self.transform, layout.window_transform(window))
+            {
+                return Err(MapError::Invalid(
+                    "stored sampling window/source framing mismatch".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+    /// Construct the ordinary source-affine window without selecting a stored
+    /// tile contract. Prefer this constructor to public struct literals.
+    pub fn new(
+        source_transform: [f64; 6],
+        source_tile: [usize; 2],
+        dimensions: [usize; 2],
+        transform: [f64; 6],
+        owner: &'a [u32],
+        terrain: &'a [f32],
+        owner_cells: &'a [[usize; 2]],
+    ) -> Self {
+        Self {
+            native_grid: None,
+            source_transform,
+            source_tile,
+            width: dimensions[0],
+            height: dimensions[1],
+            transform,
+            owner,
+            terrain,
+            owner_cells,
+        }
+    }
+    /// Explicitly select logical source-tile sampling and its delivery framing.
+    pub fn with_stored_grid(
+        mut self,
+        layout: crate::stored_grid::Layout,
+        origin: [usize; 2],
+    ) -> Result<Self, MapError> {
+        let window = [origin[0], origin[1], self.width, self.height];
+        layout.validate_window(window)?;
+        if !crate::stored_grid::same(self.source_transform, layout.source)
+            || self.source_tile != [256, 256]
+        {
+            return Err(MapError::Invalid(
+                "stored sampling source identity mismatch".into(),
+            ));
+        }
+        self.transform = layout.window_transform(window);
+        self.native_grid = Some((layout, origin));
+        self.validate_native_grid()?;
+        Ok(self)
+    }
+}
+
+impl CellStencil {
+    #[allow(clippy::neg_multiply)] // Retain explicit binary64 stage order of the selected grid contract.
+    fn window_weights<'a>(
+        &self,
+        window: &RasterWindow<'_>,
+        index: usize,
+        scratch: &'a mut WeightScratch,
+    ) -> Result<&'a [f32], MapError> {
+        let (row, col) = (index / window.width, index % window.width);
+        let point = if let Some((layout, [x, y])) = window.native_grid {
+            layout.point(y + row, x + col)
+        } else {
+            [
+                window.transform[0] + (col as f64 + 0.5) * window.transform[1],
+                window.transform[3] + (row as f64 + 0.5) * window.transform[5],
+            ]
+        };
+        let Some(bounds) = self.square else {
+            return self.polygon.weights(point, scratch);
+        };
+        let Some((layout, [xoff, yoff])) = window.native_grid else {
+            return Ok(self.polygon.square_weights(bounds, point, scratch));
+        };
+        let (global_row, global_col) = (yoff + row, xoff + col);
+        let tile = layout.tile(global_row / 256, global_col / 256);
+        let [first_col, _, first_row, _] = tile
+            .rectangle(bounds)
+            .ok_or_else(|| MapError::Invalid("square owner has no logical tile coverage".into()))?;
+        let [left, bottom, right, top] = bounds;
+        let seed_x = (tile.x(first_col) - left) / (right - left);
+        let seed_y = (tile.y(first_row) - bottom) / (top - bottom);
+        let mut x =
+            seed_x + (tile.step / (right - left)) * ((global_col % 256) as f64 - first_col as f64);
+        let mut y = seed_y
+            + ((-1.0 * tile.step) / (top - bottom))
+                * ((global_row % 256) as f64 - first_row as f64);
+        if x <= 0. {
+            x = 0.00001;
+        }
+        if x >= 1. {
+            x = 0.99999;
+        }
+        if y <= 0. {
+            y = 0.00001;
+        }
+        if y >= 1. {
+            y = 0.99999;
+        }
+        scratch.clipped = false;
+        let center = self
+            .square_center
+            .unwrap_or([(left + right) * 0.5, (bottom + top) * 0.5]);
+        for (i, p) in self.polygon.points.iter().enumerate() {
+            let wx = if p[0] <= center[0] { 1. - x } else { x };
+            let wy = if p[1] <= center[1] { 1. - y } else { y };
+            scratch.weights[i] = (wx * wy) as f32;
+        }
+        Ok(&scratch.weights)
+    }
 }
 
 /// Bounded immutable geometry-only weights for a prefix of one output window.
@@ -1163,6 +1289,7 @@ impl PixelWeights {
         budget: usize,
         pool: &rayon::ThreadPool,
     ) -> Result<Self, MapError> {
+        window.validate_native_grid()?;
         let stride = stencils
             .iter()
             .flatten()
@@ -1196,17 +1323,7 @@ impl PixelWeights {
                         let [mesh, cell] = window.owner_cells[label - 1];
                         if let Some(stencil) = &stencils[mesh][cell] {
                             scratch.resize(stencil.polygon.points.len());
-                            let point = [
-                                window.transform[0]
-                                    + ((i % window.width) as f64 + 0.5) * window.transform[1],
-                                window.transform[3]
-                                    + ((i / window.width) as f64 + 0.5) * window.transform[5],
-                            ];
-                            let weights = if let Some(bounds) = stencil.square {
-                                stencil.polygon.square_weights(bounds, point, scratch)
-                            } else {
-                                stencil.polygon.weights(point, scratch)?
-                            };
+                            let weights = stencil.window_weights(window, i, scratch)?;
                             row[..weights.len()].copy_from_slice(weights);
                         }
                     }
@@ -1291,6 +1408,12 @@ fn render_profile_range(
     row_start: usize,
     row_count: usize,
 ) -> Result<(Vec<f32>, Vec<f32>), MapError> {
+    window.validate_native_grid()?;
+    if window.native_grid.is_some() && profiles.iter().any(|p| p.options != Options::default()) {
+        return Err(MapError::Unsupported(
+            "stored grid sampling requires plain corner profiles".into(),
+        ));
+    }
     let count = window
         .width
         .checked_mul(window.height)
@@ -1373,21 +1496,13 @@ fn render_profile_range(
                         };
                         let values = &profiles[mesh].local_values[cell];
                         scratch.resize(values.len());
-                        let col = i % window.width;
-                        let row = i / window.width;
-                        let point = [
-                            window.transform[0] + (col as f64 + 0.5) * window.transform[1],
-                            window.transform[3] + (row as f64 + 0.5) * window.transform[5],
-                        ];
                         let weights = if let Some(weights) = cache
                             .filter(|_| profiles[mesh].options.render_mode != RenderMode::WithFaces)
                             .and_then(|c| c.get(i, values.len()))
                         {
                             weights
-                        } else if let Some(bounds) = stencil.square {
-                            stencil.polygon.square_weights(bounds, point, scratch)
                         } else {
-                            stencil.polygon.weights(point, scratch)?
+                            stencil.window_weights(window, i, scratch)?
                         };
                         let value = if profiles[mesh].options.render_mode == RenderMode::WithFaces {
                             // End the borrowed weights view before mutating scratch.
@@ -1594,6 +1709,7 @@ mod tests {
         let points = vec![[0., 0.], [0., 4.], [2., 5.], [5., 3.], [4., 0.]];
         let polygon = PolygonStencil::new(points.clone()).unwrap();
         let stencil = CellStencil {
+            square_center: None,
             square: None,
             polygon,
             physical_ring: points,
@@ -1617,6 +1733,7 @@ mod tests {
         let points = vec![[0., 0.], [0., 4.], [2., 5.], [5., 3.], [4., 0.]];
         let polygon = PolygonStencil::new(points.clone()).unwrap();
         let stencil = CellStencil {
+            square_center: None,
             square: None,
             polygon,
             physical_ring: points,
@@ -1725,6 +1842,7 @@ mod tests {
         let polygon = PolygonStencil::new(vec![[0., 0.], [0., 2.], [2., 2.], [2., 0.]]).unwrap();
         let square = polygon.square_bounds();
         let stencil = CellStencil {
+            square_center: None,
             physical_ring: polygon.points.clone(),
             polygon,
             square,
@@ -1734,6 +1852,7 @@ mod tests {
         };
         let stencils = vec![vec![Some(stencil)]];
         let window = RasterWindow {
+            native_grid: None,
             source_transform: [0., 1., 0., 2., 0., -1.],
             source_tile: [2, 2],
             width: 2,
@@ -1810,10 +1929,126 @@ mod tests {
 #[cfg(test)]
 mod boundary_surface_tests {
     use super::*;
+    #[test]
+    fn stored_grid_seeded_squares_cache_rows_and_crops_keep_identical_bits() {
+        let layout = crate::stored_grid::Layout::new(
+            513,
+            257,
+            [1_000_000.125, 0.5, 0., 2_000_000.25, 0., -0.5],
+        )
+        .unwrap();
+        let left = layout.source[0];
+        let top = layout.source[3];
+        let points = vec![
+            [left, top - 512.],
+            [left, top],
+            [left + 512., top],
+            [left + 512., top - 512.],
+        ];
+        let polygon = PolygonStencil::new(points.clone()).unwrap();
+        let stencils = vec![vec![Some(CellStencil {
+            square_center: Some([left + 256., top - 256.]),
+            physical_ring: points,
+            square: polygon.square_bounds(),
+            polygon,
+            corners: vec![],
+            faces: vec![],
+            elevations: None,
+        })]];
+        let profiles = vec![PreparedProfile {
+            local_values: vec![vec![200., 201., 203., 197.]],
+            face_values: vec![vec![]],
+            depth_weights: vec![vec![]],
+            horizontal: vec![None],
+            wet: vec![true],
+            options: Options::default(),
+        }];
+        let owners = vec![1; 513 * 257];
+        let ground: Vec<_> = (0..owners.len())
+            .map(|i| if i % 43 == 0 { NODATA } else { 0. })
+            .collect();
+        let full = RasterWindow {
+            native_grid: Some((layout, [0, 0])),
+            source_transform: layout.source,
+            source_tile: [256, 256],
+            width: 513,
+            height: 257,
+            transform: layout.output,
+            owner: &owners,
+            terrain: &ground,
+            owner_cells: &[[0, 0]],
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let mut invalid = RasterWindow::new(
+            layout.source,
+            [256, 256],
+            [513, 257],
+            layout.output,
+            &owners,
+            &ground,
+            &[[0, 0]],
+        )
+        .with_stored_grid(layout, [0, 0])
+        .unwrap();
+        invalid.native_grid = Some((layout, [usize::MAX, 0]));
+        assert!(render_profile(&stencils, &profiles, &invalid, 0.001, &pool).is_err());
+        assert!(PixelWeights::prepare(&stencils, &invalid, 4096, &pool).is_err());
+        let expected = render_profile(&stencils, &profiles, &full, 0.001, &pool).unwrap();
+        for bytes in [0, 4096, owners.len() * 16] {
+            let cache = PixelWeights::prepare(&stencils, &full, bytes, &pool).unwrap();
+            let got =
+                render_profile_cached(&stencils, &profiles, &full, 0.001, &pool, Some(&cache))
+                    .unwrap();
+            assert_eq!(
+                expected.0.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                got.0.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                expected.1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                got.1.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        let part = render_profile_rows(&stencils, &profiles, &full, 0.001, &pool, 255, 2).unwrap();
+        assert_eq!(
+            expected.1[255 * 513..]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            part.1.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        let mut terrain = Vec::new();
+        for r in 255..257 {
+            terrain.extend_from_slice(&ground[r * 513 + 255..r * 513 + 258]);
+        }
+        let crop = RasterWindow {
+            native_grid: Some((layout, [255, 255])),
+            source_transform: layout.source,
+            source_tile: [256, 256],
+            width: 3,
+            height: 2,
+            transform: layout.window_transform([255, 255, 3, 2]),
+            owner: &[1; 6],
+            terrain: &terrain,
+            owner_cells: &[[0, 0]],
+        };
+        let actual = render_profile(&stencils, &profiles, &crop, 0.001, &pool).unwrap();
+        for r in 0..2 {
+            for c in 0..3 {
+                assert_eq!(
+                    expected.1[(r + 255) * 513 + c + 255].to_bits(),
+                    actual.1[r * 3 + c].to_bits()
+                );
+            }
+        }
+    }
     fn fixture() -> (Vec<Vec<Option<CellStencil>>>, Vec<PreparedProfile>) {
         let points = vec![[0., 0.], [1., 0.], [1., 1.], [0., 1.]];
         let polygon = PolygonStencil::new(points.clone()).unwrap();
         let stencil = CellStencil {
+            square_center: None,
             physical_ring: points,
             polygon,
             square: Some([0., 0., 1., 1.]),
@@ -1857,6 +2092,7 @@ mod boundary_surface_tests {
         ];
         let polygon = PolygonStencil::new(points.clone()).unwrap();
         stencils[0][0] = Some(CellStencil {
+            square_center: None,
             square: polygon.square_bounds(),
             polygon,
             physical_ring: points,
@@ -1872,6 +2108,7 @@ mod boundary_surface_tests {
             .map(|i| if i % 7 == 0 { 4.5 } else { 0. })
             .collect();
         let window = RasterWindow {
+            native_grid: None,
             source_transform: transform,
             source_tile: [256, 256],
             width,

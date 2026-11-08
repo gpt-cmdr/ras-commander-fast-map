@@ -33,6 +33,43 @@ is supported or that outputs are identical to RAS Mapper. Numerical changes
 require deliberate method/schema versioning; existing schemas are not silently
 redirected to a different algorithm.
 
+## Stored tile grid opt-in
+
+The `sloping_native_grid`, `one_d_clipped_native_grid_diagnostic`, and
+`coupled_native_grid_diagnostic` records advertise the exact
+`grid_contracts=["rasmapper-stored-tile-grid/1"]` list. They dispatch sloping
+schema `/2`, XS schema `/4`, and coupled schema `/3`, respectively. Sloping
+selects `rasmapper-plain-sloping/2`; coverage composition selects
+`one-d-two-d-native-grid-coverage-first-diagnostic/1`. XS retains its `/5`
+numerical method while the explicit transport carries derived delivery framing.
+All three records declare `native_parity_qualified=false`.
+
+The descriptor separately binds source dimensions, original source transform,
+256 tile size, and derived full output transform. Engines recompute the rounded
+extent and padded logical tile geometry before payload reads. A window clips
+global integer addresses without shrinking logical edge tiles or resetting
+square interpolation seeds. Existing schemas exclude this descriptor.
+
+This scope requires one original north-up square source whose logical centers
+equal the derived full delivery lattice bit for bit. Admission checks every
+actual row and column within bounded tile work, without full-raster center
+arrays. Terrain scope, storage, velocity and face rendering are unsupported.
+Source identity cannot be replaced with output georeferencing. Composition
+requires identical descriptors, window framing and CRS for both components.
+
+The fixed layout admission limit is 32,768 logical tiles with source dimensions
+in `1..=i32::MAX`. This bounds constant-scratch center verification; allocation
+budgets still govern terrain, geometry, caches and product buffers.
+
+Rust callers constructing request structs explicitly supply `grid_contract`:
+use `None` for source-grid requests. `coupled_session::Request` also has an
+optional `window`, and each `coupled_session::Component` carries its own
+optional descriptor. `sloping::RasterWindow` has `native_grid`; use
+`RasterWindow::new()` for source-grid rendering and `with_stored_grid()` for an
+explicit validated layout. The latter derives the selected window transform.
+These public fields affect struct-literal source compatibility. Serialized
+legacy requests retain their existing defaults and numerical contracts.
+
 `numerical_qualification` contains `status`, `native_version`, `scope` and
 `flags`. The summary is derived conservatively from existing explicit fields:
 

@@ -4,6 +4,45 @@ use ras_commander_fast_map::{
 };
 
 #[test]
+fn stored_grid_coupled_contract_binds_components_and_refuses_before_reads() {
+    let grid = serde_json::json!({"id":"rasmapper-stored-tile-grid/1","source_width":513,"source_height":257,"tile_size":256,
+        "source_geo_transform":[100.,2.,0.,1000.,0.,-2.],"output_geo_transform":[100.,2.,0.,1000.,0.,-2.]});
+    let component = serde_json::json!({"profile_id":"p","crs":"EPSG:3857","width":2,"height":1,
+        "geo_transform":[610.,2.,0.,490.,0.,-2.],"depth_file":"missing.bin","wse_file":"missing.bin","grid_contract":grid});
+    let wire = serde_json::json!({"schema":"fast-map-coupled-diagnostic/3","grid_contract":grid,"window":[255,255,2,1],
+        "xs":component,"two_d":component,"two_d_owners_file":"missing.bin","two_d_cell_count":1,"max_working_bytes":1_000_000});
+    let base = std::path::Path::new("nonexistent-grid-input");
+    let run = |wire| {
+        ras_commander_fast_map::coupled_session::run(
+            &serde_json::from_value(wire).unwrap(),
+            base,
+            &base.join("out"),
+        )
+    };
+    // A valid descriptor progresses to payload I/O; each forgery refuses earlier.
+    assert!(matches!(run(wire.clone()), Err(MapError::Io(_))));
+    for (target, field, value) in [
+        ("two_d", "grid_contract", serde_json::Value::Null),
+        (
+            "two_d",
+            "geo_transform",
+            serde_json::json!([612., 2., 0., 490., 0., -2.]),
+        ),
+        ("xs", "width", serde_json::json!(3)),
+    ] {
+        let mut bad = wire.clone();
+        bad[target][field] = value;
+        assert!(matches!(run(bad), Err(MapError::Invalid(_))));
+    }
+    let mut bad = wire.clone();
+    bad["schema"] = serde_json::json!("fast-map-coupled-diagnostic/1");
+    assert!(matches!(run(bad), Err(MapError::Unsupported(_))));
+    let mut budget = wire;
+    budget["max_working_bytes"] = serde_json::json!(1);
+    assert!(matches!(run(budget), Err(MapError::Budget(_))));
+}
+
+#[test]
 fn storage_coverage_suppresses_wet_xs_and_preserves_selected_bits() {
     use ras_commander_fast_map::coupled::{Storage, compose_with_storage_into};
     let nan = f32::from_bits(0x7fc01234);

@@ -14,20 +14,41 @@ pub fn engine_method_record() -> serde_json::Value {
         },
         "storage": crate::storage_session::method_record(),
         "coupled_diagnostic": crate::coupled::method_record(),
+        "coupled_native_grid_diagnostic":crate::coupled_session::stored_grid_method_record(),
         "coupled_storage_diagnostic": crate::coupled::storage_method_record(),
         "one_d_diagnostic": crate::one_d::method_record(),
         "one_d_native_diagnostic": crate::one_d_native::method_record(),
         "one_d_clipped_diagnostic": crate::one_d_native::clipped_method_record(),
+        "one_d_clipped_native_grid_diagnostic":stored_xs_record(),
         "batch_session_r1": crate::method_record(),
         "step05_r2": crate::step05::method_record(),
         "horizontal": crate::horizontal::method_record(),
         "sloping": crate::sloping_session::method_record(),
+        "sloping_native_grid":crate::sloping_session::native_grid_method_record(),
         "depth_groups": crate::depth_groups::method_record(),
         "boundary": crate::boundary_session::method_record(),
         "whole_simulation": crate::whole_simulation::method_record(),
         "effective_terrain": crate::effective_terrain::method_record()
     });
     let specifications = [
+        (
+            "sloping_native_grid",
+            crate::sloping_session::NATIVE_GRID_SCHEMA,
+            "sloping",
+            "diagnostic",
+        ),
+        (
+            "one_d_clipped_native_grid_diagnostic",
+            crate::one_d_session::STORED_GRID_SCHEMA,
+            "one-d-diagnostic",
+            "diagnostic",
+        ),
+        (
+            "coupled_native_grid_diagnostic",
+            crate::coupled_session::STORED_GRID_SCHEMA,
+            "coupled-diagnostic",
+            "diagnostic",
+        ),
         (
             "storage",
             crate::storage_session::SCHEMA,
@@ -122,6 +143,12 @@ pub fn engine_method_record() -> serde_json::Value {
     registry["capabilities_schema"] = "ras-commander-fast-map-capabilities/1".into();
     registry["capabilities"] = capabilities.into();
     registry
+}
+
+fn stored_xs_record() -> serde_json::Value {
+    let mut record = crate::one_d_native::clipped_method_record();
+    record["grid_contracts"] = serde_json::json!([crate::stored_grid::ID]);
+    record
 }
 
 fn capability(
