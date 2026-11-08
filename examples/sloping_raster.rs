@@ -189,6 +189,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .collect::<Vec<_>>();
     let prepared_seconds = started.elapsed().as_secs_f64();
     let window = RasterWindow {
+        native_grid: None,
         source_transform: request.transform,
         source_tile: [256, 256],
         width: request.width,

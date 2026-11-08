@@ -15,6 +15,7 @@ use std::{
 pub const SCHEMA: &str = "fast-map-one-d-diagnostic/1";
 pub const NATIVE_SCHEMA: &str = "fast-map-one-d-diagnostic/2";
 pub const CLIPPED_SCHEMA: &str = "fast-map-one-d-diagnostic/3";
+pub const STORED_GRID_SCHEMA: &str = "fast-map-one-d-diagnostic/4";
 pub const CLIPPING_SCOPE: &str = "levees-and-xs-end-obstructions-only";
 
 #[derive(Deserialize, Clone, Copy)]
@@ -30,6 +31,8 @@ pub struct Window {
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub schema: String,
+    #[serde(default)]
+    pub grid_contract: Option<crate::stored_grid::Contract>,
     /// Must explicitly acknowledge that only the XS surface is rendered.
     pub scope: String,
     pub points_file: PathBuf,
@@ -103,10 +106,13 @@ fn nonnegative(value: i32) -> Result<usize, MapError> {
 }
 
 pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError> {
-    let clipped = req.schema == CLIPPED_SCHEMA;
+    let stored_grid = req.schema == STORED_GRID_SCHEMA;
+    let clipped = req.schema == CLIPPED_SCHEMA || stored_grid;
     let native = req.schema == NATIVE_SCHEMA || clipped;
-    if !matches!(req.schema.as_str(), SCHEMA | NATIVE_SCHEMA | CLIPPED_SCHEMA)
-        || req.scope != "xs-surface-only"
+    if !matches!(
+        req.schema.as_str(),
+        SCHEMA | NATIVE_SCHEMA | CLIPPED_SCHEMA | STORED_GRID_SCHEMA
+    ) || req.scope != "xs-surface-only"
     {
         return Err(MapError::Unsupported(
             "expected diagnostic 1D schema and xs-surface-only scope".into(),
@@ -138,6 +144,26 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         width: req.width,
         height: req.height,
     });
+    let layout = match (stored_grid, req.grid_contract.as_ref()) {
+        (false, None) => None,
+        (true, Some(contract)) => {
+            if contract.source_width != req.width
+                || contract.source_height != req.height
+                || !crate::stored_grid::same(contract.source_geo_transform, gt)
+                || req.tile_size != Some(256)
+            {
+                return Err(MapError::Invalid(
+                    "XS stored grid descriptor does not match original source".into(),
+                ));
+            }
+            Some(contract.validate([window.col, window.row, window.width, window.height])?)
+        }
+        _ => {
+            return Err(MapError::Unsupported(
+                "XS schema and stored grid contract must be selected together".into(),
+            ));
+        }
+    };
     if window.width == 0
         || window.height == 0
         || window
@@ -375,20 +401,26 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         }
         valid
     };
-    let output_gt = [
-        gt[0] + window.col as f64 * gt[1],
-        gt[1],
-        0.,
-        gt[3] + window.row as f64 * gt[5],
-        0.,
-        gt[5],
-    ];
+    let output_gt = layout
+        .map(|l| l.window_transform([window.col, window.row, window.width, window.height]))
+        .unwrap_or([
+            gt[0] + window.col as f64 * gt[1],
+            gt[1],
+            0.,
+            gt[3] + window.row as f64 * gt[5],
+            0.,
+            gt[5],
+        ]);
     fs::create_dir(output)?;
     let mut report = json!({"schema": req.schema, "method": if clipped {crate::one_d_native::clipped_method_record()} else if native { crate::one_d_native::method_record() } else { crate::one_d::method_record() },
         "status": "complete", "scope": req.scope, "width": window.width, "height": window.height,
         "geo_transform": output_gt, "source_width": req.width, "source_height": req.height,
         "source_geo_transform":gt, "source_col":window.col, "source_row":window.row, "tile_size":req.tile_size, "clipping_scope":req.clipping_scope, "valid_pixels": valid, "planned_bytes": planned,
         "depth_file": "depth.bin", "wse_file": "wse.bin", "dtype": "little-endian float32", "nodata": "NaN"});
+    if let Some(layout) = layout {
+        report["grid_contract"] = json!(req.grid_contract);
+        report["output_geo_transform"] = json!(layout.output);
+    }
     let result = (|| {
         crate::horizontal::write_values(&output.join("depth.bin"), &depth)?;
         crate::horizontal::write_values(&output.join("wse.bin"), &wse)?;

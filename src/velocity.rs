@@ -1109,6 +1109,7 @@ mod tests {
         let owner = [0, 1, 1, 1, 1, 1];
         let terrain = [0., 1., 2., 2.001, crate::sloping::NODATA, 0.];
         let window = crate::sloping::RasterWindow {
+            native_grid: None,
             source_transform: [0., 1., 0., 1., 0., -1.],
             source_tile: [256, 256],
             width: 6,
@@ -1274,6 +1275,7 @@ mod tests {
             .build()
             .unwrap();
         let window = crate::sloping::RasterWindow {
+            native_grid: None,
             source_transform: [0.0, 1.0, 0.0, 10.0, 0.0, -1.0],
             source_tile: [256, 128],
             width: 1,

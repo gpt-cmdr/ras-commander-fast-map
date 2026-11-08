@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.14.0 - 2026-11-08
+
+Add an explicit native stored-terrain grid contract for plain sloping
+Depth/WSE and mixed XS/2D composition. Bind raw source identity, logical tile
+sampling and derived delivery framing separately, with strict capability,
+layout and component-report validation. Commander supplies canonical prepared
+1D and mixed Depth/WSE workflows with explicit diagnostic opt-in; its mixed
+API seals the stored-tile-grid choice. Ordinary 2D entry points retain their
+dimensional guards and source-grid defaults.
+
+Retain complete native mask/Float32 comparison results for the named 6.6 and
+7.0.1 fixture scopes. The 7.0.1 mandatory matrix has 32 of 32 exact
+products; fresh Baxter checks also pass against 6.6; 6.6 Lawson/White Oak coverage is
+limited to stripe pilots. Diagnostic defaults and numerical qualification flags
+remain unchanged. Davis original-source raw native framing is not admitted by
+the `/1` center-equivalence contract; velocity/temporal grid extensions and
+terrain export with modifications remain outside this scope. See the
+[runtime comparison scope](README.md#native-runtime-comparison-scope).
+
+Rust source compatibility: struct literals for `sloping::RasterWindow`,
+`sloping_session::Request`, `one_d_session::Request`,
+`coupled_session::Request` and `coupled_session::Component` must include their
+new optional grid fields. The coupled request also includes `window`.
+Use `None` for source-grid requests; `RasterWindow::new()` and
+`with_stored_grid()` provide explicit construction paths. These public source additions require this deliberate
+minor release. Existing serialized request
+defaults and method semantics remain intact.
+
 ## 0.13.0  - 2026-11-07
 
 ### Bounded native delivery and performance qualification

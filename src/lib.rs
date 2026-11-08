@@ -30,6 +30,7 @@ pub mod aoi;
 pub mod boundary_contour;
 pub mod boundary_session;
 pub mod cache;
+mod capabilities;
 pub mod coupled;
 pub mod coupled_session;
 pub mod depth_groups;
@@ -55,10 +56,14 @@ mod sloping_binary;
 pub mod sloping_session;
 pub mod step05;
 pub mod storage_area;
+pub mod storage_session;
+pub mod stored_grid;
 pub mod terrain;
 pub mod terrain_scope;
 pub mod velocity;
 pub mod whole_simulation;
+
+pub use capabilities::engine_method_record;
 
 use std::fmt;
 

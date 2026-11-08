@@ -12,10 +12,13 @@ use std::{
 
 pub const SCHEMA: &str = "fast-map-coupled-diagnostic/1";
 pub const STORAGE_SCHEMA: &str = "fast-map-coupled-diagnostic/2";
+pub const STORED_GRID_SCHEMA: &str = "fast-map-coupled-diagnostic/3";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Component {
+    #[serde(default)]
+    pub grid_contract: Option<crate::stored_grid::Contract>,
     pub profile_id: String,
     /// Exact caller-verified CRS identity, shared by both prepared components.
     pub crs: String,
@@ -30,6 +33,10 @@ pub struct Component {
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub schema: String,
+    #[serde(default)]
+    pub grid_contract: Option<crate::stored_grid::Contract>,
+    #[serde(default)]
+    pub window: Option<[usize; 4]>,
     pub xs: Component,
     pub two_d: Component,
     /// Produced by the same 2D polygon burn used for these component products.
@@ -52,7 +59,7 @@ pub struct StorageComponent {
 pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError> {
     if !matches!(
         (req.schema.as_str(), req.storage.is_some()),
-        (SCHEMA, false) | (STORAGE_SCHEMA, true)
+        (SCHEMA, false) | (STORAGE_SCHEMA, true) | (STORED_GRID_SCHEMA, false)
     ) {
         return Err(MapError::Unsupported(
             "coupled schema /1 excludes storage; schema /2 requires storage".into(),
@@ -61,6 +68,20 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
     let xs = &req.xs;
     let two = &req.two_d;
     let gt = xs.geo_transform;
+    let layout=match (req.schema.as_str(),req.grid_contract.as_ref(),req.window) {
+        (STORED_GRID_SCHEMA,Some(contract),Some(window))=>{
+            let layout=contract.validate(window)?;
+            if !xs.grid_contract.as_ref().is_some_and(|c|c.exactly_matches(contract)) || !two.grid_contract.as_ref().is_some_and(|c|c.exactly_matches(contract))
+                || xs.width!=window[2] || xs.height!=window[3]
+                || !crate::stored_grid::same(gt,layout.window_transform(window)) || !crate::stored_grid::same(two.geo_transform,gt) {
+                return Err(MapError::Invalid("coupled stored grid component framing mismatch".into()));
+            }
+            Some(layout)
+        },
+        (SCHEMA|STORAGE_SCHEMA,None,None) if xs.grid_contract.is_none() && two.grid_contract.is_none()
+            && req.storage.as_ref().is_none_or(|s|s.component.grid_contract.is_none())=>None,
+        _=>return Err(MapError::Unsupported("coupled stored grid schema requires matching explicit component/source/window contracts; legacy excludes them".into())),
+    };
     if xs.profile_id.is_empty()
         || xs.profile_id.len() > 256
         || xs.profile_id != two.profile_id
@@ -190,7 +211,9 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         )?)
     }
     .map_err(|e| MapError::Internal(e.to_string()))?;
-    let method = if storage.is_some() {
+    let method = if layout.is_some() {
+        stored_grid_method_record()
+    } else if storage.is_some() {
         crate::coupled::storage_method_record()
     } else {
         crate::coupled::method_record()
@@ -200,6 +223,12 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         "status": "complete", "profile_id": xs.profile_id, "crs": xs.crs, "width": xs.width, "height": xs.height,
         "geo_transform": gt, "counts": counts, "planned_bytes": planned,
         "depth_file": "depth.bin", "wse_file": "wse.bin", "dtype": "little-endian float32", "nodata": "NaN"});
+    if let Some(layout) = layout {
+        report["grid_contract"] = json!(req.grid_contract);
+        report["window"] = json!(req.window);
+        report["source_geo_transform"] = json!(layout.source);
+        report["output_geo_transform"] = json!(layout.output);
+    }
     let result = (|| {
         crate::horizontal::write_values(&output.join("depth.bin"), &depth)?;
         crate::horizontal::write_values(&output.join("wse.bin"), &wse)?;
@@ -215,4 +244,11 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
     )?;
     result?;
     Ok(report)
+}
+
+pub fn stored_grid_method_record() -> Value {
+    let mut record = crate::coupled::method_record();
+    record["method_id"] = json!("one-d-two-d-native-grid-coverage-first-diagnostic/1");
+    record["grid_contracts"] = json!([crate::stored_grid::ID]);
+    record
 }
