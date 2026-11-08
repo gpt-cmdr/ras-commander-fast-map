@@ -123,6 +123,9 @@ pub struct Request {
     pub geometry_file: String,
     #[serde(default)]
     pub aoi_file: Option<String>,
+    /// Export unfiltered physical polygon labels, independent of wetness/terrain nodata.
+    #[serde(default)]
+    pub export_physical_ownership: bool,
     pub mesh_files: Vec<String>,
     pub owner_cells: Vec<[usize; 2]>,
     pub profiles: Vec<Profile>,
@@ -563,7 +566,7 @@ impl Geometry {
 
 pub fn method_record() -> Value {
     json!({"method_id":"rasmapper-plain-sloping/1", "backend":"rust", "experimental":true,
-        "native_version_qualified":"7.0.1", "stream_outputs":true, "native_ownership":true,"aoi_mask":crate::aoi::METHOD,
+        "native_version_qualified":"7.0.1", "stream_outputs":true, "export_physical_ownership":true, "native_ownership":true,"aoi_mask":crate::aoi::METHOD,
         "enhanced_options":true,"enhanced_method_id":"rasmapper-sloping-with-faces/1",
         "depth_weighted_faces":true,
         "native_donation_history":true,
@@ -605,6 +608,33 @@ fn selected_method(options: sloping::Options) -> Value {
         record["scope"] = "physical 2D cells; cell-corner and face sloping; optional storage-area level pools; no 1D".into();
     }
     record
+}
+
+// A fixed buffer is admitted before input reads; no full-window serialization clone.
+const OWNERS_IO_BYTES: usize = 64 * 1024;
+fn write_physical_ownership(path: &Path, owner: &[u32]) -> Result<(), MapError> {
+    let partial = path.with_extension("bin.partial");
+    let mut file = fs::File::create(&partial)?;
+    let mut bytes = [0u8; OWNERS_IO_BYTES];
+    for labels in owner.chunks(OWNERS_IO_BYTES / 4) {
+        for (label, destination) in labels.iter().zip(bytes.as_chunks_mut::<4>().0) {
+            destination.copy_from_slice(&label.to_le_bytes());
+        }
+        file.write_all(&bytes[..labels.len() * 4])?;
+    }
+    file.sync_all()?;
+    drop(file);
+    fs::rename(partial, path)?;
+    Ok(())
+}
+
+fn commit_report(out: &Path, report: &Value, exported_owners: bool) -> Result<(), MapError> {
+    let result = sink::write_json(&out.join("report.json"), report);
+    if result.is_err() && exported_owners {
+        let _ = fs::remove_file(out.join("owners.bin"));
+        let _ = fs::remove_file(out.join("owners.bin.partial"));
+    }
+    result
 }
 
 fn values(path: &Path, count: usize) -> Result<Vec<f32>, MapError> {
@@ -689,6 +719,21 @@ fn run_internal(
     mut consumer: Option<&mut FrameSink<'_>>,
     plan_only: bool,
 ) -> Result<Value, MapError> {
+    if req.export_physical_ownership
+        && (req.aoi_file.is_some()
+            || req.terrain_scope.is_some()
+            || req.storage_areas_file.is_some()
+            || req.storage_area_count != 0
+            || req
+                .profiles
+                .iter()
+                .any(|p| p.storage_area_values_file.is_some())
+            || consumer.is_some())
+    {
+        return Err(MapError::Unsupported(
+            "export_physical_ownership requires unfiltered physical geometry without AOI, terrain_scope, embedded storage or consumer".into(),
+        ));
+    }
     if let Some(output) = output {
         output.validate()?;
         if !req.geotiff_outputs {
@@ -863,6 +908,13 @@ fn run_internal(
         .and_then(|v| v.checked_add(persistent_bytes))
         .and_then(|v| v.checked_add(hydraulic_bytes))
         .and_then(|v| v.checked_add(aoi_scratch))
+        .and_then(|v| {
+            v.checked_add(if req.export_physical_ownership {
+                OWNERS_IO_BYTES as u64
+            } else {
+                0
+            })
+        })
         // Terrain scope: one validity byte per expanded-window pixel.
         .and_then(|v| {
             v.checked_add(if req.terrain_scope.is_some() {
@@ -1070,7 +1122,7 @@ fn run_internal(
         "requested_inflight_profiles":req.max_inflight_profiles,"effective_inflight_profiles":effective,
         "additional_profile_planned_bytes":additional,"profiles":[]});
     if deliver_files {
-        sink::write_json(&out.join("report.json"), &report)?;
+        commit_report(out, &report, req.export_physical_ownership)?;
     }
     let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || -> Result<(), MapError> {
@@ -1300,6 +1352,18 @@ fn run_internal(
                     weights: None,
                 })
             };
+            if req.export_physical_ownership {
+                write_physical_ownership(&out.join("owners.bin"), &data.owner)?;
+                report["physical_ownership"] = json!({
+                    "kind":"physical_2d", "dtype":"<u4", "count":count,
+                    "path":"owners.bin", "bytes":count as u64 * 4,
+                    "width":width, "height":height, "window":req.window,
+                    "geo_transform":transform, "epsg":req.epsg,
+                    "crs_identity":req.crs_identity,
+                    "owner_cell_count":req.owner_cells.len(),
+                    "owned_pixels":data.owner.iter().filter(|&&label| label != 0).count(),
+                });
+            }
             let window_base_bytes = count as u64 * (8 + u64::from(req.terrain_scope.is_some()))
                 + (2 * std::mem::size_of::<(WindowKey, Arc<WindowData>, u64)>()
                     + std::mem::size_of::<WindowData>()
@@ -1628,6 +1692,11 @@ fn run_internal(
         Ok(Ok(())) => report["status"] = "complete".into(),
         other => {
             report["status"] = "aborted".into();
+            if req.export_physical_ownership {
+                let _ = fs::remove_file(out.join("owners.bin"));
+                let _ = fs::remove_file(out.join("owners.bin.partial"));
+                report.as_object_mut().unwrap().remove("physical_ownership");
+            }
             report["error"] = match other {
                 Ok(Err(e)) => e.to_string(),
                 _ => "sloping internal panic".into(),
@@ -1680,6 +1749,27 @@ mod tests {
         Barrier,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn final_report_failure_removes_exported_ownership() {
+        let out = std::env::temp_dir().join(format!(
+            "fast-map-owner-report-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&out).unwrap();
+        // Force the atomic JSON writer to fail independently of permissions.
+        fs::create_dir(out.join("report.json.partial")).unwrap();
+        fs::write(out.join("owners.bin"), 1_u32.to_le_bytes()).unwrap();
+        fs::write(out.join("owners.bin.partial"), [0]).unwrap();
+        assert!(commit_report(&out, &json!({"status":"complete"}), true).is_err());
+        assert!(!out.join("owners.bin").exists());
+        assert!(!out.join("owners.bin.partial").exists());
+        fs::remove_dir_all(&out).unwrap();
+    }
 
     #[test]
     fn admission_caps_threads_profiles_memory_and_overflow() {

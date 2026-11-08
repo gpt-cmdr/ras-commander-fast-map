@@ -89,3 +89,13 @@ physical coverage labels include dry and terrain-nodata pixels, allowing coupled
 schema `/2` to apply storage precedence before visibility. Standalone transport
 native qualification is pending; the kernel's historical comparisons do not
 automatically qualify new prepared inputs or storage/XS composition.
+
+Sloping schema `/1` accepts optional `export_physical_ownership` (default
+`false`), advertised by the same flag in its method record. It writes one
+little-endian UInt32 `owners.bin` from the product's physical polygon burn:
+zero is unowned; other values are positions plus one in `owner_cells`.
+Dry and terrain-nodata pixels retain physical coverage. The report's
+`physical_ownership` block identifies kind, dtype, count, path and grid.
+The initial export refuses AOI, terrain-scope and embedded-storage combinations
+before payload reads. Cached and ordinary execution share this contract.
+Legacy requests with the flag absent or false keep their product behavior.

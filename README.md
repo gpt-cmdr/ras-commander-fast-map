@@ -418,6 +418,15 @@ reproduced), so a native mosaic is unqualified.
 
 ## Storage-area surfaces
 
+Sloping requests can export physical 2D coverage with
+`export_physical_ownership: true` when the method record advertises that flag.
+The root `owners.bin` is little-endian UInt32: zero outside physical cells,
+otherwise `owner_cells` position plus one. Coverage includes dry and terrain-nodata
+pixels and comes from the same burn as the sloping products. The report records
+the ownership grid and payload identity. This export refuses AOI, terrain-scope
+and embedded-storage combinations before payload reads. See the
+[method contract](docs/method-contract.md) for details.
+
 `sloping`, `horizontal` and `whole-simulation` requests can render separate
 storage-area polygons as level pools (method `storage-area-level-pool/1`, advertised as
 `storage_area_surfaces` in `ras2fim-batch method`). These requests still require
