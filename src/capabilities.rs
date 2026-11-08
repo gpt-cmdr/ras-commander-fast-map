@@ -12,6 +12,7 @@ pub fn engine_method_record() -> serde_json::Value {
             "version": crate::ENGINE_VERSION,
             "source_commit": crate::ENGINE_COMMIT
         },
+        "storage": crate::storage_session::method_record(),
         "coupled_diagnostic": crate::coupled::method_record(),
         "coupled_storage_diagnostic": crate::coupled::storage_method_record(),
         "one_d_diagnostic": crate::one_d::method_record(),
@@ -27,6 +28,12 @@ pub fn engine_method_record() -> serde_json::Value {
         "effective_terrain": crate::effective_terrain::method_record()
     });
     let specifications = [
+        (
+            "storage",
+            crate::storage_session::SCHEMA,
+            "storage",
+            "mapping",
+        ),
         (
             "coupled_diagnostic",
             crate::coupled_session::SCHEMA,

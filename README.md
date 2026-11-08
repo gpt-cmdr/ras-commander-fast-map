@@ -421,7 +421,8 @@ reproduced), so a native mosaic is unqualified.
 `sloping`, `horizontal` and `whole-simulation` requests can render separate
 storage-area polygons as level pools (method `storage-area-level-pool/1`, advertised as
 `storage_area_surfaces` in `ras2fim-batch method`). These requests still require
-2D cell inputs; models containing only storage areas are not supported.
+2D cell inputs. The separate prepared-buffer `storage` transport below supports
+storage-only rendering without synthetic 2D cells.
 Whole-simulation support covers arrival time and percent inundated, not duration.
 Supply all three together:
 
@@ -457,6 +458,30 @@ all in 2D pixels, with matching storage-area pixels; that evidence does not
 establish an implemented or qualified duration capability. Both models have one
 storage area connected to the 2D area; multiple storage areas and
 storage-area-to-storage-area connections are not covered by this evidence.
+
+### Storage-only prepared-buffer transport
+
+`ras2fim-batch storage <request.json> <new-output-dir>` accepts
+`schema="fast-map-storage/1"`, `storage_areas_file` (the framed WKB file above),
+`storage_area_count`, `levels_file` (one little-endian Float32 WSE per area),
+`terrain_file` (row-major little-endian Float32 terrain; NaN nodata), `width`,
+`height`, window `geo_transform`, `threads` (1–4), and `max_working_bytes`.
+All files resolve relative to the request. Counts, north-up grid, geometry
+allocation and raster buffers are admitted before payload reads. Input geometry
+retains global area order; callers preserve the original terrain grid and use
+an exactly aligned window transform. No hydraulic or terrain extraction occurs
+inside the Rust library.
+
+Outputs are `depth.bin`, `wse.bin` (Float32, NaN nodata), `owners.bin` (UInt32,
+0 outside, area index + 1 inside), and `report.json`. Owners include dry pools
+and terrain-nodata pixels. This is the same `storage-area-level-pool/1` kernel,
+with a new transport rather than a new pool algorithm. Discovery key `storage`
+advertises the schema and explicitly reports standalone transport qualification
+as pending. This does not extend the historical native comparisons above.
+Overlapping pools remain refused. The labels/products can feed coupled schema
+`/2`, which permits a truly empty 2D component and applies coverage-first storage
+precedence over XS even for dry pools. The compositor still refuses storage/2D
+overlap. No pool raster arithmetic is delegated to Python.
 
 ## Qualification and limits
 

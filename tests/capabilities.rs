@@ -83,6 +83,13 @@ fn capabilities_preserve_dispatch_schemas_flags_and_qualification_limits() {
     let entries = registry["capabilities"].as_array().unwrap();
     let dispatch = [
         (
+            "storage",
+            "fast-map-storage/1",
+            "storage",
+            "mapping",
+            "unqualified",
+        ),
+        (
             "coupled_diagnostic",
             "fast-map-coupled-diagnostic/1",
             "coupled-diagnostic",

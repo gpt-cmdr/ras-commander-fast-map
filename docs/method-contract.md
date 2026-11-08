@@ -61,6 +61,7 @@ turn that distinct reference into RAS Mapper stored-map parity.
 
 | Request schema | CLI command | Method ID |
 | --- | --- | --- |
+| `fast-map-storage/1` | `storage` | `storage-area-level-pool/1` |
 | `fast-map-one-d-diagnostic/1` | `one-d-diagnostic` | `one-d-xs-surface-diagnostic/3` |
 | `fast-map-one-d-diagnostic/2` | `one-d-diagnostic` | `one-d-xs-surface-diagnostic/4` |
 | `fast-map-one-d-diagnostic/3` | `one-d-diagnostic` | `one-d-xs-surface-diagnostic/5` |
@@ -81,3 +82,10 @@ corpus. The White Oak, Lawson and South Shaver preparation comparisons remain
 required gates; discovery metadata does not change their results. Mixed-model
 preparation and ownership require their own qualification. No new qualification
 or numerical behavior follows from this discovery contract.
+
+The `storage` registry entry uses the existing level-pool kernel through one
+standalone prepared-buffer transport. It requires no 2D cells. Its exported
+physical coverage labels include dry and terrain-nodata pixels, allowing coupled
+schema `/2` to apply storage precedence before visibility. Standalone transport
+native qualification is pending; the kernel's historical comparisons do not
+automatically qualify new prepared inputs or storage/XS composition.

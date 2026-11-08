@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-const USAGE: &str = "usage:\n  ras2fim-batch run <session.json> <new-output-dir>\n  ras2fim-batch boundary <request.json> <new-output-dir>\n  ras2fim-batch horizontal <request.json> <new-output-dir>\n  ras2fim-batch whole-simulation <request.json> <new-output-dir>\n  ras2fim-batch sloping <request.json> <new-output-dir>\n  ras2fim-batch depth-groups <request.json> <new-output-dir>\n  ras2fim-batch step05 <request.json> <new-output-dir>\n  ras2fim-batch effective-terrain <request.json> <new-output-dir>\n  ras2fim-batch one-d-diagnostic <request.json> <new-output-dir>\n  ras2fim-batch coupled-diagnostic <request.json> <new-output-dir>\n  ras2fim-batch method\n  ras2fim-batch terrain-info <terrain.tif>";
+const USAGE: &str = "usage:\n  ras2fim-batch run <session.json> <new-output-dir>\n  ras2fim-batch boundary <request.json> <new-output-dir>\n  ras2fim-batch horizontal <request.json> <new-output-dir>\n  ras2fim-batch whole-simulation <request.json> <new-output-dir>\n  ras2fim-batch sloping <request.json> <new-output-dir>\n  ras2fim-batch depth-groups <request.json> <new-output-dir>\n  ras2fim-batch step05 <request.json> <new-output-dir>\n  ras2fim-batch effective-terrain <request.json> <new-output-dir>\n  ras2fim-batch one-d-diagnostic <request.json> <new-output-dir>\n  ras2fim-batch storage <request.json> <new-output-dir>\n  ras2fim-batch coupled-diagnostic <request.json> <new-output-dir>\n  ras2fim-batch method\n  ras2fim-batch terrain-info <terrain.tif>";
 
 /// Samples this process's OS thread count (Linux /proc) to evidence no nested decode threads.
 struct ThreadMonitor {
@@ -80,6 +80,17 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let cmd = args.first().and_then(|a| a.to_str()).unwrap_or("");
     match (cmd, args.len()) {
+        ("storage", 3) => {
+            let path = PathBuf::from(&args[1]);
+            let out = PathBuf::from(&args[2]);
+            let wire = read_diagnostic_wire(&path)?;
+            let req = serde_json::from_value(wire)?;
+            let absolute = path.canonicalize()?;
+            let base = absolute.parent().ok_or("request has no parent")?;
+            let report = ras_commander_fast_map::storage_session::run(&req, base, &out)?;
+            println!("{}", serde_json::to_string(&report)?);
+            Ok(0)
+        }
         ("coupled-diagnostic", 3) => {
             let path = PathBuf::from(&args[1]);
             let out = PathBuf::from(&args[2]);
