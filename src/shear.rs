@@ -795,7 +795,12 @@ mod tests {
     fn face_pass_plan_follows_staged_sizes() {
         let dir = std::env::temp_dir().join(format!("fast-map-shear-plan-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        for (name, bytes) in [("i", 10 * 8), ("v", 40 * 16), ("ws", 3 * 7 * 4), ("n", 10 * 12)] {
+        for (name, bytes) in [
+            ("i", 10 * 8),
+            ("v", 40 * 16),
+            ("ws", 3 * 7 * 4),
+            ("n", 10 * 12),
+        ] {
             fs::write(dir.join(name), vec![0_u8; bytes]).unwrap();
         }
         let mesh = MeshRequest {
