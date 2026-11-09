@@ -50,10 +50,15 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      # The self-hosted Windows image has rustup on PATH but may lack the cargo/rustc
-      # proxies (CARGO_HOME=C:\rust\cargo). Put the pinned toolchain's bin on PATH.
+      # Windows builds with pip's maturin, not maturin-action. On the self-hosted Windows
+      # image the action fails: it calls `rustc +<toolchain>`, which needs the rustup
+      # proxies the image lacks (CARGO_HOME=C:\rust\cargo), and it unpacks with Windows
+      # PowerShell 5.1. Same maturin version, toolchain, target and arguments as the action.
       - uses: dtolnay/rust-toolchain@1.99.1
         if: runner.os == 'Windows'
+        with:
+          targets: ${{ matrix.target }}
+          components: llvm-tools-preview
       - name: Put the toolchain's cargo on PATH
         if: runner.os == 'Windows'
         shell: bash
@@ -61,7 +66,14 @@ jobs:
           cargo_exe="$(rustup which cargo)"
           cargo_exe="${cargo_exe//\\//}"
           echo "${cargo_exe%/*}" >> "$GITHUB_PATH"
+      - name: Build wheel (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python -m pip install maturin==1.15.0
+          python -m maturin build --release --locked --out dist-unsanitized --target "${{ matrix.target }}"
       - uses: PyO3/maturin-action@v1
+        if: runner.os != 'Windows'
         with:
           maturin-version: '1.15.0'
           rust-toolchain: '1.99.1'
