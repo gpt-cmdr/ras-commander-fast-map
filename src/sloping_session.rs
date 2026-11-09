@@ -167,6 +167,11 @@ pub struct Request {
     /// to `max/`; per-profile products are then not written or streamed.
     #[serde(default)]
     pub reduce_max: bool,
+    /// Max shear stress (`rasmapper-face-shear-max/1`): per-mesh face tables
+    /// and stored output-time series; the request's single profile must be
+    /// the Max profile (cell `Maximum Water Surface`).
+    #[serde(default)]
+    pub shear_stress: Option<crate::shear::Request>,
 
     /// Declares `terrain` as the top-priority source of a registered terrain.
     #[serde(default)]
@@ -216,6 +221,8 @@ struct RenderedProfile {
     wse: Vec<f32>,
     velocity: Option<Vec<f32>>,
     derived: Vec<Vec<f32>>,
+    shear: Option<Vec<f32>>,
+    shear_seconds: f64,
     hydraulic_seconds: f64,
     render_seconds: f64,
     finalize_seconds: f64,
@@ -243,10 +250,12 @@ fn render(
     pinned: Option<&PinnedHydraulics>,
     storage: Option<&crate::storage_area::StorageAreaPixels>,
     products: &DerivedPlan<'_>,
+    shear: Option<&ShearPlan>,
     source_shape: [usize; 2],
 ) -> Result<RenderedProfile, MapError> {
     let tick = Instant::now();
-    let cache_key = if (hydraulic_cache.is_some() || pinned.is_some()) && normals.is_none() {
+    let needs_cells = normals.is_some() || shear.is_some();
+    let cache_key = if (hydraulic_cache.is_some() || pinned.is_some()) && !needs_cells {
         let mut key =
             serde_json::to_string(&options).map_err(|e| MapError::Invalid(e.to_string()))?;
         for file in &profile.values_files {
@@ -276,7 +285,7 @@ fn render(
             new_prepared.push(sloping::prepare_profile_with_options(
                 mesh, stencil, &wse, 0.001, pool, options,
             )?);
-            if normals.is_some() {
+            if needs_cells {
                 cell_values.push(wse);
             }
         }
@@ -382,11 +391,34 @@ fn render(
         }
         _ => None,
     };
+    let mut shear_seconds = 0.0;
+    let shear = match shear {
+        Some(plan) => {
+            let shear_tick = Instant::now();
+            let clip =
+                crate::shear::clip_depth(plan.depth, &depth, window, meshes, &cell_values, pool)?;
+            let inputs: Vec<_> = meshes
+                .iter()
+                .zip(stencils)
+                .zip(&cell_values)
+                .zip(&plan.facepoints)
+                .map(|(((mesh, stencil), wse), fp)| {
+                    (mesh, stencil.as_slice(), wse.as_slice(), fp.as_slice())
+                })
+                .collect();
+            let values = crate::shear::render(&inputs, window, &clip, pool, source_shape)?;
+            shear_seconds = shear_tick.elapsed().as_secs_f64();
+            Some(values)
+        }
+        None => None,
+    };
     Ok(RenderedProfile {
         depth,
         wse,
         velocity,
         derived,
+        shear,
+        shear_seconds,
         hydraulic_seconds,
         render_seconds,
         finalize_seconds,
@@ -397,6 +429,46 @@ fn render(
         finite_pixels,
         flooded_pixels,
     })
+}
+
+/// Max shear stress of one request: facepoint values per mesh and the clip.
+struct ShearPlan {
+    depth: crate::velocity::VelocityDepth,
+    facepoints: Vec<Vec<f32>>,
+}
+
+/// Validates the shear-stress block before any read.
+fn validate_shear(req: &Request) -> Result<(), MapError> {
+    let Some(shear) = &req.shear_stress else {
+        return Ok(());
+    };
+    crate::shear::factor(&shear.units)?;
+    if shear.meshes.len() != req.mesh_files.len() {
+        return Err(MapError::Invalid(
+            "shear_stress needs one mesh entry per mesh file".into(),
+        ));
+    }
+    if shear
+        .meshes
+        .iter()
+        .any(|m| m.times == 0 || m.table_rows == 0)
+    {
+        return Err(MapError::Invalid(
+            "shear_stress needs stored output times and face tables".into(),
+        ));
+    }
+    if req.profiles.len() != 1
+        || req.options != sloping::Options::default()
+        || req.reduce_max
+        || req.geotiff_outputs
+        || req.storage_areas_file.is_some()
+        || req.storage_area_count != 0
+    {
+        return Err(MapError::Unsupported(
+            "shear stress is the Max profile only, on plain sloping without storage areas, reduction or native GeoTIFF".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Velocity clipping depth and derived products of one request.
@@ -588,6 +660,8 @@ pub fn method_record() -> Value {
         "derived_products":crate::velocity::DERIVED,
         "derived_method_id":crate::velocity::DERIVED_METHOD_ID,
         "derived_max":"reduce_max/1",
+        "shear_stress":crate::shear::METHOD_ID,
+        "shear_stress_depth":["rendered","horizontal"],
 
         "terrain_scope":crate::terrain_scope::METHOD_ID,
         "storage_area_surfaces":crate::storage_area::METHOD_ID,
@@ -753,6 +827,7 @@ fn run_internal(
                 || !req.derived_products.is_empty()
                 || req.gravity.is_some()
                 || req.reduce_max
+                || req.shear_stress.is_some()
                 || consumer.is_some()
                 || req.profiles.iter().any(|p| {
                     p.storage_area_values_file.is_some() || p.face_velocity_files.is_some()
@@ -802,6 +877,7 @@ fn run_internal(
             || req.velocity_normals_files.is_some()
             || req.storage_areas_file.is_some()
             || req.reduce_max
+            || req.shear_stress.is_some()
             || consumer.is_some())
     {
         return Err(MapError::Unsupported("row streaming requires plain-corner native GeoTIFF without velocity, storage, reduction or consumer".into()));
@@ -809,6 +885,12 @@ fn run_internal(
 
     req.options.validate()?;
     validate_derived(req)?;
+    validate_shear(req)?;
+    if req.shear_stress.is_some() && consumer.is_some() {
+        return Err(MapError::Unsupported(
+            "shear stress is delivered as files or streams, not to a consumer".into(),
+        ));
+    }
     if req.geotiff_outputs && (!req.stream_outputs || req.velocity_normals_files.is_some()) {
         return Err(MapError::Unsupported(
             "native GeoTIFF requires stream_outputs and no velocity".into(),
@@ -1141,6 +1223,11 @@ fn run_internal(
     } else {
         0
     };
+    // Shear: its output and an optional horizontal clipping depth.
+    let velocity_arrays = velocity_arrays
+        + req.shear_stress.as_ref().map_or(0, |s| {
+            1 + u64::from(s.depth == crate::velocity::VelocityDepth::Horizontal)
+        });
     let per_profile = (count as u64)
         .checked_mul(4 * velocity_arrays)
         .ok_or_else(|| MapError::Budget("velocity product plan overflow".into()))?;
@@ -1151,9 +1238,16 @@ fn run_internal(
     } else {
         0
     };
+    // The shear face pass (tables, normals, one output time's rows and
+    // per-face/facepoint arrays) runs once, before any profile.
+    let shear_face_pass = match &req.shear_stress {
+        Some(shear) => crate::shear::planned_bytes(base, shear)?,
+        None => 0,
+    };
     let admitted = admitted
         .checked_add(per_profile)
         .and_then(|v| v.checked_add(reduce))
+        .and_then(|v| v.checked_add(shear_face_pass))
         .ok_or_else(|| MapError::Budget("velocity product plan overflow".into()))?;
     let additional = additional
         .checked_add(per_profile)
@@ -1255,6 +1349,58 @@ fn run_internal(
                 depth: req.velocity_depth,
                 names: &req.derived_products,
                 gravity: req.gravity.unwrap_or(f32::NAN),
+            };
+            let shear_plan = match &req.shear_stress {
+                Some(shear) => {
+                    let shear_tick = Instant::now();
+                    let factor = crate::shear::factor(&shear.units)?;
+                    let mut facepoints = Vec::with_capacity(meshes.len());
+                    let mut faces = Vec::with_capacity(meshes.len());
+                    for (m, (mesh, input)) in meshes.iter().zip(&shear.meshes).enumerate() {
+                        let normals = crate::velocity::read_normals(
+                            &model::resolve(base, &input.normals_file),
+                            mesh.faces.len(),
+                        )?;
+                        let tables = crate::shear::read_tables(
+                            &model::resolve(base, &input.tables_info_file),
+                            &model::resolve(base, &input.tables_values_file),
+                            mesh.faces.len(),
+                            input.table_rows,
+                        )?;
+                        let geometry = crate::shear::FaceGeometry::new(mesh, &normals, &tables)?;
+                        let max = crate::shear::face_max_from_files(
+                            &geometry,
+                            &model::resolve(base, &input.water_surface_file),
+                            &model::resolve(base, &input.face_velocity_file),
+                            input.times,
+                            factor,
+                            &pool,
+                        )?;
+                        if deliver_files {
+                            crate::horizontal::write_values(
+                                &out.join(format!("shear_face_max-{m}.bin")),
+                                &max,
+                            )?;
+                        }
+                        faces.push(json!({"faces": max.len(), "times": input.times,
+                            "nonzero_faces": max.iter().filter(|&&v| v > 0.0).count()}));
+                        facepoints.push(crate::shear::facepoint_values(mesh, &max));
+                    }
+                    report["shear_stress"] = json!({"method": crate::shear::method_record(),
+                        "units": shear.units, "factor": factor,
+                        "depth": match shear.depth {
+                            crate::velocity::VelocityDepth::Rendered => "rendered",
+                            crate::velocity::VelocityDepth::Horizontal => "horizontal",
+                        },
+                        "face_files": deliver_files.then(|| (0..meshes.len()).map(|m| format!("shear_face_max-{m}.bin")).collect::<Vec<_>>()),
+                        "meshes": faces,
+                        "face_seconds": shear_tick.elapsed().as_secs_f64()});
+                    Some(ShearPlan {
+                        depth: shear.depth,
+                        facepoints,
+                    })
+                }
+                None => None,
             };
             let mut maxima = if req.reduce_max {
                 vec![vec![f32::NAN; count]; req.derived_products.len()]
@@ -1625,6 +1771,7 @@ fn run_internal(
                             .map(|s| &s.pinned_hydraulics),
                         storage.as_ref(),
                         &plan,
+                        shear_plan.as_ref(),
                         [terrain.width, terrain.height],
                     )
                 })?;
@@ -1636,6 +1783,8 @@ fn run_internal(
                         wse,
                         velocity,
                         derived,
+                        shear,
+                        shear_seconds,
                         hydraulic_seconds,
                         render_seconds,
                         finalize_seconds,
@@ -1675,6 +1824,9 @@ fn run_internal(
                         }
                         if !derived.is_empty() {
                             header["derived"] = json!(req.derived_products);
+                        }
+                        if shear.is_some() {
+                            header["shear_stress"] = true.into();
                         }
                         if req.geotiff_outputs {
                             let tick = Instant::now();
@@ -1724,6 +1876,9 @@ fn run_internal(
                             for values in &derived {
                                 crate::horizontal::write_f32(&mut stream, values)?;
                             }
+                            if let Some(values) = &shear {
+                                crate::horizontal::write_f32(&mut stream, values)?;
+                            }
                             stream.flush()?;
                         }
                         report["stream_seconds"] =
@@ -1742,8 +1897,16 @@ fn run_internal(
                                 values,
                             )?;
                         }
+                        if let Some(values) = &shear {
+                            crate::horizontal::write_values(&dir.join("shear_stress.bin"), values)?;
+                        }
                     }
-                    let unit = json!({"id":profile.id,"status":"complete","hydraulic_seconds":hydraulic_seconds,"render_seconds":render_seconds,"finalize_seconds":finalize_seconds,"velocity_seconds":velocity_seconds,"derived_seconds":derived_seconds,"storage_render_seconds":storage_render_seconds,"hydraulic_reused":hydraulic_reused});
+                    let mut unit = json!({"id":profile.id,"status":"complete","hydraulic_seconds":hydraulic_seconds,"render_seconds":render_seconds,"finalize_seconds":finalize_seconds,"velocity_seconds":velocity_seconds,"derived_seconds":derived_seconds,"storage_render_seconds":storage_render_seconds,"hydraulic_reused":hydraulic_reused});
+                    if let Some(values) = &shear {
+                        unit["shear_seconds"] = shear_seconds.into();
+                        unit["shear_valid_pixels"] =
+                            values.iter().filter(|v| !v.is_nan()).count().into();
+                    }
                     sink::write_json(&dir.join("unit.json"), &unit)?;
                     report["profiles"].as_array_mut().unwrap().push(unit);
                     if deliver_files {
@@ -1778,6 +1941,15 @@ fn run_internal(
         Ok(Ok(())) => report["status"] = "complete".into(),
         other => {
             report["status"] = "aborted".into();
+            if deliver_files && let Some(shear) = &req.shear_stress {
+                for m in 0..shear.meshes.len() {
+                    let _ = fs::remove_file(out.join(format!("shear_face_max-{m}.bin")));
+                    let _ = fs::remove_file(out.join(format!("shear_face_max-{m}.bin.partial")));
+                }
+                if let Some(record) = report.get_mut("shear_stress") {
+                    record["face_files"] = Value::Null;
+                }
+            }
             if req.export_physical_ownership {
                 let _ = fs::remove_file(out.join("owners.bin"));
                 let _ = fs::remove_file(out.join("owners.bin.partial"));
@@ -1794,6 +1966,7 @@ fn run_internal(
                     "depth.bin",
                     "wse.bin",
                     "velocity.bin",
+                    "shear_stress.bin",
                     "depth.bin.partial",
                     "wse.bin.partial",
                     "depth.tif",

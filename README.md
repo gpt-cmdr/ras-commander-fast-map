@@ -480,7 +480,9 @@ one sloping/horizontal output time) equal masks, at most 5 pixels within 2 ulp
 (the Davis velocity residual). These Davis comparisons do not qualify the
 original-source raw native grid: fresh 7.0.1 comparison stops at framing before
 pixels, and stored-tile-grid `/1` does not admit this layout. Storage areas,
-boundary requests and shear stress are outside this method.
+boundary requests and shear stress are outside this method. Max shear stress
+is its own method, `rasmapper-face-shear-max/1`: see
+[Max shear stress](docs/shear-stress.md).
 
 ## Whole-simulation products (arrival time, duration, percent inundated)
 

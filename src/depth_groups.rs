@@ -139,6 +139,7 @@ impl Request {
         self.model.options.validate()?;
         if self.model.options != crate::sloping::Options::default()
             || self.model.velocity_normals_files.is_some()
+            || self.model.shear_stress.is_some()
             || !self.model.derived_products.is_empty()
             || self.model.reduce_max
             || self.model.stream_outputs

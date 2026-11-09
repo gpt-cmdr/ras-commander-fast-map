@@ -689,14 +689,14 @@ pub fn read_face_velocity(path: &std::path::Path, faces: usize) -> Result<Vec<f3
 }
 
 #[derive(Clone, Copy)]
-struct SourceLattice {
+pub(crate) struct SourceLattice {
     origin: [f64; 2],
     tile: usize,
     pitch: f64,
 }
 
 impl SourceLattice {
-    fn new(gt: [f64; 6], tile: [usize; 2], shape: [usize; 2]) -> Result<Self, MapError> {
+    pub(crate) fn new(gt: [f64; 6], tile: [usize; 2], shape: [usize; 2]) -> Result<Self, MapError> {
         let [width, height] = shape;
         if width == 0
             || height == 0
@@ -741,12 +741,56 @@ impl SourceLattice {
         [min_x, cell, 0.0, max_y, 0.0, -cell]
     }
 
-    fn point(self, col: usize, row: usize) -> [f64; 2] {
+    pub(crate) fn point(self, col: usize, row: usize) -> [f64; 2] {
         let gt = self.tile_transform(col / self.tile, row / self.tile);
         [
             gt[0] + ((col % self.tile) as f64 + 0.5) * gt[1],
             gt[3] + ((row % self.tile) as f64 + 0.5) * gt[5],
         ]
+    }
+}
+
+impl SourceLattice {
+    /// Normalized position of a square cell's pixel (col, row) as
+    /// [`square_pixel`] steps it: the first covered centre normalized once,
+    /// then whole-pixel steps, clamped to (0.00001, 0.99999).
+    pub(crate) fn square_unit(
+        self,
+        left: f64,
+        bottom: f64,
+        right: f64,
+        top: f64,
+        col: usize,
+        row: usize,
+    ) -> [f64; 2] {
+        let gt = self.tile_transform(col / self.tile, row / self.tile);
+        let mut first_col = ((left - gt[0]) / gt[1]).floor() as i64;
+        if left > gt[0] + gt[1] * (first_col as f64 + 0.5) {
+            first_col += 1;
+        }
+        let mut first_row = ((gt[3] - top) / gt[1]).floor() as i64;
+        if top < gt[3] - gt[1] * (first_row as f64 + 0.5) {
+            first_row += 1;
+        }
+        first_col = first_col.max(0);
+        first_row = first_row.max(0);
+        let x0 = (gt[0] + gt[1] * (first_col as f64 + 0.5) - left) / (right - left);
+        let y0 = (gt[3] - gt[1] * (first_row as f64 + 0.5) - bottom) / (top - bottom);
+        let mut x = x0 + (gt[1] / (right - left)) * ((col % self.tile) as i64 - first_col) as f64;
+        let mut y = y0 + (-gt[1] / (top - bottom)) * ((row % self.tile) as i64 - first_row) as f64;
+        if x <= 0.0 {
+            x = 0.00001;
+        }
+        if x >= 1.0 {
+            x = 0.99999;
+        }
+        if y <= 0.0 {
+            y = 0.00001;
+        }
+        if y >= 1.0 {
+            y = 0.99999;
+        }
+        [x, y]
     }
 }
 
