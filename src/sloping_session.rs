@@ -1944,6 +1944,7 @@ fn run_internal(
             if deliver_files && let Some(shear) = &req.shear_stress {
                 for m in 0..shear.meshes.len() {
                     let _ = fs::remove_file(out.join(format!("shear_face_max-{m}.bin")));
+                    let _ = fs::remove_file(out.join(format!("shear_face_max-{m}.bin.partial")));
                 }
                 if let Some(record) = report.get_mut("shear_stress") {
                     record["face_files"] = Value::Null;

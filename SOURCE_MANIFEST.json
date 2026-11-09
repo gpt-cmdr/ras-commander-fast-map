@@ -351,7 +351,7 @@
     "src/sink.rs": "7a5d49e4580dd40eb283669955dd2660ad9e74b26846b43aa9813b10c12999ee",
     "src/sloping.rs": "726c378e94d10b94a3d54ea25aa1b1bfa9c4dccd1b6be6d8262734805b465c89",
     "src/sloping_binary.rs": "b31da37067a261afe77bafb4aa1713f65dbe195169f18c631860c3d907b41f62",
-    "src/sloping_session.rs": "8ffa59af5bbf27112cd04f7fd2ba688e3932733b6ae2c1cfe6eee505abd6ea25",
+    "src/sloping_session.rs": "e7b5709b88496d96d74d3cfc72a4946bf8fdceccf6e948ac9f6560d7c7c3408b",
     "src/step05.rs": "a6a3cfa98b40e697bba88a84a151afd7c688192553ca8b47654786f63a954d52",
     "src/storage_area.rs": "224f30c9ca5110ffa122242db00e754bdf0fc53bef1cb2f3ac94a54dd59f5631",
     "src/storage_session.rs": "2967c6e11a4d6aeb67203689055e00caaaf7ea229c149da1e5288603a3fd564a",
