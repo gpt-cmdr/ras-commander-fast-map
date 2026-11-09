@@ -676,9 +676,14 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
         Err(error) => {
             for item in fs::read_dir(out)? {
                 let path = item?.path();
-                if path
-                    .extension()
-                    .is_some_and(|e| e == "geojson" || e == "partial")
+                let diagnostic = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".units.json"));
+                if diagnostic
+                    || path
+                        .extension()
+                        .is_some_and(|e| e == "geojson" || e == "partial")
                 {
                     fs::remove_file(path)?;
                 }

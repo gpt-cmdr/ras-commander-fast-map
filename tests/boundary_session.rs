@@ -206,6 +206,28 @@ fn storage_source_fixture(folder: &std::path::Path, mask_value: u8, outside: boo
 }
 
 #[test]
+fn later_profile_failure_removes_completed_diagnostic_units() {
+    let folder = scratch();
+    let mut value = storage_source_fixture(&folder, 1, false);
+    value["model"]["threads"] = 1.into();
+    value["model"]["max_inflight_profiles"] = 1.into();
+    value["model"]["profiles"][1]["storage_area_values_file"] = "missing-levels".into();
+    let request: Request = serde_json::from_value(value).unwrap();
+    let out = folder.join("out");
+    assert!(boundary_session::run(&request, &folder, &out).is_err());
+    let report: Value =
+        serde_json::from_slice(&fs::read(out.join("report.json")).unwrap()).unwrap();
+    assert_eq!(report["status"], "aborted");
+    assert!(
+        fs::read_dir(&out)
+            .unwrap()
+            .all(|entry| entry.unwrap().file_name() == "report.json")
+    );
+    assert!(folder.join("levels").is_file());
+    fs::remove_dir_all(folder).unwrap();
+}
+
+#[test]
 fn native_row_metadata_preserves_parallel_storage_products_and_source_order() {
     let folder = scratch();
     let v = storage_source_fixture(&folder, 1, false);

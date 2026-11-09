@@ -37,7 +37,7 @@ computed rasters and native reference caches outside the repositories.
 
 Wheel builds retain their complete CycloneDX dependency graphs. Before smoke
 checks, checksums or artifact upload, run
-`python scripts/sanitize_wheel_sbom.py --input-dir dist-raw --output-dir dist`
+`python scripts/sanitize_wheel_sbom.py --input-dir dist-unsanitized --output-dir dist`
 to replace build-local workspace identifiers and their references
 with portable identifiers. The check must preserve component/dependency counts,
 validate every reference and regenerate `RECORD`; executable, license and other
