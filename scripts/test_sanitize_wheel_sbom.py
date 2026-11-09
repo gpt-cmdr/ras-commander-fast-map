@@ -108,6 +108,28 @@ class SanitizeWheelTests(unittest.TestCase):
             self.assertTrue(after["dependencies"][0]["dependsOn"][0].startswith(BASE + "#target/"))
             repair.validate_record({info.filename: archive.read(info) for info in archive.infolist()}, RECORD)
 
+    def test_cargo_version_only_fragment_with_matching_directory_preserves_graph(self):
+        expected, _ = repair.sanitize_document(document(), repair.PROJECT, "0.14.0")
+        for root in (
+                "path+file:///home/runner/work/ras-commander-fast-map/ras-commander-fast-map#0.14.0",
+                "path+file:///C:/workspace/ras-commander-fast-map#0.14.0"):
+            with self.subTest(root=root):
+                value = json.loads(json.dumps(document()).replace(OLD, root))
+                actual, graph = repair.sanitize_document(value, repair.PROJECT, "0.14.0")
+                self.assertEqual(actual, expected)
+                self.assertEqual(graph["components"], 4)
+                self.assertEqual(graph["dependency_nodes"], 4)
+                self.assertEqual(graph["dependency_edges"], 4)
+
+    def test_version_only_workspace_identity_refuses_wrong_name_version_or_host(self):
+        for root in (
+                "path+file:///workspace/different-package#0.14.0",
+                "path+file:///workspace/ras-commander-fast-map#9.9.9",
+                "path+file://remote-host/workspace/ras-commander-fast-map#0.14.0"):
+            with self.subTest(root=root):
+                value = json.loads(json.dumps(document()).replace(OLD, root))
+                self.assert_rejected(value, "Unknown local workspace identity")
+
     def test_zip_attributes_and_unchanged_compressed_streams_are_preserved(self):
         source = wheel(self.root)
         result = repair.sanitize_wheel(source, self.root / "fixed")

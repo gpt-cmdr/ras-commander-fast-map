@@ -129,7 +129,12 @@ def sanitize_document(document, package, version):
     if original_root != base:
         require(original_root.startswith("path+file://"), "Unknown workspace identity")
         uri = urlsplit(original_root[len("path+"):])
-        require(uri.scheme == "file" and uri.path and not uri.query and uri.fragment == f"{package}@{version}",
+        # Cargo omits the package name when it equals the URL's final path
+        # component (Cargo Book, Package ID specifications). This occurs in
+        # normal repository-named Linux CI checkouts as well as local builds.
+        named = uri.fragment == f"{package}@{version}"
+        inferred = uri.fragment == version and PurePosixPath(uri.path).name == package
+        require(uri.scheme == "file" and not uri.netloc and uri.path and not uri.query and (named or inferred),
                 "Unknown local workspace identity")
     mapping = {original_root: base}
     root["bom-ref"] = base
