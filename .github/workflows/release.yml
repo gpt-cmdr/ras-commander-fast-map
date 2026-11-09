@@ -11,8 +11,11 @@ on:
 permissions:
   contents: read
 jobs:
+  # Tag pushes and dispatches only (no pull_request), so no fork guard is needed. Build jobs
+  # run on CLB's self-hosted Slurm runners; github-release, pypi and crates stay
+  # GitHub-hosted (the CLB Linux runner has no gh CLI; the PyPI publish action runs in Docker).
   version:
-    runs-on: ubuntu-latest
+    runs-on: ["self-hosted", "Linux", "X64", "clb-ci-linux"]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -38,7 +41,7 @@ jobs:
   sdist:
     if: ${{ !inputs.publish_existing }}
     needs: version
-    runs-on: ubuntu-latest
+    runs-on: ["self-hosted", "Linux", "X64", "clb-ci-linux"]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.99.1

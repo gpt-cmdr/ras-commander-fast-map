@@ -10,7 +10,8 @@ env:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    # CLB self-hosted Slurm runner; pull requests from forks stay GitHub-hosted.
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && '["ubuntu-latest"]' || '["self-hosted", "Linux", "X64", "clb-ci-linux"]') }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.99.1
@@ -32,19 +33,34 @@ jobs:
       matrix:
         include:
           - os: windows-latest
+            self_hosted: '["self-hosted", "Windows", "X64", "clb-ci-windows"]'
             target: x86_64-pc-windows-msvc
             manylinux: auto
             platform: windows-x86_64
+          # The Linux wheel stays GitHub-hosted: maturin-action builds manylinux_2_28
+          # in Docker, which the CLB Linux runner does not have.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             manylinux: '2_28'
             platform: linux-x86_64
-    runs-on: ${{ matrix.os }}
+    # Fork pull requests -> GitHub-hosted matrix.os; otherwise the self-hosted labels.
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && format('["{0}"]', matrix.os) || matrix.self_hosted || format('["{0}"]', matrix.os)) }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
+      # The self-hosted Windows image has rustup on PATH but may lack the cargo/rustc
+      # proxies (CARGO_HOME=C:\rust\cargo). Put the pinned toolchain's bin on PATH.
+      - uses: dtolnay/rust-toolchain@1.99.1
+        if: runner.os == 'Windows'
+      - name: Put the toolchain's cargo on PATH
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo_exe="$(rustup which cargo)"
+          cargo_exe="${cargo_exe//\\//}"
+          echo "${cargo_exe%/*}" >> "$GITHUB_PATH"
       - uses: PyO3/maturin-action@v1
         with:
           maturin-version: '1.15.0'
