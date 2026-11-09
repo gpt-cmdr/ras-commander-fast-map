@@ -319,9 +319,10 @@ Boundary generation supports physical 2D cells with horizontal or plain corner
 sloping surfaces. Cell-face interpolation, shallow-to-horizontal controls and
 face depth weighting are rejected. Supply one original, unmodified float32
 terrain TIFF and its matching terrain HDF metadata. Retiled/cropped TIFFs,
-terrain modifications and multi-source mosaics are outside this boundary scope.
-Commander rejects models containing 1D elements; boundary requests refuse
-storage-area surfaces.
+terrain modifications and multi-source mosaics are outside the schema `/1` scope.
+For schema `/1`, Commander rejects models containing 1D elements and boundary
+requests refuse storage-area surfaces. See the native serial contract below
+for schema `/2`.
 
 The method retains valid negative depths to locate the zero-depth crossings.
 The intrinsic cell-wet gate uses float32 `WSE > minimum_elevation + 0.001`;

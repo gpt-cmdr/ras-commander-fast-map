@@ -497,14 +497,17 @@ fn prepare_tile(
             } else {
                 continue;
             };
-            if v.is_infinite() {
-                return Err(invalid("infinite boundary terrain sample"));
-            }
             if native {
+                if v.is_infinite() {
+                    return Err(invalid("infinite boundary terrain sample"));
+                }
                 // Native tile/perimeter buffers use the fixed Float32 sentinel,
                 // without interpreting the original TIFF's nodata metadata.
                 ground[k] = native_ground(f64::from(v));
             } else if let Some(v) = terrain.classify(v) {
+                if !v.is_finite() {
+                    return Err(invalid("infinite boundary terrain sample"));
+                }
                 ground[k] = Some(v as f32);
             }
         }
@@ -1553,6 +1556,65 @@ fn execute(req: &Request, base: &Path, out: &Path, report: &mut Value) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_infinite_nodata_is_dry_but_other_infinities_and_native_samples_refuse() {
+        use crate::effective_terrain::{self, Effective, Grid};
+        let folder =
+            std::env::temp_dir().join(format!("boundary-infinite-nodata-{}", std::process::id()));
+        fs::create_dir(&folder).unwrap();
+        let path = folder.join("terrain.tif");
+        effective_terrain::write_geotiff(
+            &path,
+            Effective {
+                grid: Grid {
+                    origin_x: 0.,
+                    origin_y: 4.,
+                    cell_size: 1.,
+                    width: 4,
+                    height: 4,
+                },
+                values: vec![0.; 16],
+                report: Value::Null,
+            },
+            2227,
+        )
+        .unwrap();
+        let mut terrain = NativeTerrain::open(
+            path.to_str().unwrap(),
+            2227,
+            &model::CrsIdentity::Epsg,
+            QueryConvention::PixelCenter,
+            NodataPolicy::Dry,
+            1 << 20,
+        )
+        .unwrap();
+        let metadata: TerrainMetadata = serde_json::from_value(json!({
+            "shape":[4,4], "transform":[0,1,0,4,0,-1], "tile_shape":[256,256],
+            "tile_grid":[1,1], "selected_tiles":[0],
+            "mask":{"path":"unused","dtype":"|u1","shape":[1,65536]},
+            "perimeter":{"path":"unused","dtype":"<f4","shape":[1,513]}
+        }))
+        .unwrap();
+        let owners = Owners::empty();
+        for sentinel in [f32::INFINITY, f32::NEG_INFINITY] {
+            terrain.nodata = Some(f64::from(sentinel));
+            let mask = vec![1; TILE * TILE];
+            let perimeter = vec![sentinel; 513];
+            let sample = |terrain: &NativeTerrain, native| {
+                prepare_tile(
+                    0, 0, &metadata, &mask, &perimeter, terrain, &owners, &owners, true, native,
+                )
+            };
+            let legacy = sample(&terrain, false).unwrap();
+            assert_eq!(legacy.ground[0], Some(0.));
+            assert_eq!(legacy.ground[TILE], None);
+            assert!(sample(&terrain, true).is_err());
+            terrain.nodata = Some(-9999.);
+            assert!(sample(&terrain, false).is_err());
+        }
+        drop(terrain);
+        fs::remove_dir_all(folder).unwrap();
+    }
     #[test]
     fn native_ground_uses_global_float32_sentinel_not_source_nodata() {
         assert_eq!(native_ground(-32768.0), Some(-32768.0));
