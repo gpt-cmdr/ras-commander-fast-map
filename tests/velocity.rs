@@ -134,3 +134,51 @@ fn derived_capabilities_are_advertised() {
         "rasmapper-depth-velocity-products/1"
     );
 }
+
+#[test]
+fn with_faces_velocity_capability_is_advertised() {
+    let record = sloping_session::method_record();
+    assert_eq!(
+        record["velocity_with_faces"],
+        "rasmapper-with-faces-velocity-derived/1"
+    );
+    assert_eq!(
+        record["velocity_with_faces_options"],
+        json!(["reduce_shallow_to_horizontal", "use_depth_weighted_faces"])
+    );
+    assert!(
+        record["velocity_render_modes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("slopingPretty"))
+    );
+}
+
+#[test]
+fn with_faces_options_admit_velocity_and_max_derived() {
+    // Every slopingPretty option combination passes request validation with
+    // velocity, derived products and reduce_max; only the absent inputs fail.
+    for (shallow, weighted) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut v = with_velocity();
+        v["options"] = json!({"render_mode":"slopingPretty",
+            "reduce_shallow_to_horizontal":shallow,"use_depth_weighted_faces":weighted});
+        v["derived_products"] = json!(["depth_x_velocity", "depth_x_velocity_squared", "froude"]);
+        v["gravity"] = json!(32.174);
+        v["reduce_max"] = json!(true);
+        let folder = scratch();
+        let r: sloping_session::Request = serde_json::from_value(v).unwrap();
+        let err = sloping_session::run(&r, &folder, &folder.join("out")).unwrap_err();
+        let text = err.to_string();
+        assert_ne!(err.kind(), "unsupported", "{shallow} {weighted}: {text}");
+        for word in [
+            "velocity",
+            "derived",
+            "reduce_max",
+            "slopingPretty",
+            "shallow",
+        ] {
+            assert!(!text.contains(word), "{shallow} {weighted}: {text}");
+        }
+        fs::remove_dir_all(folder).unwrap();
+    }
+}

@@ -583,6 +583,8 @@ pub fn method_record() -> Value {
         "velocity":crate::velocity::METHOD_ID,
         "velocity_depth":["rendered","horizontal"],
         "velocity_render_modes":["horizontal","sloping","slopingPretty"],
+        "velocity_with_faces":crate::velocity::WITH_FACES_METHOD_ID,
+        "velocity_with_faces_options":["reduce_shallow_to_horizontal","use_depth_weighted_faces"],
         "derived_products":crate::velocity::DERIVED,
         "derived_method_id":crate::velocity::DERIVED_METHOD_ID,
         "derived_max":"reduce_max/1",
