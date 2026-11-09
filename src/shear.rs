@@ -6,7 +6,7 @@
 //! `Maximum Shear`), and the stored map interpolates those face scalars:
 //!
 //! 1. face water surfaces: the sloping face classification already used by
-//!    the WSE renderer (`Mesh::reconstruct`, RAS Mapper `ComputeFaceWSsNew`);
+//!    the WSE renderer (`Mesh::reconstruct`);
 //! 2. face hydraulic radius, connected faces only, at the face water surface
 //!    `ValueA` from the HDF `Faces Area Elevation` table: area and top width by
 //!    linear interpolation of area over elevation (above the table, the last
@@ -18,8 +18,8 @@
 //!    inverse polyline-length weights (`ComputeSlopingFacepointVelocities_LeastSquares`);
 //!    zero where every incident face is dry on both sides;
 //! 4. face true velocity of a connected face: the mean of its two facepoint
-//!    arc vectors (`ComputeFaceTrueVelocities`); other faces: zero;
-//! 5. face shear (`ComputeFaceTrueShear`): `k * |V| * V * n^2 / R^(1/3)` in
+//!    arc vectors; other faces: zero;
+//! 5. face shear: `k * |V| * V * n^2 / R^(1/3)` in
 //!    binary32 with `R^(1/3)` from binary64 `pow`, `k` = 28.258362 (US
 //!    Customary, 62.4 / 1.486^2) or 9810 (SI), `n` the face's first `Faces Area
 //!    Elevation` Manning's n; zero when `V = 0` or `R = 0`;
@@ -27,7 +27,7 @@
 //!    (initial 0, strict `>`);
 //! 7. pixels: each facepoint takes the binary32 mean of its incident faces'
 //!    Max values, painted with the plain sloping facepoint weights
-//!    (`FacepointWeightedPaint`) in cells whose Max WSE passes the native wet
+//!    in cells whose Max WSE passes the native wet
 //!    gate, drawn where the clipping depth is > 0. The values do not depend on
 //!    the WSE render mode; the active mode's Max depth is the mask.
 //!
@@ -46,7 +46,7 @@ use std::{
 };
 
 pub const METHOD_ID: &str = "rasmapper-face-shear-max/1";
-/// RAS Mapper `MeshFV2D.ComputeFaceTrueShear` unit factors (binary32).
+/// RAS Mapper's face-shear unit factors (binary32).
 pub const FACTOR_US: f32 = 28.258362;
 pub const FACTOR_SI: f32 = 9810.0;
 /// RAS Mapper's `MinWSPlotTolerance` (cell wet gate and face classification).
@@ -58,7 +58,7 @@ pub fn method_record() -> serde_json::Value {
         "product": "shear stress (lb/ft2 or N/m2), RAS Mapper stored-map Max rule, independent of the WSE render mode",
         "profiles": ["Max"],
         "inputs": "per mesh: HDF face normals with polyline face lengths, Faces Area Elevation Info/Values (elevation, area, wetted perimeter, Manning's n), and every stored output time's cell Water Surface and Face Velocity; the request profile supplies Maximum Water Surface",
-        "face_water_surface": "sloping face classification (ComputeFaceWSsNew); connected = not None and not Levee",
+        "face_water_surface": "sloping face classification; connected = not None and not Levee",
         "hydraulic_radius": "connected faces at ValueA: area/top width by linear area interpolation (beyond the table: last area + polyline length * excess), perimeter P[i-1]*t + P[i]*(1-t) (constant beyond), R = area / perimeter in binary32; 0 elsewhere",
         "facepoint_velocity": "inverse polyline-length weighted least squares of the face-normal velocities over each hydraulically connected arc; zero where every incident face is dry",
         "face_velocity": "connected faces: mean of the two facepoint arc vectors; others zero",
@@ -162,7 +162,7 @@ impl FaceTables {
         &self.rows[self.start[face]..self.start[face] + self.count[face]]
     }
 
-    /// `ComputeFaceAreaAndTopWidth` then `ComputeFacePerimeter`; `area / perimeter`.
+    /// Face area and top width, then wetted perimeter; `area / perimeter`.
     pub fn hydraulic_radius(&self, face: usize, ws: f32, face_length: f32) -> f32 {
         let t = self.table(face);
         let last = t[t.len() - 1];
@@ -242,7 +242,7 @@ fn arc(corner: &Corner, slot: usize, connected: impl Fn(usize) -> bool) -> (usiz
     (start, end)
 }
 
-/// Facepoint arc vectors (`ComputeFacePointVelocity_FacePerpLeastSquares_Weighted`).
+/// Facepoint arc vectors: length-weighted least squares of the face-normal velocities.
 fn facepoint_vectors(
     corner: &Corner,
     water: &[FaceWater],
@@ -370,7 +370,7 @@ impl<'a> FaceGeometry<'a> {
     }
 }
 
-/// `ComputeFaceTrueShear` then `Vector2D.Magnitude`.
+/// Face shear vector, then its magnitude.
 pub fn shear_magnitude(v: [f32; 2], n: f32, r: f32, factor: f32) -> f32 {
     let [x, y] = v;
     if (x == 0.0 && y == 0.0) || r == 0.0 {
@@ -392,8 +392,7 @@ pub fn accumulate(max: &mut [f32], values: &[f32]) {
     }
 }
 
-/// Facepoint scalar: binary32 mean of the incident faces' values in ring order
-/// (`AverageFaceScalarsToFacepointValuesSA`).
+/// Facepoint scalar: binary32 mean of the incident faces' values in ring order.
 pub fn facepoint_values(mesh: &Mesh, face_values: &[f32]) -> Vec<f32> {
     mesh.corners
         .iter()

@@ -18,8 +18,8 @@ scalars. Shear stress is not stored in the plan HDF; it is derived.
 At each stored output time, per mesh:
 
 1. **Face water surface.** Each face is classified from its two cells' water
-   surfaces with RAS Mapper's adjusted face rule (`ComputeFaceWSsNew`, the same
-   classification the sloping WSE renderer uses). A face is *connected* unless
+   surfaces with RAS Mapper's adjusted face rule (the same classification the
+   sloping WSE renderer uses). A face is *connected* unless
    it is `None` (a dry cell, a perimeter face, or both sides below the face
    minimum) or `Levee`. Its water surface is `ValueA`.
 2. **Hydraulic radius** (connected faces only; other faces 0). From the face's
@@ -44,9 +44,9 @@ At each stored output time, per mesh:
    (`ComputeSlopingFacepointVelocities_LeastSquares`.) This is not the C-stencil
    reconstruction the velocity map uses.
 4. **Face velocity.** A connected face takes the mean of the arc vectors of its
-   two facepoints at that face (`ComputeFaceTrueVelocities`); other faces get
+   two facepoints at that face; other faces get
    zero.
-5. **Face shear** (`ComputeFaceTrueShear`):
+5. **Face shear:**
    `tau = k * |V| * V * n * n / float32(pow(R, 0.33333333333333337))`, evaluated
    left to right in binary32 with the root from a binary64 `pow`, where
    `k = 28.258362` for US Customary (62.4 / 1.486^2) and `9810` for SI, and `n` is
@@ -57,13 +57,13 @@ At each stored output time, per mesh:
 6. **Max.** Per face, the largest magnitude over every stored output time
    (start 0, replace only on a strictly larger value).
 
-Rendering (`ShearRenderer`, Max branch):
+Rendering (Max):
 
 7. Each facepoint takes the binary32 mean of its incident faces' Max values,
-   in ring order (`AverageFaceScalarsToFacepointValuesSA`), including dry and
+   in ring order, including dry and
    perimeter faces, whose Max is 0.
 8. Pixels are painted from the cell's facepoint values with the **plain
-   sloping facepoint weights** (`FacepointWeightedPaint` with `FPPrevWeights`),
+   sloping facepoint weights**,
    the weights plain sloping WSE uses, on the native source-tile lattice for
    square cells. A cell is skipped when its Max WSE is `<= minimum + 0.001`.
 9. A pixel is drawn where the clipping depth is `> 0`. The values do **not**
@@ -72,18 +72,11 @@ Rendering (`ShearRenderer`, Max branch):
    depth, `"horizontal"` the cell-constant Max depth (RAS Mapper's horizontal
    mode).
 
-Sources: RAS Mapper 7.0.1 behaviour, read from `RasMapperLib.dll`
-(`Render.ShearRenderer.Compute`, `PostProcessor.ComputeMaxMinShear2D` and
-`ComputePostProcessHydraulicFaceProperties`, `MeshFV2D.ComputeFaceTrueShear`,
-`ComputeFaceTrueVelocities`, `ComputeFacePointVelocity_FacePerpLeastSquares_Weighted`,
-`ComputeFaceAreaAndTopWidth`, `ComputeFacePerimeter`, `ComputeFaceWSsNew`,
-`RASD2FlowArea.ReadFaceMannValues`, `Render.Renderer.ComputeFromFaceScalarValues`),
-and checked against native stored maps and the PostProcessing `Maximum Shear`
-datasets RAS Mapper wrote for them (below). No decompiled code is in this
-repository. The rule is the open-channel boundary shear `tau = gamma R S_f`
-with a Manning friction slope. The HEC-RAS user documentation does not state
-the face, hydraulic-radius and Max details above, so they were read from the
-implementation and qualified against its output.
+Qualification: every rule above is checked against RAS Mapper 7.0.1 output,
+the native stored maps and the PostProcessing `Maximum Shear` datasets RAS
+Mapper wrote for them (below). The rule is the open-channel boundary shear
+`tau = gamma R S_f` with a Manning friction slope. Scope: pure 2D models,
+built for FIM library creation, not general use across all model types.
 
 ## Request
 

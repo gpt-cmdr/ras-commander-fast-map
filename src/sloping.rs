@@ -807,7 +807,7 @@ impl CellStencil {
     pub(crate) fn face_ids(&self) -> impl Iterator<Item = usize> + '_ {
         self.faces.iter().map(|f| f[0])
     }
-    /// Plain facepoint weights at `point` (RAS Mapper `FPPrevWeights`):
+    /// Plain facepoint weights at `point`:
     /// the square or polygon weights painted by plain-corner sloping.
     pub(crate) fn plain_weights<'a>(
         &self,
