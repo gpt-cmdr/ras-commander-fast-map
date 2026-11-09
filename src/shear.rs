@@ -445,6 +445,13 @@ pub fn planned_bytes(base: &Path, request: &Request) -> Result<u64, MapError> {
     for mesh in &request.meshes {
         let faces = size(&mesh.tables_info_file)? / 8;
         let values = size(&mesh.tables_values_file)?;
+        // Normals are read whole: refuse a size that disagrees with the face
+        // count before admission, so no oversized file is loaded.
+        if size(&mesh.normals_file)? != faces * 12 || values != mesh.table_rows as u64 * 16 {
+            return Err(MapError::Invalid(
+                "shear stress normals or table sizes disagree with the face count".into(),
+            ));
+        }
         let cells = size(&mesh.water_surface_file)? / (4 * mesh.times.max(1) as u64);
         let bytes = values
             .checked_mul(3)
@@ -788,7 +795,7 @@ mod tests {
     fn face_pass_plan_follows_staged_sizes() {
         let dir = std::env::temp_dir().join(format!("fast-map-shear-plan-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        for (name, bytes) in [("i", 10 * 8), ("v", 40 * 16), ("ws", 3 * 7 * 4)] {
+        for (name, bytes) in [("i", 10 * 8), ("v", 40 * 16), ("ws", 3 * 7 * 4), ("n", 10 * 12)] {
             fs::write(dir.join(name), vec![0_u8; bytes]).unwrap();
         }
         let mesh = MeshRequest {
@@ -807,6 +814,8 @@ mod tests {
         };
         let one = 40 * 16 * 3 + 10 * 124 + 7 * 8 + (4 << 20);
         assert_eq!(planned_bytes(&dir, &request).unwrap(), 2 * one);
+        fs::write(dir.join("n"), vec![0_u8; 11 * 12]).unwrap();
+        assert!(planned_bytes(&dir, &request).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 
