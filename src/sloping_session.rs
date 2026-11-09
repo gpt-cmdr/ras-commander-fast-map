@@ -1238,9 +1238,16 @@ fn run_internal(
     } else {
         0
     };
+    // The shear face pass (tables, normals, one output time's rows and
+    // per-face/facepoint arrays) runs once, before any profile.
+    let shear_face_pass = match &req.shear_stress {
+        Some(shear) => crate::shear::planned_bytes(base, shear)?,
+        None => 0,
+    };
     let admitted = admitted
         .checked_add(per_profile)
         .and_then(|v| v.checked_add(reduce))
+        .and_then(|v| v.checked_add(shear_face_pass))
         .ok_or_else(|| MapError::Budget("velocity product plan overflow".into()))?;
     let additional = additional
         .checked_add(per_profile)

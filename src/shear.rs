@@ -432,6 +432,37 @@ fn expect_len(path: &Path, bytes: u64) -> Result<(), MapError> {
     Ok(())
 }
 
+/// Planned bytes of the face pass, from the staged file sizes (no reads):
+/// per mesh the raw and parsed tables, normals and per-face working arrays
+/// (inverse lengths, slots, face water, facepoint ring vectors, shear, Max,
+/// facepoint values), one cell row and one face row with their read buffers;
+/// every mesh's facepoint values are retained for rendering.
+pub fn planned_bytes(base: &Path, request: &Request) -> Result<u64, MapError> {
+    let size = |name: &str| -> Result<u64, MapError> {
+        Ok(fs::metadata(crate::model::resolve(base, name))?.len())
+    };
+    let mut total = 0_u64;
+    for mesh in &request.meshes {
+        let faces = size(&mesh.tables_info_file)? / 8;
+        let values = size(&mesh.tables_values_file)?;
+        let cells = size(&mesh.water_surface_file)? / (4 * mesh.times.max(1) as u64);
+        let bytes = values
+            .checked_mul(3)
+            .and_then(|v| {
+                v.checked_add(
+                    faces.checked_mul(8 + 12 + 12 + 4 + 16 + 12 + 16 + 24 + 4 + 4 + 4 + 8)?,
+                )
+            })
+            .and_then(|v| v.checked_add(cells.checked_mul(8)?))
+            .and_then(|v| v.checked_add(4 << 20))
+            .ok_or_else(|| MapError::Budget("shear stress plan overflow".into()))?;
+        total = total
+            .checked_add(bytes)
+            .ok_or_else(|| MapError::Budget("shear stress plan overflow".into()))?;
+    }
+    Ok(total)
+}
+
 /// Loads the staged `Faces Area Elevation` table of one mesh.
 pub fn read_tables(
     info: &Path,
@@ -751,6 +782,32 @@ mod tests {
         };
         let values = facepoint_values(&mesh, &[0.1, 0.2, 0.7]);
         assert_eq!(values, vec![(0.1_f32 + 0.2 + 0.7) / 3.0, 0.7]);
+    }
+
+    #[test]
+    fn face_pass_plan_follows_staged_sizes() {
+        let dir = std::env::temp_dir().join(format!("fast-map-shear-plan-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for (name, bytes) in [("i", 10 * 8), ("v", 40 * 16), ("ws", 3 * 7 * 4)] {
+            fs::write(dir.join(name), vec![0_u8; bytes]).unwrap();
+        }
+        let mesh = MeshRequest {
+            normals_file: "n".into(),
+            tables_info_file: "i".into(),
+            tables_values_file: "v".into(),
+            table_rows: 40,
+            times: 3,
+            water_surface_file: "ws".into(),
+            face_velocity_file: "fv".into(),
+        };
+        let request = Request {
+            units: "US Customary".into(),
+            depth: VelocityDepth::Rendered,
+            meshes: vec![mesh.clone(), mesh],
+        };
+        let one = 40 * 16 * 3 + 10 * 124 + 7 * 8 + (4 << 20);
+        assert_eq!(planned_bytes(&dir, &request).unwrap(), 2 * one);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
