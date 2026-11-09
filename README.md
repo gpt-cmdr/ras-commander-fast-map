@@ -570,8 +570,9 @@ whole-simulation requests a pool pixel is wet when its depth is strictly greater
 than the threshold; there is no cell gate. Pixels owned by both a 2D cell and a
 storage area, or by two storage areas, are refused (RAS Mapper's ordering for
 those layouts is not qualified), as are velocity with storage areas, duration
-with storage areas, boundary requests with storage areas and storage-area pixels outside a top-priority
-source's footprint.
+with storage areas, schema `/1` boundary requests with storage areas, and
+storage-area pixels outside a top-priority source's footprint. Native schema
+`/2` boundaries use the separate native serial contract above.
 
 Qualification against native HEC-RAS 7.0.1 stored maps (RAS Mapper terrain
 export, valid masks and float32 bits):
