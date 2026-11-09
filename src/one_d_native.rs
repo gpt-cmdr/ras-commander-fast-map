@@ -50,6 +50,41 @@ pub struct Window {
     pub height: usize,
 }
 
+/// One complete native sample raster, independent of the ordinary tile lattice.
+/// Boundary callers supply the extended 257-sample tile's actual bounds.
+#[derive(Clone, Copy, Debug)]
+pub struct SampleRaster {
+    /// Projected [min_x, min_y, max_x, max_y], without coordinate conversion.
+    pub bounds: [f64; 4],
+    pub size: usize,
+}
+
+impl SampleRaster {
+    fn tile(self) -> Result<Tile, MapError> {
+        let [min_x, min_y, max_x, max_y] = self.bounds;
+        if self.size == 0
+            || self.size > i32::MAX as usize
+            || self.bounds.iter().any(|v| !v.is_finite())
+            || min_x >= max_x
+            || min_y >= max_y
+        {
+            return Err(MapError::Invalid("invalid XS sample raster".into()));
+        }
+        let cell = ((max_x - min_x) / self.size as f64).max((max_y - min_y) / self.size as f64);
+        if !cell.is_finite() || cell <= 0.0 {
+            return Err(MapError::Invalid("XS sample raster cell overflow".into()));
+        }
+        Ok(Tile {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            cell,
+            size: self.size,
+        })
+    }
+}
+
 #[derive(Clone)]
 struct Triangle {
     bounds: AABB<[f64; 2]>,
@@ -79,6 +114,7 @@ pub struct PreparedSurface {
 struct Clipping {
     clips: Vec<crate::one_d_clip::Clip>,
     planes: Vec<[f64; 4]>,
+    point_m: Vec<[f64; 3]>,
 }
 
 fn clipping_bytes(
@@ -88,7 +124,7 @@ fn clipping_bytes(
 ) -> Result<usize, MapError> {
     points
         .checked_mul(8)
-        .and_then(|n| triangles.checked_mul(32).and_then(|m| n.checked_add(m)))
+        .and_then(|n| triangles.checked_mul(56).and_then(|m| n.checked_add(m)))
         .and_then(|n| {
             cross_sections
                 .checked_mul(32 + 2 * std::mem::size_of::<crate::one_d_clip::Clip>())
@@ -188,6 +224,8 @@ impl PreparedSurface {
         )?;
         let mut planes = Vec::new();
         reserve(&mut planes, triangles.len())?;
+        let mut point_m = Vec::new();
+        reserve(&mut point_m, triangles.len())?;
         for segment in segments {
             for indices in
                 &triangles[segment.triangle_start..segment.triangle_start + segment.triangle_count]
@@ -196,6 +234,7 @@ impl PreparedSurface {
                     let index = segment.point_start + i as usize;
                     [points[index][0], points[index][1], normalized_m[index]]
                 });
+                point_m.push(p.map(|v| v[2]));
                 let u: [f64; 3] = std::array::from_fn(|i| p[1][i] - p[0][i]);
                 let v: [f64; 3] = std::array::from_fn(|i| p[2][i] - p[0][i]);
                 let a = u[1] * v[2] - u[2] * v[1];
@@ -214,6 +253,7 @@ impl PreparedSurface {
         surface.clipping = Some(Clipping {
             clips: copied_clips,
             planes,
+            point_m,
         });
         surface.geometry_bytes = admitted;
         Ok(surface)
@@ -347,6 +387,207 @@ impl PreparedSurface {
             max_bytes,
             clipping: None,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_signed(
+        &self,
+        levels: &[f32],
+        terrain: &[f32],
+        depth: &[f32],
+        wse: &[f32],
+        claims: &[u8],
+        samples: usize,
+        bytes_per_sample: usize,
+    ) -> Result<(), MapError> {
+        if levels.len() != self.cross_sections
+            || levels.iter().any(|v| v.is_infinite())
+            || terrain.len() != samples
+            || depth.len() != samples
+            || wse.len() != samples
+            || claims.len() != samples
+            || claims.iter().any(|&v| v > 1)
+            || terrain.iter().any(|v| v.is_infinite())
+        {
+            return Err(MapError::Invalid("invalid XS signed sample buffers".into()));
+        }
+        // All working buffers are caller-owned; reserve room for their complete
+        // lengths as well as candidate references before any output changes.
+        let bytes = samples
+            .checked_mul(bytes_per_sample)
+            .and_then(|n| {
+                self.tree
+                    .size()
+                    .checked_mul(std::mem::size_of::<&Triangle>())
+                    .and_then(|m| n.checked_add(m))
+            })
+            .and_then(|n| n.checked_add(self.geometry_bytes))
+            .ok_or_else(|| MapError::Budget("XS signed sample allocation overflow".into()))?;
+        if bytes > self.max_bytes {
+            return Err(MapError::Budget(
+                "XS signed samples exceed admitted bytes".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn signed_value(
+        &self,
+        triangle: &Triangle,
+        levels: &[f32],
+        ground: f32,
+        weight: f32,
+        m: f32,
+    ) -> Result<Option<(f32, f32)>, MapError> {
+        let us = levels[triangle.upstream];
+        let ds = levels[triangle.downstream];
+        if !ground.is_finite() || !us.is_finite() || !ds.is_finite() {
+            return Ok(None);
+        }
+        let water = weight * us + (1.0_f32 - weight) * ds;
+        if !weight.is_finite() || !m.is_finite() || !water.is_finite() {
+            return Err(MapError::Invalid("XS signed surface overflow".into()));
+        }
+        // Native signed depth tests the final WSE sentinel, not its endpoints.
+        // A computed depth of -9999 remains an ordinary numeric sample.
+        if water == -9999.0_f32 {
+            return Ok(None);
+        }
+        if let Some(data) = &self.clipping
+            && !crate::one_d_clip::visible(
+                data.clips[triangle.upstream],
+                data.clips[triangle.downstream],
+                us,
+                ds,
+                weight,
+                m,
+                water,
+            )
+        {
+            return Ok(None);
+        }
+        let delta = water - ground;
+        if !delta.is_finite() {
+            return Err(MapError::Invalid("XS signed depth overflow".into()));
+        }
+        Ok(Some((delta, water)))
+    }
+
+    /// Conservative admission using the same triangle query as signed rendering.
+    pub(crate) fn intersects_signed_raster(&self, raster: SampleRaster) -> Result<bool, MapError> {
+        let tile = raster.tile()?;
+        Ok(self
+            .tree
+            .locate_in_envelope_intersecting(tile.bounds())
+            .next()
+            .is_some())
+    }
+
+    /// Sample a complete supplied raster using native rank/scanline arithmetic.
+    /// Initial claims (0 or 1) exclude higher-priority physical coverage. Claims
+    /// are retained even for missing or clipped values; outputs are reset to NaN.
+    /// Signed depths bypass the raster plot threshold. This is a sampling
+    /// primitive, not a complete boundary mapping or native vector parity claim.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_signed_raster(
+        &self,
+        levels: &[f32],
+        terrain: &[f32],
+        raster: SampleRaster,
+        depth: &mut [f32],
+        wse: &mut [f32],
+        claims: &mut [u8],
+    ) -> Result<usize, MapError> {
+        let tile = raster.tile()?;
+        let samples = raster
+            .size
+            .checked_mul(raster.size)
+            .ok_or_else(|| MapError::Budget("XS sample raster overflow".into()))?;
+        self.validate_signed(levels, terrain, depth, wse, claims, samples, 13)?;
+        let mut candidates = Vec::new();
+        reserve(&mut candidates, self.tree.size())?;
+        candidates.extend(self.tree.locate_in_envelope_intersecting(tile.bounds()));
+        candidates.sort_unstable_by_key(|t| (t.rank, t.id));
+        depth.fill(f32::NAN);
+        wse.fill(f32::NAN);
+        let mut valid = 0;
+        let mut failure = None;
+        for t in candidates {
+            let plane = self.clipping.as_ref().map(|data| data.planes[t.id]);
+            t.scan(&tile, plane, |row, col, weight, m| {
+                let index = row * raster.size + col;
+                if claims[index] != 0 || failure.is_some() {
+                    return;
+                }
+                claims[index] = 1;
+                match self.signed_value(t, levels, terrain[index], weight as f32, m as f32) {
+                    Ok(Some((d, w))) => {
+                        depth[index] = d;
+                        wse[index] = w;
+                        valid += 1;
+                    }
+                    Ok(None) => {}
+                    Err(error) => failure = Some(error),
+                }
+            });
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(valid)
+    }
+
+    /// Sample original terrain stitch points using stored triangle order and
+    /// double barycentrics, then Float32 Z/M. This deliberately differs from
+    /// promoted-rank incremental raster sampling. Claims have the same contract
+    /// as `render_signed_raster`; the caller supplies original point terrain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_signed_points(
+        &self,
+        levels: &[f32],
+        points: &[[f64; 2]],
+        terrain: &[f32],
+        depth: &mut [f32],
+        wse: &mut [f32],
+        claims: &mut [u8],
+    ) -> Result<usize, MapError> {
+        self.validate_signed(levels, terrain, depth, wse, claims, points.len(), 29)?;
+        if points.iter().flatten().any(|v| !v.is_finite()) {
+            return Err(MapError::Invalid("nonfinite XS sample point".into()));
+        }
+        depth.fill(f32::NAN);
+        wse.fill(f32::NAN);
+        let mut valid = 0;
+        for (index, &point) in points.iter().enumerate() {
+            if claims[index] != 0 {
+                continue;
+            }
+            let found = self
+                .tree
+                .locate_in_envelope_intersecting(AABB::from_point(point))
+                .filter_map(|t| t.point_weights(point).map(|weights| (t, weights)))
+                .min_by_key(|(t, _)| t.id);
+            if let Some((t, weights)) = found {
+                claims[index] = 1;
+                let weight = ((t.vertices[0][2] * weights[0] + t.vertices[1][2] * weights[1])
+                    + t.vertices[2][2] * weights[2]) as f32;
+                let m = self
+                    .clipping
+                    .as_ref()
+                    .map(|data| {
+                        let values = data.point_m[t.id];
+                        ((values[0] * weights[0] + values[1] * weights[1]) + values[2] * weights[2])
+                            as f32
+                    })
+                    .unwrap_or(0.0);
+                if let Some((d, w)) = self.signed_value(t, levels, terrain[index], weight, m)? {
+                    depth[index] = d;
+                    wse[index] = w;
+                    valid += 1;
+                }
+            }
+        }
+        Ok(valid)
     }
 
     /// Render a source-grid window without resetting the original tile lattice.
@@ -584,6 +825,25 @@ impl Tile {
     }
 }
 impl Triangle {
+    fn point_weights(&self, [x, y]: [f64; 2]) -> Option<[f64; 3]> {
+        let [p, q, r] = self.vertices;
+        let a = q[1] - r[1];
+        let b = p[0] - r[0];
+        let c = r[0] - q[0];
+        let d = p[1] - r[1];
+        let determinant = a * b + c * d;
+        let dx = x - r[0];
+        let dy = y - r[1];
+        let first = (a * dx + c * dy) / determinant;
+        let second = (b * dy - d * dx) / determinant;
+        let third = (1.0 - first) - second;
+        let weights = [first, second, third];
+        weights
+            .iter()
+            .all(|w| (-0.0001..=1.0001).contains(w))
+            .then_some(weights)
+    }
+
     fn scan(
         &self,
         tile: &Tile,

@@ -28,7 +28,17 @@ pub const ENGINE_COMMIT: &str = env!("FAST_MAP_ENGINE_COMMIT");
 
 pub mod aoi;
 pub mod boundary_contour;
+// Attributed upstream core plus reviewed native compatibility overlay; keep
+// upstream style local to this private module. Unsafe code remains forbidden.
+#[allow(dead_code, clippy::all)]
+mod boundary_clip_legacy;
+mod boundary_metadata;
+pub mod boundary_native_contour;
+mod boundary_point;
+mod boundary_ring_groups;
 pub mod boundary_session;
+pub mod boundary_surface;
+pub mod boundary_xs;
 pub mod cache;
 mod capabilities;
 pub mod coupled;

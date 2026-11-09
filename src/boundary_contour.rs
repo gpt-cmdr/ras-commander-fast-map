@@ -14,7 +14,7 @@ pub struct Limits {
     pub max_working_bytes: usize,
 }
 impl Limits {
-    fn admit(self, vertices: usize, paths: usize) -> Result<()> {
+    pub(crate) fn admit(self, vertices: usize, paths: usize) -> Result<()> {
         let estimate = vertices
             .checked_mul(256)
             .and_then(|n| paths.checked_mul(128).and_then(|m| n.checked_add(m)))
@@ -38,7 +38,7 @@ pub struct Grid {
     pub transform: [f64; 6],
 }
 impl Grid {
-    fn validate(self, n: usize) -> Result<()> {
+    pub(crate) fn validate(self, n: usize) -> Result<()> {
         let t = self.transform;
         if self.cols < 2
             || self.rows < 2
@@ -53,13 +53,13 @@ impl Grid {
         }
         Ok(())
     }
-    fn point(self, r: usize, c: usize) -> [f64; 2] {
+    pub(crate) fn point(self, r: usize, c: usize) -> [f64; 2] {
         [
             self.transform[0] + (c as f64 + 0.5) * self.transform[1],
             self.transform[3] + (r as f64 + 0.5) * self.transform[5],
         ]
     }
-    fn center(self, r: usize, c: usize) -> [f64; 2] {
+    pub(crate) fn center(self, r: usize, c: usize) -> [f64; 2] {
         [
             self.transform[0] + (c + 1) as f64 * self.transform[1],
             self.transform[3] + (r + 1) as f64 * self.transform[5],
@@ -74,7 +74,7 @@ struct Sample {
 #[derive(Clone, Debug)]
 pub struct Unit {
     pub sequence: u64,
-    paths: Paths64,
+    pub(crate) paths: Paths64,
 }
 impl Unit {
     pub fn vertex_count(&self) -> usize {
@@ -125,7 +125,7 @@ impl Fragments {
         Ok(Unit { sequence, paths })
     }
 }
-fn quantize(p: [f64; 2]) -> Result<Point64> {
+pub(crate) fn quantize(p: [f64; 2]) -> Result<Point64> {
     let q = [
         (p[0] * PRECISION).round_ties_even(),
         (p[1] * PRECISION).round_ties_even(),
@@ -302,7 +302,7 @@ pub fn tin(
     out.complete(sequence)
 }
 
-fn count_vertices(paths: &Paths64) -> Result<usize> {
+pub(crate) fn count_vertices(paths: &Paths64) -> Result<usize> {
     paths.iter().try_fold(0usize, |n, p| {
         n.checked_add(p.len())
             .ok_or_else(|| MapError::Budget("contour vertex count overflow".into()))
@@ -386,7 +386,7 @@ fn rotate_min(p: &mut [[i64; 2]]) {
     }
     p.rotate_left(i.min(j) % n);
 }
-fn canonical(path: &Path64, ccw: bool) -> Result<Vec<[i64; 2]>> {
+pub(crate) fn canonical(path: &Path64, ccw: bool) -> Result<Vec<[i64; 2]>> {
     let mut p: Vec<_> = path.iter().map(|p| [p.x, p.y]).collect();
     p.dedup();
     if p.len() > 1 && p.first() == p.last() {
@@ -412,7 +412,7 @@ pub struct Output {
     pub coordinate_precision: f64,
     pub coordinates: MultiPolygon,
 }
-fn aoi_paths(aoi: &MultiPolygon, limits: Limits) -> Result<Paths64> {
+pub(crate) fn aoi_paths(aoi: &MultiPolygon, limits: Limits) -> Result<Paths64> {
     let vertices = aoi.iter().flatten().try_fold(0usize, |n, r| {
         n.checked_add(r.len())
             .ok_or_else(|| MapError::Budget("AOI contour vertex count overflow".into()))

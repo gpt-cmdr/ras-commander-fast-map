@@ -21,7 +21,7 @@ def main():
         if package.get("source") is None:
             continue
         source = Path(package["manifest_path"]).parent.resolve()
-        paths = {p for p in source.iterdir() if p.is_file() and p.name.lower().startswith(("license", "licence", "copying", "notice"))}
+        paths = {p for p in source.iterdir() if p.is_file() and p.name.lower().startswith(("license", "licence", "copying", "notice", "third_party_notices", "third-party-notices"))}
         if package.get("license_file"):
             path = (source / package["license_file"]).resolve()
             assert path.is_relative_to(source)

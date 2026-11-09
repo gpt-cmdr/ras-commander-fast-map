@@ -43,12 +43,14 @@ fn complete_native_temporal_masks_and_float32_bits() {
         assert_eq!(actual.len(), expected.len(), "{product} shape");
         let mut valid = 0;
         for (i, (a, b)) in actual
-            .chunks_exact(4)
-            .zip(expected.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(expected.as_chunks::<4>().0.iter())
             .enumerate()
         {
-            let actual = f32::from_le_bytes(a.try_into().unwrap());
-            let expected = f32::from_le_bytes(b.try_into().unwrap());
+            let actual = f32::from_le_bytes(*a);
+            let expected = f32::from_le_bytes(*b);
             assert_eq!(actual.is_nan(), expected.is_nan(), "{product} mask at {i}");
             if !expected.is_nan() {
                 assert!(expected.is_finite(), "{product} invalid reference at {i}");

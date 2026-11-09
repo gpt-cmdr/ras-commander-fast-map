@@ -353,6 +353,53 @@ output is required, and retain comparison evidence for the intended model.
 This separate polygon layer does not change the existing Depth/WSE raster
 methods, their float32 arithmetic or their qualification claims.
 
+### Native serial contour contract
+
+The `native_boundary` capability selects
+`rasmapper-serial-zero-depth-contours/1` through boundary request schema `/2`.
+Set `contour_method` to that exact method ID. This separate contract retains
+native first-subject/subsequent-clip NonZero union, classic integer intersection
+rounding, serial source/tile/stitch order and native thin-hole filtering.
+It does not redirect schema `/1` to a different algorithm.
+
+The model can additionally carry stored XS signed-depth sampling and level-pool
+storage. The optional `one_d` descriptor uses `boundary_xs::XsInput`; physical
+2D coverage takes precedence over stored storage coverage, then XS coverage,
+before missing-water or dry filtering. XS raster samples and arbitrary stitch
+points use distinct native arithmetic. Selected profiles must agree across
+all components.
+
+Keep every original terrain source in native order. The primary descriptor
+retains the complete global stitch TIN; `additional_terrains` is an ordered
+list of `{terrain, crs_identity, terrain_metadata}` records without duplicate
+stitch descriptors. Each source retains its original 256-pixel tile layout,
+all row-major tile IDs, masks and perimeters. Sources are never flattened or
+retiled. All source caches and active tile buffers enter planned admission.
+
+Masks and perimeters are read by active tile row; their full backing files
+count toward prepared disk storage separately from working RAM. Empty tile
+units retain their original positions in the merge sequence. The complete
+global stitch TIN remains available. Ambiguous physical 2D claims at fuzzy
+polygon edges are refused because native parallel insertion does not establish
+a reproducible owner there.
+
+Native comparison requires RASMapper's explicit serial polygon-loop control;
+one-CPU affinity alone does not establish that control. Commander supplies it
+through `StoreMapPerformanceOptions(native_polygon_serial=True)`, verifies the
+effective flag and records the actual runtime identity. Ordinary native parallel
+exports can produce different merge orders. Read the capability's qualification
+status and the named comparison evidence before claiming vector equality.
+Retain both rendering-helper and merge-host identities: native equal-height
+intersection ordering also depends on the .NET host's sorting behavior.
+
+Commander exposes this method through `method="native_serial"` on its existing
+boundary mapping/comparison APIs. It contours the complete source history and
+applies an optional final unrounded GEOS polygon intersection in GIS delivery,
+recorded as `unrounded-geos-intersection/1`. Direct Rust AOI clipping remains an
+integer-lattice operation and has a distinct clipping contract. Terrain
+modifications, face options, steady encroachment and blocked-obstruction
+polygons remain outside this method's admitted scope.
+
 ## Velocity (sloping requests)
 
 Add per-mesh `velocity_normals_files` (HDF `Faces NormalUnitVector and Length`

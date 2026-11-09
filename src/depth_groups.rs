@@ -229,11 +229,21 @@ impl Accumulator {
                     let offset = (chunk * CHUNK * 4) as u64;
                     file.seek(SeekFrom::Start(offset))?;
                     file.read_exact(&mut bytes[..values.len() * 4])?;
-                    for (a, b) in acc.iter_mut().zip(bytes.chunks_exact(4)).take(values.len()) {
-                        *a = f32::from_le_bytes(b.try_into().unwrap());
+                    for (a, b) in acc
+                        .iter_mut()
+                        .zip(bytes.as_chunks::<4>().0)
+                        .take(values.len())
+                    {
+                        *a = f32::from_le_bytes(*b);
                     }
                     accumulate(&mut acc[..values.len()], values, threshold);
-                    for (b, a) in bytes.chunks_exact_mut(4).zip(&acc).take(values.len()) {
+                    for (b, a) in bytes
+                        .as_chunks_mut::<4>()
+                        .0
+                        .iter_mut()
+                        .zip(&acc)
+                        .take(values.len())
+                    {
                         b.copy_from_slice(&a.to_le_bytes());
                     }
                     file.seek(SeekFrom::Start(offset))?;
@@ -263,8 +273,10 @@ impl Accumulator {
                     let mut bytes = vec![0; nrows * width * 4];
                     file.read_exact(&mut bytes)?;
                     let data = bytes
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|b| f32::from_le_bytes(*b))
                         .collect();
                     consume(data, nrows)?;
                 }

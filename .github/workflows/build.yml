@@ -21,6 +21,7 @@ jobs:
           python-version: '3.13'
       - run: python scripts/verify_sources.py
       - run: python scripts/dependency_notices.py --check
+      - run: python -m unittest discover -s scripts -p test_sanitize_wheel_sbom.py
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings -A clippy::chunks_exact_to_as_chunks
       - run: cargo test --locked --all-targets
@@ -51,7 +52,9 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           docker-options: --env FAST_MAP_BUILD_COMMIT
-          args: --release --locked --out dist
+          args: --release --locked --out dist-unsanitized
+      - name: Canonicalize SBOM workspace identities and verify wheel integrity
+        run: python scripts/sanitize_wheel_sbom.py --input-dir dist-unsanitized --output-dir dist
       - name: Installed wheel smoke and source identity
         shell: bash
         run: |

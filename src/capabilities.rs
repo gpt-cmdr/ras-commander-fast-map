@@ -27,6 +27,7 @@ pub fn engine_method_record() -> serde_json::Value {
         "sloping_native_grid":crate::sloping_session::native_grid_method_record(),
         "depth_groups": crate::depth_groups::method_record(),
         "boundary": crate::boundary_session::method_record(),
+        "native_boundary": crate::boundary_session::native_method_record(),
         "whole_simulation": crate::whole_simulation::method_record(),
         "effective_terrain": crate::effective_terrain::method_record()
     });
@@ -118,6 +119,12 @@ pub fn engine_method_record() -> serde_json::Value {
         (
             "boundary",
             crate::boundary_session::SCHEMA,
+            "boundary",
+            "mapping",
+        ),
+        (
+            "native_boundary",
+            crate::boundary_session::NATIVE_SCHEMA,
             "boundary",
             "mapping",
         ),

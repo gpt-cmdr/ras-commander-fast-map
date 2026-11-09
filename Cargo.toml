@@ -2,7 +2,7 @@
 name = "ras-commander-fast-map"
 version = "0.14.0"
 edition = "2024"
-license = "MIT AND BSD-3-Clause"
+license = "MIT AND BSD-3-Clause AND BSD-2-Clause AND BSL-1.0"
 description = "Native Rust 2D flood inundation mapping: horizontal and sloping surfaces, bounded timesteps and terrain windows"
 rust-version = "1.99"
 authors = ["CLB Engineering Corporation"]

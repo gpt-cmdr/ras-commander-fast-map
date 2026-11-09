@@ -188,6 +188,13 @@ fn capabilities_preserve_dispatch_schemas_flags_and_qualification_limits() {
             "not_declared",
         ),
         (
+            "native_boundary",
+            "ras-commander-boundary-request/2",
+            "boundary",
+            "mapping",
+            "unqualified",
+        ),
+        (
             "whole_simulation",
             "ras-commander-whole-simulation-request/1",
             "whole-simulation",
