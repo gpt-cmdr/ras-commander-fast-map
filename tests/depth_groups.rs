@@ -200,8 +200,10 @@ fn grouped_matches_ordinary_frames_masks_bits_and_spill() {
         let maximum = read_tiff(&f.0.join(name).join("left/max.tif"));
         let b = fs::read(f.0.join("ordinary/b/depth.bin")).unwrap();
         let b: Vec<_> = b
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         let expected: Vec<_> = b
             .iter()

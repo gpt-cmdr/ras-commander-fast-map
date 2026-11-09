@@ -35,20 +35,34 @@ Do not retag an immutable published version or silently skip failed artifacts.
 Retain public qualification summaries while keeping external model files,
 computed rasters and native reference caches outside the repositories.
 
+Wheel builds retain their complete CycloneDX dependency graphs. Before smoke
+checks, checksums or artifact upload, run
+`python scripts/sanitize_wheel_sbom.py --input-dir dist-unsanitized --output-dir dist`
+to replace build-local workspace identifiers and their references
+with portable identifiers. The check must preserve component/dependency counts,
+validate every reference and regenerate `RECORD`; executable, license and other
+payload bytes must remain identical. Unrecognized local paths or inconsistent
+graphs fail the build. Keep unsanitized local wheels outside publication folders.
+
+The native boundary request exposes `additional_terrains`, `contour_method`,
+`diagnostic_units` and `one_d` fields on `boundary_session::Request`. Rust
+struct-literal callers must supply these fields. Treat that source compatibility
+change deliberately when choosing the crate's minor release and documenting
+request construction; JSON defaults do not supply omitted Rust struct fields.
+
 If registry authentication is configured after the GitHub Release exists,
 dispatch release.yml at that tag with `publish_existing=true`. It verifies the
 tag/version and existing release checksums, then publishes to each enabled
 registry without rebuilding or replacing the release assets. Enable only the
 registries that have not yet received this version when retrying publication.
 
-## 0.13.0 integration gates
+## Mapping integration gates
 
-This release ports the bounded diagnostic/performance delta onto public 0.12,
-retaining unmodified effective-terrain schema /1. It does not include private
-terrain-modification schema /2. Row streaming is opt-in (0 default, at most
-4096 rows), restricted to plain corner/native TIFF output; full ownership and
-ground remain resident. Installed-wheel/native prepared-fixture checks must
-identify the integrated artifact, separately from historical 0.11 measurements.
-Windows local evidence does not replace Linux CI/wheel qualification or review.
-The unresolved Creek native-repeat variation remains a release limitation;
-no Creek median or all-model parity claim is made.
+Unmodified effective-terrain schema `/1` retains its numerical contract.
+Terrain modifications require separate qualification. Row streaming is opt-in
+(0 default, at most 4096 rows), restricted to plain corner/native TIFF output;
+full ownership and ground remain resident. Installed-wheel/native fixture
+checks must identify the exact artifact, input scope and options. Windows local
+evidence does not replace Linux installed-wheel qualification or review.
+Retain unresolved native-repeat variation as a qualification limitation;
+withhold timing summaries for unstable cases and avoid all-model parity claims.

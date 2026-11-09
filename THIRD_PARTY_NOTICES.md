@@ -33,6 +33,22 @@ manifest binds the retained license. This pure Rust dependency introduces no
 GDAL or HEC-RAS runtime requirement. Its integer intersections and union behavior
 are not claimed to reproduce RASMapper vector output.
 
+The explicit native-serial boundary path uses a private Rust clipping core in
+`src/boundary_clip_legacy/`, adapted from the classic core of
+[`solidmesh-clipper` 0.2.0](https://github.com/larsbrubaker/solidmesh/tree/05a748e8683f25bc1bfc24f39b806fb70ae3b156/crates/clipper-library).
+That Rust source carries MatterHackers' BSD-2-Clause notice and the original
+Angus Johnson Clipper Boost Software License 1.0 notice. Compatibility changes
+follow the horizontal-edge and scanbeam lifecycle and original-edge join predicates in
+[official Clipper 6.2.1 revision 482](https://svn.code.sf.net/p/polyclipping/code/!svn/bc/482/trunk/C%23/clipper_library/clipper.cs)
+under the Boost license. Its host-specific crossing-list sorts follow Microsoft's
+[reference-source depth-limited quicksort and introsort](https://github.com/microsoft/referencesource/blob/ec9fa9ae770d522a5b5f0607898044b7478574a3/mscorlib/system/collections/generic/arraysorthelper.cs)
+under the MIT license. Full license texts, the original Rust package's complete
+third-party notice and immutable source checksums are retained in
+[`licenses/vendored/boundary_clip_legacy/`](licenses/vendored/boundary_clip_legacy/).
+The vendored core uses the existing Clipper2 integer-point types. Neither
+`solidmesh-clipper` nor `solidmesh-math` is a runtime dependency. Numerical
+qualification is documented separately from this software provenance.
+
 Other Rust dependencies and their exact resolved versions are recorded in
 `Cargo.lock`. Retain their applicable notices when distributing compiled
 binaries. Resolved dependency license texts are retained under

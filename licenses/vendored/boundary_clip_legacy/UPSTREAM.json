@@ -1,0 +1,124 @@
+{
+  "schema": "fast-map-vendored-classic-license-provenance/1",
+  "repository_path": "src/boundary_clip_legacy",
+  "runtime_dependencies": "Existing clipper2-rust integer-point types and the Rust standard library.",
+  "local_implementation_changes": [
+    "Local minima retain arena insertion IDs; their linked list is ordered once at reset by descending integer Y and descending insertion ID, preserving classic newest-first equal-Y ties.",
+    "Initial reset scanbeams are appended and deduplicated from that ordered list, preserving scanbeam IDs, Y values, links and edge-reset order; sweep-time scanbeam insertion is unchanged.",
+    "The temporary minima-index allocation is fallible and reports a private clipping error on refusal.",
+    "Tile/TIN clipping retains legacy crossing sorting; the flat global merge explicitly selects modern introsort, matching the respective managed host policies without a runtime dependency.",
+    "Four join predicates use original edge-delta collinearity from the licensed 6.2.1 source rather than rounded current-point slopes."
+  ],
+  "rust_source": {
+    "package": "solidmesh-clipper",
+    "version": "0.2.0",
+    "vcs_commit": "05a748e8683f25bc1bfc24f39b806fb70ae3b156",
+    "archive_url": "https://static.crates.io/crates/solidmesh-clipper/solidmesh-clipper-0.2.0.crate",
+    "archive_sha256": "4113f0fa7ae3459d6b0cc94c598e73cbb2ae75fb33f45449b512f244e4f94e6b",
+    "license": "BSD-2-Clause AND BSL-1.0",
+    "files": [
+      {
+        "path": "src/boundary_clip_legacy/clipper_base.rs",
+        "upstream_url": "https://raw.githubusercontent.com/larsbrubaker/solidmesh/05a748e8683f25bc1bfc24f39b806fb70ae3b156/crates/clipper-library/src/clipper6/clipper_base.rs",
+        "upstream_sha256": "2a5720858778599f3c2a7e0039837788dce648445589846cdcc2d57e93d7b404"
+      },
+      {
+        "path": "src/boundary_clip_legacy/engine.rs",
+        "upstream_url": "https://raw.githubusercontent.com/larsbrubaker/solidmesh/05a748e8683f25bc1bfc24f39b806fb70ae3b156/crates/clipper-library/src/clipper6/engine.rs",
+        "upstream_sha256": "39c3b7b5f55832fe1ba3e8ad39eeae2372818157a057b78a0d7b44f997b375f8"
+      },
+      {
+        "path": "src/boundary_clip_legacy/horizontals.rs",
+        "upstream_url": "https://raw.githubusercontent.com/larsbrubaker/solidmesh/05a748e8683f25bc1bfc24f39b806fb70ae3b156/crates/clipper-library/src/clipper6/horizontals.rs",
+        "upstream_sha256": "6a663bd49ef5f5c4d14fe7b1dfbc5368d4184df1eedf578fd44e01b0b1d6c9e2"
+      },
+      {
+        "path": "src/boundary_clip_legacy/intersections.rs",
+        "upstream_url": "https://raw.githubusercontent.com/larsbrubaker/solidmesh/05a748e8683f25bc1bfc24f39b806fb70ae3b156/crates/clipper-library/src/clipper6/intersections.rs",
+        "upstream_sha256": "1f16dc1dd6ce027f097bd4d5e35dc973df12384eb9bc59e22503a9b399c3dc25"
+      },
+      {
+        "path": "src/boundary_clip_legacy/joins.rs",
+        "upstream_url": "https://raw.githubusercontent.com/larsbrubaker/solidmesh/05a748e8683f25bc1bfc24f39b806fb70ae3b156/crates/clipper-library/src/clipper6/joins.rs",
+        "upstream_sha256": "f615ad6897ab2b3ab20d24bd0e3d51d4baa79bf19fcd37d3a5d53cefc928f3d9"
+      },
+      {
+        "path": "src/boundary_clip_legacy/mod.rs",
+        "upstream_url": "https://raw.githubusercontent.com/larsbrubaker/solidmesh/05a748e8683f25bc1bfc24f39b806fb70ae3b156/crates/clipper-library/src/clipper6/mod.rs",
+        "upstream_sha256": "97b51024acba2d7053d08a295bf9fe5ec518f3522eb43861b19d976e3fe3b8ab"
+      },
+      {
+        "path": "src/boundary_clip_legacy/out_polys.rs",
+        "upstream_url": "https://raw.githubusercontent.com/larsbrubaker/solidmesh/05a748e8683f25bc1bfc24f39b806fb70ae3b156/crates/clipper-library/src/clipper6/out_polys.rs",
+        "upstream_sha256": "d542e1afd22fc26e56670425446a5c32b17deb2790fa67df19c93bf800b2cbe5"
+      },
+      {
+        "path": "src/boundary_clip_legacy/poly_tree.rs",
+        "upstream_url": "https://raw.githubusercontent.com/larsbrubaker/solidmesh/05a748e8683f25bc1bfc24f39b806fb70ae3b156/crates/clipper-library/src/clipper6/poly_tree.rs",
+        "upstream_sha256": "e84248537c3977671b1c9c86e02fb4ad39813a127ab97e47bb2d4e0f7a0cc48d"
+      },
+      {
+        "path": "src/boundary_clip_legacy/statics.rs",
+        "upstream_url": "https://raw.githubusercontent.com/larsbrubaker/solidmesh/05a748e8683f25bc1bfc24f39b806fb70ae3b156/crates/clipper-library/src/clipper6/statics.rs",
+        "upstream_sha256": "8a06a654c721dbac9bb888293fdfa5e7c1aadf55c2b650e7e9c5df9f1977bd8d"
+      },
+      {
+        "path": "src/boundary_clip_legacy/types.rs",
+        "upstream_url": "https://raw.githubusercontent.com/larsbrubaker/solidmesh/05a748e8683f25bc1bfc24f39b806fb70ae3b156/crates/clipper-library/src/clipper6/types.rs",
+        "upstream_sha256": "79e808391f76ddcc123e07d1538bc0e4012e2ca59050d7c0776088c88cd88b49"
+      }
+    ],
+    "excluded_upstream_modules": [
+      "offset.rs"
+    ]
+  },
+  "compatibility_changes": [
+    {
+      "scope": "Horizontal-edge and scanbeam/ghost-join lifecycle and four original-edge-delta join predicates; selected algorithm compatibility changes, not a complete replacement by upstream6.2.1.",
+      "source_url": "https://svn.code.sf.net/p/polyclipping/code/!svn/bc/482/trunk/C%23/clipper_library/clipper.cs",
+      "source_sha256": "9d19b2fa86f00a7951d6a25c2e50f1d1fea5f7686a17b4a81bf821677f821296",
+      "license": "BSL-1.0",
+      "license_url": "https://svn.code.sf.net/p/polyclipping/code/!svn/bc/482/trunk/License.txt",
+      "license_sha256": "e3cc0380cc5eb9aedf5a7616fe9fde3710891bced21fd6a20a19194ccd4c1c88"
+    },
+    {
+      "scope": "Legacy .NET depth-limited quicksort and modern introsort used to order tied crossings under the explicit tile/TIN or global-merge host policy.",
+      "source_url": "https://raw.githubusercontent.com/microsoft/referencesource/ec9fa9ae770d522a5b5f0607898044b7478574a3/mscorlib/system/collections/generic/arraysorthelper.cs",
+      "source_sha256": "3dac5f29257c268e63b14ff07c1f51f3262b98911b0ee89bc25c47b64648b351",
+      "vcs_commit": "ec9fa9ae770d522a5b5f0607898044b7478574a3",
+      "license": "MIT",
+      "license_url": "https://raw.githubusercontent.com/microsoft/referencesource/ec9fa9ae770d522a5b5f0607898044b7478574a3/LICENSE.txt",
+      "license_sha256": "c1f47cf87974fdc14137ddd32e6273c0d9b30365bba4b96daf0b26243e309a4c"
+    }
+  ],
+  "retained_notices": [
+    {
+      "path": "licenses/vendored/boundary_clip_legacy/LICENSE-solidmesh-clipper-BSD-2-Clause.txt",
+      "sha256": "2731cdbc5d3916af68c1d5ffa2d3e3a3cfae6817ce5561d91f8bc565a3401982",
+      "upstream_url": "https://raw.githubusercontent.com/larsbrubaker/solidmesh/05a748e8683f25bc1bfc24f39b806fb70ae3b156/crates/clipper-library/LICENSE",
+      "sha256_lf": "2731cdbc5d3916af68c1d5ffa2d3e3a3cfae6817ce5561d91f8bc565a3401982"
+    },
+    {
+      "path": "licenses/vendored/boundary_clip_legacy/solidmesh-clipper-THIRD_PARTY_NOTICES.md",
+      "sha256": "b77967a0b5c358cf6ddbab6841232c4d61256bf64e16b0fd2a135aea2c7eb8e7",
+      "upstream_url": "https://raw.githubusercontent.com/larsbrubaker/solidmesh/05a748e8683f25bc1bfc24f39b806fb70ae3b156/crates/clipper-library/THIRD_PARTY_NOTICES.md",
+      "sha256_lf": "b77967a0b5c358cf6ddbab6841232c4d61256bf64e16b0fd2a135aea2c7eb8e7"
+    },
+    {
+      "path": "licenses/vendored/boundary_clip_legacy/LICENSE-Clipper-BSL-1.0.txt",
+      "sha256": "e3cc0380cc5eb9aedf5a7616fe9fde3710891bced21fd6a20a19194ccd4c1c88",
+      "upstream_url": "https://svn.code.sf.net/p/polyclipping/code/!svn/bc/482/trunk/License.txt",
+      "sha256_lf": "1bc8ddf91ba50e4186abb6b2339910e4529471ad8181b7cf2a5026c09ce09294"
+    },
+    {
+      "path": "licenses/vendored/boundary_clip_legacy/LICENSE-Microsoft-MIT.txt",
+      "sha256": "c1f47cf87974fdc14137ddd32e6273c0d9b30365bba4b96daf0b26243e309a4c",
+      "upstream_url": "https://raw.githubusercontent.com/microsoft/referencesource/ec9fa9ae770d522a5b5f0607898044b7478574a3/LICENSE.txt",
+      "sha256_lf": "88f56ee31c909b144a273bea8a48573a535830b29d48cfa0af9c61ecc2764f42"
+    }
+  ],
+  "checksum_conventions": {
+    "upstream": "SHA256 of original downloaded source or archive bytes.",
+    "retained_notices": "sha256 records source bytes; sha256_lf also permits checkout newline conversion without changing notice content."
+  }
+}

@@ -53,12 +53,14 @@ fn native_velocity_and_derived_complete_masks_and_bits() {
             assert_eq!(actual.len(), expected.len());
             assert_eq!(actual.len() % 4, 0);
             for (pixel, (a, b)) in actual
-                .chunks_exact(4)
-                .zip(expected.chunks_exact(4))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(expected.as_chunks::<4>().0.iter())
                 .enumerate()
             {
-                let a = f32::from_le_bytes(a.try_into().unwrap());
-                let b = f32::from_le_bytes(b.try_into().unwrap());
+                let a = f32::from_le_bytes(*a);
+                let b = f32::from_le_bytes(*b);
                 assert_eq!(
                     a.is_nan(),
                     b.is_nan(),

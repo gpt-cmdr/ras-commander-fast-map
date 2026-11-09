@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.15.0 - 2026-11-09
+
+Add the explicit native-serial inundation-boundary contract with canonical
+cross-section, storage-area and mixed geometry, original terrain mosaics,
+complete tile/stitch history and bounded workers. Preserve native flat merging,
+host-specific crossing order, integer rounding and original-edge joins.
+Keep the deterministic boundary default and its request semantics unchanged.
+
+Associate unchanged flat rings for GIS delivery without a second union.
+Refuse unsupported or ambiguous geometry and failed intersections. Retain
+complete BSD, Boost and MIT source provenance for the private clipping core.
+Sanitize build-local wheel SBOM identities while preserving the dependency
+graph, executable bytes and license payloads.
+
+Rust struct-literal callers must supply the added boundary request fields.
+Native serial qualification remains
+an explicit opt-in with fixture, runtime, profile and platform limits. See the
+[native contour contract](README.md#native-serial-contour-contract) and the
+Commander mapping guide for valid-vector and raw-diagnostic comparison scopes.
+
 ## 0.14.0 - 2026-11-08
 
 Add an explicit native stored-terrain grid contract for plain sloping
