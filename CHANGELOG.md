@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.15.0 - 2026-11-09
 
 Add the explicit native-serial inundation-boundary contract with canonical
 cross-section, storage-area and mixed geometry, original terrain mosaics,
@@ -14,8 +14,8 @@ complete BSD, Boost and MIT source provenance for the private clipping core.
 Sanitize build-local wheel SBOM identities while preserving the dependency
 graph, executable bytes and license payloads.
 
-Rust struct-literal callers must supply the added boundary request fields;
-this requires a deliberate minor release. Native serial qualification remains
+Rust struct-literal callers must supply the added boundary request fields.
+Native serial qualification remains
 an explicit opt-in with fixture, runtime, profile and platform limits. See the
 [native contour contract](README.md#native-serial-contour-contract) and the
 Commander mapping guide for valid-vector and raw-diagnostic comparison scopes.
