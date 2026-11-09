@@ -998,7 +998,7 @@ fn render_impl(
 }
 
 /// Derived products from a pixel's binary32 depth and velocity at one output
-/// time, in RAS Mapper's operation order (`DepthAndVelocityRenderer`): D x V
+/// time, in the operation order qualified against RAS Mapper output: D x V
 /// and D x V^2 in binary32; Froude divides in binary64 by the square root of
 /// the binary32 product of the float32 gravity constant and depth.
 pub fn depth_x_velocity(depth: f32, velocity: f32) -> f32 {

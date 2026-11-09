@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.16.0 - 2026-11-09
 
 Advertise slopingPretty velocity, per-time D x V, D x V^2 and Froude and their
 `reduce_max/1` Max as qualified with every slopingPretty option: sloping
