@@ -51,6 +51,12 @@ pub fn method_record() -> serde_json::Value {
 }
 
 pub const DERIVED_METHOD_ID: &str = "rasmapper-depth-velocity-products/1";
+/// slopingPretty (cell-face stencil) velocity, per-time D x V, D x V^2 and
+/// Froude, and their `reduce_max/1` Max, with any `ShallowBehaviorMode` and
+/// `UseDepthWeightedFaces`: RAS Mapper clips velocity with the rendered depth of
+/// the same options (`depth > 0`), so the mask is the slopingPretty depth mask.
+/// Qualified against native HEC-RAS 7.0.1 stored maps (0 mask, 0 bit differences).
+pub const WITH_FACES_METHOD_ID: &str = "rasmapper-with-faces-velocity-derived/1";
 /// Derived products, in stream/output order.
 pub const DERIVED: [&str; 3] = ["depth_x_velocity", "depth_x_velocity_squared", "froude"];
 

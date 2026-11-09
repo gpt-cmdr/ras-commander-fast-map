@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+Advertise slopingPretty velocity, per-time D x V, D x V^2 and Froude and their
+`reduce_max/1` Max as qualified with every slopingPretty option: sloping
+method flags `velocity_with_faces` (`rasmapper-with-faces-velocity-derived/1`)
+and `velocity_with_faces_options` (`reduce_shallow_to_horizontal`,
+`use_depth_weighted_faces`). No numerical change: velocity is clipped by the
+depth rendered with the same options, as in RAS Mapper. Native HEC-RAS 7.0.1
+Max on bridges p05 and Davis p02, all four option combinations: 0 mask and
+0 bit differences. The earlier bridges slopingPretty mask difference came from
+comparing a plain run with a shallow-reduction reference.
+
 ## 0.15.0 - 2026-11-09
 
 Add the explicit native-serial inundation-boundary contract with canonical

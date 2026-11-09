@@ -429,6 +429,28 @@ Max D x V, D x V^2 and Froude are per-output-time products reduced this way
 The sloping method record advertises `velocity_depth`, `velocity_render_modes`,
 `derived_products`, `derived_method_id` and `derived_max` (`reduce_max/1`).
 
+**slopingPretty (cell-face stencil).** `velocity_with_faces`
+(`rasmapper-with-faces-velocity-derived/1`) records that velocity, the per-time
+derived products and their `reduce_max/1` Max are qualified in slopingPretty
+with every option RAS Mapper offers there, listed in
+`velocity_with_faces_options` (`reduce_shallow_to_horizontal`,
+`use_depth_weighted_faces`). RAS Mapper's rule is the same as in plain sloping:
+velocity values do not depend on the render mode, and every velocity-based
+product is clipped where the depth rendered with the *same* slopingPretty
+options is > 0 (`VelocityRenderer`: `outDepths[i] > 0f` from that mode's depth
+computer; derived Max is the per-time union). Shallow reduction and depth
+weighting therefore change the mask, not the velocity values. Native HEC-RAS
+7.0.1 stored maps (Max, all four option combinations, 0 mask and 0 bit
+differences): bridges p05 velocity 974,095 / 974,142 / 974,216 / 974,256 pixels
+(plain / shallow reduction / depth-weighted / both) and D x V, D x V^2, Froude
+Max over 433 output times 974,110 / 974,191 / 974,231 / 974,291; Davis p02
+velocity 21,402 / 21,591 / 20,703 / 21,114 and derived Max over 217 times
+21,315 / 21,862 / 20,880 / 21,287. The earlier "slopingPretty depth gap" on
+bridges (75 + 28 pixels) was a reference made with shallow reduction on (the
+ras-commander `store_maps` default for a bare `slopingPretty`) compared with a
+plain-slopingPretty run; with matching options depth, WSE and velocity are
+identical.
+
 Current private exactness work and its bounded acceptance gates are recorded
 in [other-map qualification](docs/other-map-qualification.md), including the
 Davis square-cell velocity correction, complete temporal tests and remaining
@@ -449,9 +471,8 @@ pixels by at most 2 ulp. A true sloping native run shows the valid mask equals
 the sloping depth mask on bridges Max (973,902 pixels, values and mask
 identical); the 973,532-pixel figure above came from a horizontal-mode
 reference. Horizontal clipping matches native horizontal velocity on bridges
-Max (973,532 pixels) and 03JAN1999 00:00 (402,500), and slopingPretty velocity
-values match natively on every common pixel (its mask follows the rendered
-slopingPretty depth). Derived products, native 7.0.1: bridges 03JAN1999 00:00
+Max (973,532 pixels) and 03JAN1999 00:00 (402,500); slopingPretty is
+qualified separately (above). Derived products, native 7.0.1: bridges 03JAN1999 00:00
 sloping (402,616 pixels) and horizontal (402,500) bit for bit for all three;
 `reduce_max` over all 433 output times bridges Max sloping (973,956) and
 horizontal (973,531) bit for bit; Davis p02 (horizontal Max over 217 times and
