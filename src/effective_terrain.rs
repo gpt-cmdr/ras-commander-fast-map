@@ -4,7 +4,7 @@
 //! Reproduces the float32 grid that `RasTerrain.export_rasmapper_terrain()`
 //! obtains from RasMapperLib (HEC-RAS 7.0.1) for an unmodified terrain, from
 //! the terrain's own source TIFFs, level-0 tile masks and stitch TIN. The rule
-//! below was reverse-engineered from exports alone (no vendor code), and is
+//! below describes that exported output and is
 //! qualified pixel-for-pixel on BaldEagleCrkMulti2D Terrain50 (two sources,
 //! 197,179,058 valid pixels) and five synthetic terrains built by HEC-RAS
 //! 7.0.1 (one to three sources, coarse-over-fine, fine-over-coarse,

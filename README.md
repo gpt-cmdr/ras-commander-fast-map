@@ -437,8 +437,8 @@ with every option RAS Mapper offers there, listed in
 `use_depth_weighted_faces`). RAS Mapper's rule is the same as in plain sloping:
 velocity values do not depend on the render mode, and every velocity-based
 product is clipped where the depth rendered with the *same* slopingPretty
-options is > 0 (`VelocityRenderer`: `outDepths[i] > 0f` from that mode's depth
-computer; derived Max is the per-time union). Shallow reduction and depth
+options is > 0 (derived Max is the per-time union), as RAS Mapper's stored
+maps show. Shallow reduction and depth
 weighting therefore change the mask, not the velocity values. Native HEC-RAS
 7.0.1 stored maps (Max, all four option combinations, 0 mask and 0 bit
 differences): bridges p05 velocity 974,095 / 974,142 / 974,216 / 974,256 pixels
