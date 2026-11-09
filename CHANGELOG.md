@@ -12,6 +12,24 @@ Max on bridges p05 and Davis p02, all four option combinations: 0 mask and
 0 bit differences. The earlier bridges slopingPretty mask difference came from
 comparing a plain run with a shallow-reduction reference.
 
+### Max shear stress (`rasmapper-face-shear-max/1`)
+
+Add RAS Mapper's Shear Stress (Max) for physical 2D cells to `sloping`
+requests through an optional `shear_stress` block, advertised as
+`shear_stress` with `shear_stress_depth: ["rendered", "horizontal"]`. The
+engine computes every face's shear at every stored output time
+(least-squares facepoint velocities, `Faces Area Elevation` hydraulic radius,
+first Manning's n, `k*|V|*V*n^2/R^(1/3)`), keeps each face's Max, averages it to
+facepoints and paints it with the plain sloping weights, clipped by the
+rendered or horizontal Max depth. Native HEC-RAS 7.0.1: BaldEagleCrkMulti2D
+bridges p05 and Davis p02, sloping and horizontal, 0 mask and 0 binary32
+differences, and per-face Max equal to RAS Mapper's PostProcessing
+`Maximum Shear`. Max only; storage areas, stored output times and slopingPretty
+options are refused. See [docs/shear-stress.md](docs/shear-stress.md).
+
+Rust source compatibility: `sloping_session::Request` struct literals must
+include `shear_stress` (use `None`). Serialized requests are unchanged.
+
 ## 0.15.0 - 2026-11-09
 
 Add the explicit native-serial inundation-boundary contract with canonical

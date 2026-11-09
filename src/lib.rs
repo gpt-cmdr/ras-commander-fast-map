@@ -60,6 +60,7 @@ pub mod ownership;
 mod retained;
 pub mod scipy_interp;
 pub mod session;
+pub mod shear;
 pub mod sink;
 pub mod sloping;
 mod sloping_binary;

@@ -232,6 +232,31 @@ impl Mesh {
         Ok(())
     }
 
+    /// Face classification only (no corner reconstruction): the sloping face
+    /// water surfaces of [`Mesh::reconstruct`].
+    pub fn face_water(
+        &self,
+        wse: &[f32],
+        plot_tolerance: f32,
+        pool: &rayon::ThreadPool,
+    ) -> Result<Vec<FaceWater>, MapError> {
+        if wse.len() != self.cells.len()
+            || wse.iter().any(|v| !v.is_finite())
+            || !plot_tolerance.is_finite()
+            || plot_tolerance < 0.0
+        {
+            return Err(MapError::Invalid(
+                "invalid sloping profile or native plot tolerance".into(),
+            ));
+        }
+        Ok(pool.install(|| {
+            self.faces
+                .par_iter()
+                .map(|face| reconstruct_face(face, &self.cells, wse, plot_tolerance))
+                .collect()
+        }))
+    }
+
     pub fn reconstruct(
         &self,
         wse: &[f32],
@@ -782,6 +807,21 @@ impl CellStencil {
     pub(crate) fn face_ids(&self) -> impl Iterator<Item = usize> + '_ {
         self.faces.iter().map(|f| f[0])
     }
+    /// Plain facepoint weights at `point` (RAS Mapper `FPPrevWeights`):
+    /// the square or polygon weights painted by plain-corner sloping.
+    pub(crate) fn plain_weights<'a>(
+        &self,
+        point: [f64; 2],
+        scratch: &'a mut WeightScratch,
+    ) -> Result<&'a [f32], MapError> {
+        scratch.resize(self.corners.len());
+        if let Some(bounds) = self.square {
+            Ok(self.polygon.square_weights(bounds, point, scratch))
+        } else {
+            self.polygon.weights(point, scratch)
+        }
+    }
+
     /// Native face-donation node weights at `point`: `n` corner weights then
     /// `n` face weights, binary32, as used by cell-face sloping painting.
     pub(crate) fn donated_weights<'a>(
