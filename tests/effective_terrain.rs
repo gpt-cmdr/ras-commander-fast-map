@@ -1,7 +1,7 @@
 //! Effective terrain (`rasmapper-effective-terrain/2`): priority, footprint,
 //! stitch TIN, rounding, lattice, terrain modifications and refusals on small synthetic sources.
 use ras_commander_fast_map::effective_terrain::{
-    self, Effective, Grid, METHOD_ID, NODATA, Request, quantize, snap_grid,
+    self, Effective, Grid, METHOD_ID, METHOD_ID_V1, NODATA, Request, quantize, snap_grid,
 };
 use serde_json::{Value, json};
 use std::{
@@ -126,7 +126,7 @@ fn single_source_interior_is_source_and_edges_need_a_full_quad() {
             }
         }
     }
-    assert_eq!(out.report["method_id"], METHOD_ID);
+    assert_eq!(out.report["method_id"], METHOD_ID_V1);
 }
 
 #[test]
@@ -341,6 +341,7 @@ fn modifications_follow_priority_and_round() {
     let layers = out.report["modifications"]["layers"].as_array().unwrap();
     assert_eq!(layers[0]["name"], "pad");
     assert_eq!(layers[1]["name"], "cut");
+    assert_eq!(out.report["method_id"], METHOD_ID);
 }
 
 #[test]

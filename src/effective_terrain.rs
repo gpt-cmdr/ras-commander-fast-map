@@ -146,12 +146,19 @@ pub struct Request {
 
 pub fn method_record() -> Value {
     json!({
-        "method_id": METHOD_ID,
-        "compatible_method_ids": [METHOD_ID_V1],
-        "request_schema": SCHEMA,
-        "request_schemas": [SCHEMA_V1, SCHEMA],
-        "reference": "RasTerrain.export_rasmapper_terrain(downsample_factor=1, rasterize_modifications=False), HEC-RAS 7.0.1; with modification_layers, rasterize_modifications=True",
-        "modifications": crate::terrain_mods::method_record(),
+        "method_id": METHOD_ID_V1,
+        "request_schema": SCHEMA_V1,
+        "request_schemas": [SCHEMA_V1],
+        "reference": "RasTerrain.export_rasmapper_terrain(downsample_factor=1, rasterize_modifications=False), HEC-RAS 7.0.1",
+        // Terrain modifications are parked: schema 2 is accepted, but no whole
+        // modified terrain equals the HEC-RAS export yet, so it is not advertised.
+        "parked": {
+            "method_id": METHOD_ID,
+            "request_schema": SCHEMA,
+            "status": "unqualified; accepted but not advertised",
+            "reference": "RasTerrain.export_rasmapper_terrain(downsample_factor=1, rasterize_modifications=True), HEC-RAS 7.0.1",
+            "modifications": crate::terrain_mods::method_record()
+        },
         "lattice": "finest source (ties: priority), union of source extents snapped outward; or a supplied grid",
         "order": "stitch TIN first; then sources in priority order",
         "source_test": "all four quad centres valid; after a higher-priority source has a valid pixel containing the point, at least one quad centre must be in the source footprint (mask bit 0 and valid)",
@@ -164,7 +171,7 @@ pub fn method_record() -> Value {
             "synthetic HEC-RAS 7.0.1 terrains (1-3 sources)": "4 of 5 bit-identical; 5 stitch-TIN corner px differ on the fifth (687,908 valid)"
         },
         "known_differences": "a few pixels where a stitch TIN triangle meets a nodata corner; RAS Mapper's own exports of one terrain disagree there (2 px of T2 change when an unrelated modification is rasterized)",
-        "refused": "unqualified modification types (see modifications.refused), non-float32/rotated/non-square sources, sources in different CRSs"
+        "refused": "terrains with modifications (parked; see parked.modifications), non-float32/rotated/non-square sources, sources in different CRSs"
     })
 }
 
@@ -673,8 +680,13 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
     let mods = crate::terrain_mods::apply(&req.modification_layers, &grid, &mut values)?;
     let mods_seconds = mods_started.elapsed().as_secs_f64();
     let valid = values.iter().filter(|v| **v != NODATA).count() as u64;
+    let method_id = if req.schema == SCHEMA_V1 {
+        METHOD_ID_V1
+    } else {
+        METHOD_ID
+    };
     let report = json!({
-        "method_id": METHOD_ID,
+        "method_id": method_id,
         "grid": {"origin_x": grid.origin_x, "origin_y": grid.origin_y, "cell_size": grid.cell_size,
                   "width": grid.width, "height": grid.height},
         "sources": sources.iter().zip(&per_source).map(|(s, n)| json!({
