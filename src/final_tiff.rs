@@ -545,18 +545,25 @@ pub struct Writer {
     shared_tiles: u64,
 }
 
+/// Resolve the CRS GeoKey code and whether it is geographic, refusing codes
+/// the final writer cannot encode. Request planning calls this before reads.
+pub fn check_epsg(epsg: u32) -> Result<(u16, bool), MapError> {
+    let code = u16::try_from(epsg)
+        .ok()
+        .filter(|c| *c != 0)
+        .ok_or_else(|| {
+            MapError::Unsupported("final_format needs an EPSG code below 65536".into())
+        })?;
+    let geographic = terrio::crs::SpatialRef::from_epsg(epsg)
+        .map_err(|e| MapError::Unsupported(format!("final_format CRS EPSG:{epsg}: {e}")))?
+        .is_geographic();
+    Ok((code, geographic))
+}
+
 impl Writer {
     /// Create the file and write its header and the shared nodata tile.
     pub fn create(path: &Path, layout: &Layout, epsg: u32) -> Result<Self, MapError> {
-        let code = u16::try_from(epsg)
-            .ok()
-            .filter(|c| *c != 0)
-            .ok_or_else(|| {
-                MapError::Unsupported("final_format needs an EPSG code below 65536".into())
-            })?;
-        let geographic = terrio::crs::SpatialRef::from_epsg(epsg)
-            .map_err(|e| MapError::Unsupported(format!("final_format CRS EPSG:{epsg}: {e}")))?
-            .is_geographic();
+        let (code, geographic) = check_epsg(epsg)?;
         // GeoKey directory: model type, raster type PixelIsArea, the EPSG CRS code.
         let geo_keys = vec![
             1,

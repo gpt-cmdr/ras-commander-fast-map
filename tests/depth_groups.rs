@@ -475,6 +475,17 @@ fn cli_final_format_places_legacy_values_on_the_full_grid() {
         String::from_utf8_lossy(&refused.stderr)
     );
     assert!(!f.0.join("gridded/a/depth.tif").exists());
+    // An EPSG code the final writer cannot encode is refused before any output.
+    let mut wide = selected.clone();
+    wide["epsg"] = 70000.into();
+    let refused = run("wide-epsg", &wide);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("EPSG code below 65536"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!f.0.join("wide-epsg/a").exists());
 }
 
 #[test]

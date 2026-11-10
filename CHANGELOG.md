@@ -20,13 +20,15 @@ Add a direct dependency on `flate2` with its pure-Rust `zlib-rs` backend, a
 package terrio 0.4.2 already resolved; no package is added to `Cargo.lock`.
 See [the evaluation and limits](docs/performance-improvements.md#final-format-single-pass-writer).
 
-Qualification (unqualified timing): Spring River p02 Max Depth/WSE, sloping,
-4 CPUs, 1 in-flight, Commander 0.117.0 plus its `final_format` staging change,
-Windows MinGW build of the 0.16-lineage source. Five old/new pairs: 0 mask and
+Pre-port evidence (unqualified timing): Spring River p02 Max Depth/WSE,
+sloping, 4 CPUs, 1 in-flight, Commander 0.117.0 plus its `final_format` staging
+change, Windows MinGW build of the private pre-port writer source, not this
+0.17.0 build. Five old/new pairs: 0 mask and
 0 bit differences at base, overview 2 and overview 4 for both products. Wall
 time about 61 s against 134 s (about 27 s against 131 s excluding the
 comparison step) on an 8-vCPU VM at about 20% background load, above the 20%
-quiet gate, so these timings are not qualified benchmarks.
+quiet gate, so these timings are not qualified benchmarks. A refusal of EPSG
+codes the writer cannot encode now happens from the request, before any read.
 
 ## 0.16.0 - 2026-11-09
 

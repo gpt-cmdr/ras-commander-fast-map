@@ -944,6 +944,10 @@ fn run_internal(
                 .into(),
         ));
     }
+    if final_layout.is_some() {
+        // Same refusal as final_tiff::Writer::create, before any read.
+        crate::final_tiff::check_epsg(req.epsg)?;
+    }
     if !matches!(req.schema.as_str(), SCHEMA | NATIVE_GRID_SCHEMA)
         || !(1..=64).contains(&req.threads)
         || !(1..=64).contains(&req.max_inflight_profiles)
