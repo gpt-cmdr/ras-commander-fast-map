@@ -119,7 +119,83 @@ opt-in: fixed overhead can also increase RSS on tiny grids. These observations
 do not establish a universal optimal stripe size or a large-model speedup.
 
 The initial improvement experiments did not run full River/Creek end-to-end comparisons. The subsequent [matched rerun](performance-comparison-rerun.md) qualifies River plain Max Depth/WSE with three warm pairs. Creek initially matched but native-repeat export variation stopped its warm comparison; no Creek median is qualified.
-Large velocity coverage, one-core/small-array timing thresholds, cold-cache
-experiments and a final-format single-pass writer remain separate follow-up
-work. No approximation, guard override, dependency change or release was used
-to obtain the reported results.
+Large velocity coverage, one-core/small-array timing thresholds and cold-cache
+experiments remain separate follow-up work. No approximation, guard override,
+dependency change or release was used to obtain the results above; the
+final-format writer below is later work that adds a direct `flate2` dependency.
+
+## Final-format single-pass writer
+
+Opt-in `final_format` (with `compression: "DEFLATE"`) writes the delivery
+raster directly: full-grid placement at an integer offset, a numeric nodata
+value, tiled DEFLATE and average overviews. The [README](../README.md#final-delivery-format-final_format)
+records the wire fields. `src/final_tiff.rs` owns the encoding; it does not use
+GDAL, Python or terrio's writer. Existing requests, method IDs and product
+arithmetic are unchanged.
+
+| Concern | Implementation |
+| --- | --- |
+| Memory | One row of tiles per level plus the rows handed to the next level; admitted in the request plan before payload reads |
+| Parallelism | Tile compression, window placement and overview rows run on the request's Rayon pool; no additional pool |
+| Determinism | Tiles are written in tile order per completed tile row; bytes are independent of thread count and row batching |
+| Nodata tiles | Rows outside the window are never materialized; tiles holding only nodata, at every level, reference one encoded tile |
+| Overviews | Cascade (level 4 from level 2) with GDAL's masked `AVERAGE` weights and binary64 accumulation order |
+| Refusals | Non-finite valid values and values GDAL would read as nodata; placement that disagrees with the request window |
+
+DEFLATE uses `flate2` with its pure-Rust `zlib-rs` backend. Compressed bytes
+are not expected to equal GDAL's; decoded values and masks are.
+
+### Evaluation
+
+Release unit tests decode every level through the terrio reader for odd grids,
+non-aligned and tile-aligned placement, a fractional cascade ratio, single
+rows/columns, an all-nodata product and a 40,000 by 40,000 BigTIFF holding one
+valid pixel. They compare Float32 bits with a whole-array statement of the same
+arithmetic, and file bytes across 1 to 8 threads and row batches. A CLI test
+checks that window pixels equal the LZW route's bits.
+
+An independent rasterio 1.4.4 / GDAL 3.10.3 comparison used the expanded-corpus
+harness `normalize()` as reference and its `compare()` as acceptance, outside
+this repository. Seven synthetic EPSG:3433 cases with NaN holes pass with zero
+mask and zero Float32-bit differences at base, overview 2 and overview 4:
+811 by 1037 with a 407 by 613 window at row 131, column 257; 1023 by 777; a
+window filling its grid; a window in the far corner; one row; tile-aligned
+placement; and an all-nodata product. A 5 by 3 grid passes the same per-level
+comparison, where the harness's fixed `[2, 4]` decimation assertion does not
+apply to the reference either. A `[2, 4, 8, 16]` chain also matches a rasterio
+rebuild at every level for the six cases at least 32 pixels wide and high.
+The cases include means that land exactly on, and within the mask tolerance
+of, the nodata value.
+
+Single observations on CLB01 (8-core i7-11700K, sampled total CPU load 91 to
+100% from other work, local scratch disk), 20,011 by 20,003 grid, 17,371 by 13,229 window at
+row 1019, column 3787, 32,083,460 valid pixels (8.0%), noisy synthetic values,
+`[2, 4]` overviews, 256 tiles, level 6:
+
+| Route | Threads | Seconds |
+| --- | --- | --- |
+| Harness `normalize()` (rasterio, reads the LZW window product) | 1 | 39.8 |
+| Native final-format writer, in-memory window | 1 | 7.5 |
+| Native final-format writer, in-memory window | 4 | 3.9 |
+
+The three files pass the harness comparison at all levels (32,083,460,
+8,648,611 and 2,168,560 valid pixels) and the two native files are byte
+identical. Of 8,241 tiles, 7,129 reference the shared nodata tile; the native
+file is 141.5 MB against 143.3 MB. A smoother in-process synthetic of the same
+shape observed about 3.0 s at one thread and 1.2 s at four under lighter load.
+An earlier run of the table at 40 to 50% load observed 32.8, 5.7 and 3.5 s.
+These are single observations on a loaded workstation, not benchmarks: they exclude mapping,
+the Python stream and the reference's own source write, and they do not
+establish a Spring River end-to-end time. That requires a matched rerun with
+Commander staging `final_format`.
+
+### Limits and open items
+
+- Only Float32 Depth/WSE of sloping requests; `depth-groups` refuses `DEFLATE`.
+- Overview factors are consecutive powers of two; only GDAL 3.10.3 behavior
+  has been compared. Predictor 2/3, strips and other resamplings are absent.
+- The CRS is written as an EPSG code (below 65536) in three GeoKeys.
+- Edge-tile padding is nodata; GDAL readers ignore it.
+- A failed write leaves the partial file, as the LZW route does.
+- The writer lives in this crate; terrio 0.4.2 remains the reader and the
+  LZW/strip writer, and its parallel work stays on the request pool.

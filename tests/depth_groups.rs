@@ -368,6 +368,115 @@ fn cli_output_controls_and_binary_group_framing() {
     assert!(serde_json::from_value::<Request>(invalid).is_err());
 }
 
+/// The final delivery option changes only nodata, placement, tiling, compression
+/// and overviews: window pixels keep the legacy LZW product bits.
+#[test]
+fn cli_final_format_places_legacy_values_on_the_full_grid() {
+    let (f, mut model) = fixture();
+    model["stream_outputs"] = true.into();
+    model["geotiff_outputs"] = true.into();
+    model["window"] = json!([1, 1, 3, 2]);
+    model["profiles"] =
+        json!([{"id":"a","values_files":["a.bin"]},{"id":"b","values_files":["b.bin"]}]);
+    let run = |name: &str, request: &Value| {
+        fs::write(f.0.join("request.json"), request.to_string()).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_ras2fim-batch"))
+            .args(["sloping"])
+            .arg(f.0.join("request.json"))
+            .arg(f.0.join(name))
+            .output()
+            .unwrap()
+    };
+    let legacy = run("legacy", &model);
+    assert!(legacy.status.success());
+    let mut selected = model.clone();
+    selected["compression"] = "DEFLATE".into();
+    selected["final_format"] = json!({"nodata":-9999.0,"block_size":16,
+        "full_grid":{"width":4,"height":4,"row_offset":1,"col_offset":1,
+            "transform":[0.,1.,0.,4.,0.,-1.]},
+        "overview_factors":[2],"overview_resampling":"average"});
+    let output = run("final", &selected);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let header: Value = serde_json::from_str(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(header["products"], "native-geotiff/1");
+    assert_eq!(header["compression"], "DEFLATE");
+    assert_eq!(header["final_format"]["full_grid"]["row_offset"], 1);
+    let mut streamed = selected.clone();
+    streamed["row_stream_rows"] = 1.into();
+    assert!(run("rows", &streamed).status.success());
+    for profile in ["a", "b"] {
+        for product in ["depth", "wse"] {
+            let name = format!("{profile}/{product}.tif");
+            let window = read_tiff(&f.0.join("legacy").join(&name));
+            let path = f.0.join("final").join(&name);
+            let full = read_tiff(&path);
+            assert_eq!((window.len(), full.len()), (6, 16));
+            let mut valid = 0;
+            for (i, v) in full.iter().enumerate() {
+                let (r, c) = (i / 4, i % 4);
+                let source = ((1..3).contains(&r) && (1..4).contains(&c))
+                    .then(|| window[(r - 1) * 3 + c - 1])
+                    .filter(|w| !w.is_nan());
+                valid += usize::from(source.is_some());
+                assert_eq!(
+                    v.to_bits(),
+                    source.unwrap_or(-9999.0).to_bits(),
+                    "{name} {i}"
+                );
+            }
+            assert_eq!(
+                header[format!("{product}_final")]["valid_pixels"]
+                    .as_u64()
+                    .filter(|_| profile == "a")
+                    .unwrap_or(valid as u64),
+                valid as u64
+            );
+            let bytes = fs::read(&path).unwrap();
+            assert_eq!(bytes, fs::read(f.0.join("rows").join(&name)).unwrap());
+            assert_eq!(compression(&path), 8);
+            let raster = terrio::LazyRaster::open_tiff(path.to_str().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(raster.overviews(), vec![(2, 2)]);
+            assert_eq!(raster.block_size(), Some((16, 16)));
+            assert_eq!(raster.nodata(), Some(-9999.0));
+            assert_eq!(raster.geo_transform(), [0., 1., 0., 4., 0., -1.]);
+        }
+    }
+    // Refused from the request alone: wrong placement, or DEFLATE without the format.
+    let mut misplaced = selected.clone();
+    misplaced["final_format"]["full_grid"]["col_offset"] = 0.into();
+    assert!(!run("misplaced", &misplaced).status.success());
+    assert!(!f.0.join("misplaced/a/depth.tif").exists());
+    let mut bare = model.clone();
+    bare["compression"] = "DEFLATE".into();
+    assert!(!run("bare", &bare).status.success());
+    // Final delivery is not qualified with the stored tile grid contract.
+    let mut gridded = selected.clone();
+    gridded["schema"] = "ras-commander-sloping-request/2".into();
+    gridded["grid_contract"] = json!({"id":"rasmapper-stored-tile-grid/1","source_width":4,
+        "source_height":4,"tile_size":256,"source_geo_transform":[0.,1.,0.,4.,0.,-1.],
+        "output_geo_transform":[0.,1.,0.,4.,0.,-1.]});
+    let refused = run("gridded", &gridded);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("stored tile grid contract"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!f.0.join("gridded/a/depth.tif").exists());
+}
+
 #[test]
 fn native_extensions_are_strict_and_do_not_change_base_request() {
     let (_f, model) = fixture();
