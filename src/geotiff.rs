@@ -144,6 +144,57 @@ impl RowWriter {
     }
 }
 
+/// Row-streamed product file: legacy strips, or the opt-in final delivery format.
+pub(crate) enum ProductWriter {
+    Strips(Box<RowWriter>),
+    Final(Box<crate::final_tiff::Writer>),
+}
+
+impl ProductWriter {
+    /// `transform` is the product window's; `layout` carries the final placement.
+    pub(crate) fn create(
+        path: &Path,
+        width: usize,
+        height: usize,
+        transform: [f64; 6],
+        epsg: u32,
+        compression: crate::native_output::Compression,
+        layout: Option<&crate::final_tiff::Layout>,
+    ) -> Result<Self, MapError> {
+        Ok(match layout {
+            Some(layout) => Self::Final(Box::new(crate::final_tiff::Writer::create(
+                path, layout, epsg,
+            )?)),
+            None => Self::Strips(Box::new(RowWriter::create(
+                path,
+                width,
+                height,
+                transform,
+                epsg,
+                compression,
+            )?)),
+        })
+    }
+
+    pub(crate) fn write_rows(
+        &mut self,
+        values: &[f32],
+        pool: &rayon::ThreadPool,
+    ) -> Result<(), MapError> {
+        match self {
+            Self::Strips(writer) => writer.write_rows(values),
+            Self::Final(writer) => writer.write_rows(values, pool),
+        }
+    }
+
+    pub(crate) fn finish(self) -> Result<(), MapError> {
+        match self {
+            Self::Strips(writer) => writer.finish(),
+            Self::Final(writer) => writer.finish().map(|_| ()),
+        }
+    }
+}
+
 pub(crate) fn write(
     path: &Path,
     values: Vec<f32>,

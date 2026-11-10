@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.17.0 - 2026-11-10
+
+### Final-format native delivery
+
+Add opt-in `final_format` with `compression: "DEFLATE"` for native sloping
+Depth/WSE GeoTIFFs: full-grid placement at an integer offset, a numeric nodata
+value, 256-default tiles, zlib DEFLATE and cascaded average overviews matching
+GDAL 3.10.3 `AVERAGE` masks and Float32 bits. Tiles are compressed on the
+request pool with one tile row per level in memory; nodata-only tiles share one
+encoded tile; file bytes are independent of thread count and row batching.
+Existing requests, method IDs and product arithmetic are unchanged. The
+capability is advertised as `native_final_format`; `depth-groups` refuses
+`DEFLATE`, and sloping refuses `final_format` with the stored tile grid
+contract or shear stress. Add the public `final_tiff` module and a
+`final_geotiff` example.
+
+Add a direct dependency on `flate2` with its pure-Rust `zlib-rs` backend, a
+package terrio 0.4.2 already resolved; no package is added to `Cargo.lock`.
+See [the evaluation and limits](docs/performance-improvements.md#final-format-single-pass-writer).
+
+Pre-port evidence (unqualified timing): Spring River p02 Max Depth/WSE,
+sloping, 4 CPUs, 1 in-flight, Commander 0.117.0 plus its `final_format` staging
+change, Windows MinGW build of the private pre-port writer source, not this
+0.17.0 build. Five old/new pairs: 0 mask and
+0 bit differences at base, overview 2 and overview 4 for both products. Wall
+time about 61 s against 134 s (about 27 s against 131 s excluding the
+comparison step) on an 8-vCPU VM at about 20% background load, above the 20%
+quiet gate, so these timings are not qualified benchmarks. A refusal of EPSG
+codes the writer cannot encode now happens from the request, before any read.
+
 ## 0.16.0 - 2026-11-09
 
 Advertise slopingPretty velocity, per-time D x V, D x V^2 and Froude and their

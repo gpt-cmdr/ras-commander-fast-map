@@ -136,6 +136,11 @@ impl Request {
                 "invalid depth-groups schema, jobs, selectors, products or cutoff".into(),
             ));
         }
+        if self.compression == Compression::Deflate {
+            return Err(MapError::Unsupported(
+                "depth groups write NONE or LZW; DEFLATE belongs to final_format".into(),
+            ));
+        }
         self.model.options.validate()?;
         if self.model.options != crate::sloping::Options::default()
             || self.model.velocity_normals_files.is_some()
