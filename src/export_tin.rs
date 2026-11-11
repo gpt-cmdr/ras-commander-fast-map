@@ -43,7 +43,7 @@ use crate::MapError;
 pub(crate) const BLOCK_VALID: u8 = 1;
 /// Mask bits 1-4: a neighbour (below 2, right 4, left 8, above 16) is off.
 pub(crate) const BLOCK_EDGES: u8 = 2 | 4 | 8 | 16;
-const TILE: usize = 256;
+pub(crate) const TILE: usize = 256;
 
 /// .NET type identity used in the export's segment hash. The hash of a
 /// segment is `K xor (lo32 xor hi32)(bits(A.X))` as a signed 32-bit value,
@@ -99,15 +99,16 @@ impl TileGrid {
         ((self.max_y - y) / self.cs).floor() as i64
     }
 
-    fn ccx(&self, c: i64) -> f64 {
+    pub(crate) fn ccx(&self, c: i64) -> f64 {
         self.min_x + self.cs * (c as f64 + 0.5)
     }
 
-    fn ccy(&self, r: i64) -> f64 {
+    pub(crate) fn ccy(&self, r: i64) -> f64 {
         self.max_y - self.cs * (r as f64 + 0.5)
     }
 
-    fn overlaps(&self, e: &[f64; 4]) -> bool {
+    /// `e` = `[left, right, bottom, top]`.
+    pub(crate) fn overlaps(&self, e: &[f64; 4]) -> bool {
         let [left, right, bottom, top] = *e;
         !(self.max_x < left || self.min_x > right || self.min_y > top || self.max_y < bottom)
     }
@@ -427,7 +428,7 @@ fn cross(ax: f64, ay: f64, bx: f64, by: f64, cx: f64, cy: f64) -> f64 {
 }
 
 #[inline]
-fn close_to(px: f64, py: f64, qx: f64, qy: f64, d: f64) -> bool {
+pub(crate) fn close_to(px: f64, py: f64, qx: f64, qy: f64, d: f64) -> bool {
     let a = (px - qx).abs();
     if a > d {
         return false;

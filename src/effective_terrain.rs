@@ -489,7 +489,7 @@ impl SourceLattice {
 /// The export's output lattice: 256-pixel tiles whose pitch and pixel size
 /// RAS Mapper recomputes from tile extents, so pixel centres differ from
 /// `origin + (i + 0.5) * cell` in the last bits.
-struct OutputLattice {
+pub(crate) struct OutputLattice {
     min_x: f64,
     max_y: f64,
     pitch: f64,
@@ -498,7 +498,7 @@ struct OutputLattice {
 }
 
 impl OutputLattice {
-    fn new(grid: &Grid) -> Self {
+    pub(crate) fn new(grid: &Grid) -> Self {
         let (tx, ty) = (grid.width.div_ceil(TILE), grid.height.div_ceil(TILE));
         let (min_x, max_y, cs) = (grid.origin_x, grid.origin_y, grid.cell_size);
         let max_x = min_x + tx as f64 * cs * TILE as f64;
@@ -532,7 +532,7 @@ impl OutputLattice {
     }
 
     /// Full 256 x 256 geometry of output tile (`l`, `m`).
-    fn tile_grid(&self, l: usize, m: usize) -> TileGrid {
+    pub(crate) fn tile_grid(&self, l: usize, m: usize) -> TileGrid {
         let p = self.pitch;
         TileGrid::new(
             self.min_x + p * m as f64,

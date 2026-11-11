@@ -8,6 +8,34 @@ still advertises `rasmapper-effective-terrain/1` with request schema 1 only;
 schema 2 is accepted and described under `effective_terrain.parked`, and a
 schema 1 receipt still reports method `/1`.
 
+### Effective terrain: RAS Mapper's ground-line ribbon TIN and inclusive ellipses
+
+Ground lines (`terrain_mods`) now follow RasMapperLib 7.0.1's export arithmetic
+instead of the fitted template (interoperability study, prose findings only; no
+vendor code used or copied): binary32 centre profile (stations shifted to 0,
+clamped to the length, 100 ft / 100/3.281 m densification with RAS Mapper's
+running-start arithmetic, clamped queries); toe and ridge offset lines carrying
+the centerline station as M, with intersection or arc joints, square ends,
+self-intersection trimming and M-fraction injection of the profile stations;
+binary32/binary64 ridge and toe elevations; a five-ribbon zipper TIN (not
+Delaunay) rasterized per 256-pixel output tile with the export TIN rasterizer,
+the last triangle of a feature winning. Combination is RAS Mapper's binary32
+replacement (strict for SetIfHigher/SetIfLower). Ellipses are inclusive
+(`<= 1`) at output-tile pixel centres and may be rotated (new optional
+`rotation`, degrees). Newly supported: ground-line SetValue and Max Reach <=
+Top Width. Newly refused: any ground line with a `System Name` (new optional
+`system_name`; RAS Mapper builds named ground lines through a separate system
+path, measured 1,506 px apart on one channel) and negative side slopes. New
+optional layer field `length_units` (`feet` default, `meters`). Whole terrains
+vs HEC-RAS 7.0.1 exports with modifications (export a, pixels where two
+exports differ excluded): B2 443 -> 0 value differences, B1 3 -> 0, B3, B4 and
+A unchanged, and no remaining difference lies inside a modification footprint.
+Synthetic 20 ft terrains with blank System Names: 0 modified pixels differ on a
+22.5 km channel, a 21.2 km levee, a combined case, short-segment levees,
+ground-line SetValue, Max Reach <= Top Width and five rotated ellipses; 2 of
+8,935 pixels at 1/32 ft on a sharp-bend/hairpin channel case. Method IDs and
+request schemas are unchanged; the new fields are optional.
+
 ### Effective terrain: RAS Mapper's per-tile export TIN (gap fill)
 
 After sampling, each 256-pixel output tile now triangulates the edges of valid
