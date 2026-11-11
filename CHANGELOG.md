@@ -18,6 +18,19 @@ Measured on the Whisky Chitto p04 staged schema /2 requests (4,483 XS, 12,919 x
 4 CPUs): render 0.99 s at 1 worker, 0.49 s at 4; call total 4.58 s to 4.10 s;
 outputs SHA256-equal to v0.17.0.
 
+### Multi-profile 1D requests
+
+`one-d-diagnostic` schemas /2-/4 accept `levels_files` (1-256 profiles) as an
+alternative to `levels_file`; exactly one is required. Inputs, terrain and the
+prepared surface are read and built once; profile `i` is rendered into reused
+buffers and written to `profile-{i:04}/` with its own report in the
+single-profile shape. The top-level report lists every profile and carries the
+shared timing. All levels are read and admitted before any output is created.
+Outputs are bit-identical to one request per profile; method records advertise
+`multi_profile`. Single-profile requests and their output layout are unchanged.
+On Whisky Chitto p04 (3 profiles, 4 workers, warm medians of 3), one request
+took 5.88 s against 12.50 s for three single requests.
+
 ## 0.17.0 - 2026-11-10
 
 ### Final-format native delivery

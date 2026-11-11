@@ -18,6 +18,7 @@ pub const NATIVE_SCHEMA: &str = "fast-map-one-d-diagnostic/2";
 pub const CLIPPED_SCHEMA: &str = "fast-map-one-d-diagnostic/3";
 pub const STORED_GRID_SCHEMA: &str = "fast-map-one-d-diagnostic/4";
 pub const CLIPPING_SCOPE: &str = "levees-and-xs-end-obstructions-only";
+pub const MAX_PROFILES: usize = 256;
 
 #[derive(Deserialize, Clone, Copy)]
 #[serde(deny_unknown_fields)]
@@ -44,7 +45,13 @@ pub struct Request {
     pub xs_ids_file: PathBuf,
     pub segment_count: usize,
     pub cross_section_count: usize,
-    pub levels_file: PathBuf,
+    /// One profile's XS levels. Exactly one of `levels_file` and `levels_files`.
+    #[serde(default)]
+    pub levels_file: Option<PathBuf>,
+    /// Schemas /2-/4: up to 256 profiles sharing one read and surface prepare;
+    /// profile `i` is written to `profile-{i:04}/` with its own report.
+    #[serde(default)]
+    pub levels_files: Option<Vec<PathBuf>>,
     pub terrain_file: PathBuf,
     pub width: usize,
     pub height: usize,
@@ -143,6 +150,18 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
     {
         return Err(MapError::Invalid("1D schema /3 requires normalized M, XS clips and explicit clipping scope; older schemas exclude clipping".into()));
     }
+    let level_paths: Vec<&PathBuf> = match (&req.levels_file, &req.levels_files) {
+        (Some(one), None) => vec![one],
+        (None, Some(many)) if native && !many.is_empty() && many.len() <= MAX_PROFILES => {
+            many.iter().collect()
+        }
+        _ => {
+            return Err(MapError::Invalid(format!(
+                "1D requires exactly one of levels_file or levels_files (1-{MAX_PROFILES}; schemas /2-/4)"
+            )));
+        }
+    };
+    let multi = req.levels_files.is_some();
     let threads = req.threads.unwrap_or(1);
     if threads == 0 || threads > 64 || (!native && threads != 1) {
         return Err(MapError::Invalid(
@@ -262,6 +281,7 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         .and_then(|v| {
             req.cross_section_count
                 .checked_mul(4)
+                .and_then(|n| n.checked_mul(level_paths.len()))
                 .and_then(|n| v.checked_add(n))
         })
         .and_then(|v| {
@@ -324,17 +344,22 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
             })
         })
         .collect::<Result<Vec<_>, MapError>>()?;
-    let levels = read_records(
-        &base.join(&req.levels_file),
-        req.cross_section_count,
-        f32::from_le_bytes,
-    )?;
+    let mut profiles = Vec::new();
+    profiles
+        .try_reserve_exact(level_paths.len())
+        .map_err(|e| MapError::Budget(e.to_string()))?;
+    for path in &level_paths {
+        profiles.push(read_records(
+            &base.join(path),
+            req.cross_section_count,
+            f32::from_le_bytes,
+        )?);
+    }
     let terrain = read_records(&base.join(&req.terrain_file), pixels, f32::from_le_bytes)?;
     if terrain.iter().any(|v| v.is_infinite()) {
         return Err(MapError::Invalid("1D terrain must be finite or NaN".into()));
     }
     let read_seconds = tick.elapsed().as_secs_f64();
-    let mut prepare_seconds = 0.0;
     let tick = Instant::now();
     let mut depth = Vec::new();
     let mut wse = Vec::new();
@@ -347,13 +372,25 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
     wse.resize(pixels, f32::NAN);
     let alloc_seconds = tick.elapsed().as_secs_f64();
     let tick = Instant::now();
-    let valid = if native {
+    let grid = crate::one_d_native::Grid {
+        width: req.width,
+        height: req.height,
+        geo_transform: gt,
+        tile_size: req.tile_size.unwrap_or(1),
+    };
+    let native_window = crate::one_d_native::Window {
+        col: window.col,
+        row: window.row,
+        width: window.width,
+        height: window.height,
+    };
+    let surface = if native {
         let ranks = read_records(
             &base.join(req.render_order_file.as_ref().unwrap()),
             req.segment_count,
             u32::from_le_bytes,
         )?;
-        let surface = if clipped {
+        Some(if clipped {
             let normalized_m = read_records(
                 &base.join(req.normalized_m_file.as_ref().unwrap()),
                 req.point_count,
@@ -392,62 +429,21 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
                 &ranks,
                 surface_budget,
             )?
-        };
-        prepare_seconds = tick.elapsed().as_secs_f64();
-        let pool = if threads > 1 {
-            Some(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(threads)
-                    .build()
-                    .map_err(|e| MapError::Internal(e.to_string()))?,
-            )
-        } else {
-            None
-        };
-        surface.render_into_with(
-            &levels,
-            &terrain,
-            crate::one_d_native::Grid {
-                width: req.width,
-                height: req.height,
-                geo_transform: gt,
-                tile_size: req.tile_size.unwrap(),
-            },
-            crate::one_d_native::Window {
-                col: window.col,
-                row: window.row,
-                width: window.width,
-                height: window.height,
-            },
-            &mut depth,
-            &mut wse,
-            pool.as_ref(),
-        )?
+        })
     } else {
-        let surface = PreparedSurface::new(
-            &points,
-            &triangles,
-            &segments,
-            req.cross_section_count,
-            geometry,
-        )?;
-        let profile = surface.profile(&levels)?;
-        let mut valid = 0;
-        for (i, ground) in terrain.iter().enumerate() {
-            let point = [
-                gt[0] + (i % req.width) as f64 * gt[1] + 0.5 * gt[1],
-                gt[3] + (i / req.width) as f64 * gt[5] + 0.5 * gt[5],
-            ];
-            let (d, z) = profile
-                .sample(point, *ground)
-                .unwrap_or((f32::NAN, f32::NAN));
-            valid += usize::from(d.is_finite());
-            depth[i] = d;
-            wse[i] = z;
-        }
-        valid
+        None
     };
-    let render_seconds = tick.elapsed().as_secs_f64() - prepare_seconds;
+    let prepare_seconds = tick.elapsed().as_secs_f64();
+    let pool = if threads > 1 {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|e| MapError::Internal(e.to_string()))?,
+        )
+    } else {
+        None
+    };
     let output_gt = layout
         .map(|l| l.window_transform([window.col, window.row, window.width, window.height]))
         .unwrap_or([
@@ -458,40 +454,172 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
             0.,
             gt[5],
         ]);
-    fs::create_dir(output)?;
-    let mut report = json!({"schema": req.schema, "method": if clipped {crate::one_d_native::clipped_method_record()} else if native { crate::one_d_native::method_record() } else { crate::one_d::method_record() },
-        "status": "complete", "scope": req.scope, "width": window.width, "height": window.height,
-        "geo_transform": output_gt, "source_width": req.width, "source_height": req.height,
-        "source_geo_transform":gt, "source_col":window.col, "source_row":window.row, "tile_size":req.tile_size, "clipping_scope":req.clipping_scope, "valid_pixels": valid, "planned_bytes": planned,
-        "depth_file": "depth.bin", "wse_file": "wse.bin", "dtype": "little-endian float32", "nodata": "NaN"});
-    if let Some(layout) = layout {
-        report["grid_contract"] = json!(req.grid_contract);
-        report["output_geo_transform"] = json!(layout.output);
+    let method = if clipped {
+        crate::one_d_native::clipped_method_record()
+    } else if native {
+        crate::one_d_native::method_record()
+    } else {
+        crate::one_d::method_record()
+    };
+    let profile_report = |valid: usize| {
+        let mut report = json!({"schema": req.schema, "method": method,
+            "status": "complete", "scope": req.scope, "width": window.width, "height": window.height,
+            "geo_transform": output_gt, "source_width": req.width, "source_height": req.height,
+            "source_geo_transform":gt, "source_col":window.col, "source_row":window.row, "tile_size":req.tile_size, "clipping_scope":req.clipping_scope, "valid_pixels": valid, "planned_bytes": planned,
+            "depth_file": "depth.bin", "wse_file": "wse.bin", "dtype": "little-endian float32", "nodata": "NaN",
+            "threads": threads});
+        if let Some(layout) = layout {
+            report["grid_contract"] = json!(req.grid_contract);
+            report["output_geo_transform"] = json!(layout.output);
+        }
+        report
+    };
+    // The output folder is created only after the first successful render, so
+    // refused requests leave no output (unchanged single-profile behaviour).
+    let mut created = false;
+    let mut summaries = Vec::new();
+    let mut last_report = Value::Null;
+    let mut failure = None;
+    for (index, levels) in profiles.iter().enumerate() {
+        let folder = if multi {
+            output.join(format!("profile-{index:04}"))
+        } else {
+            output.to_path_buf()
+        };
+        let tick = Instant::now();
+        let rendered = match &surface {
+            Some(surface) => surface.render_into_with(
+                levels,
+                &terrain,
+                grid,
+                native_window,
+                &mut depth,
+                &mut wse,
+                pool.as_ref(),
+            ),
+            None => PreparedSurface::new(
+                &points,
+                &triangles,
+                &segments,
+                req.cross_section_count,
+                geometry,
+            )
+            .and_then(|surface| {
+                let profile = surface.profile(levels)?;
+                let mut valid = 0;
+                for (i, ground) in terrain.iter().enumerate() {
+                    let point = [
+                        gt[0] + (i % req.width) as f64 * gt[1] + 0.5 * gt[1],
+                        gt[3] + (i / req.width) as f64 * gt[5] + 0.5 * gt[5],
+                    ];
+                    let (d, z) = profile
+                        .sample(point, *ground)
+                        .unwrap_or((f32::NAN, f32::NAN));
+                    valid += usize::from(d.is_finite());
+                    depth[i] = d;
+                    wse[i] = z;
+                }
+                Ok(valid)
+            }),
+        };
+        let valid = match rendered {
+            Ok(valid) => valid,
+            Err(e) if multi => {
+                failure = Some((index, e));
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+        let render_seconds = tick.elapsed().as_secs_f64();
+        let tick = Instant::now();
+        let mut report = profile_report(valid);
+        if !created {
+            fs::create_dir(output)?;
+            created = true;
+        }
+        let result = (|| {
+            if multi {
+                fs::create_dir(&folder)?;
+            }
+            crate::horizontal::write_values(&folder.join("depth.bin"), &depth)?;
+            crate::horizontal::write_values(&folder.join("wse.bin"), &wse)?;
+            Ok::<_, MapError>(())
+        })();
+        let write_seconds = tick.elapsed().as_secs_f64();
+        // Additive report fields; wall seconds on the calling thread. Shared
+        // read/prepare time is reported once, on the first profile.
+        let shared = index == 0;
+        report["timing"] = json!({
+            "read_seconds": if shared { read_seconds } else { 0.0 },
+            "allocate_seconds": if shared { alloc_seconds } else { 0.0 },
+            "surface_prepare_seconds": if shared { prepare_seconds } else { 0.0 },
+            "render_seconds": render_seconds,
+            "write_seconds": write_seconds,
+            "total_seconds": started.elapsed().as_secs_f64(),
+        });
+        if let Err(e) = &result {
+            report["status"] = json!("aborted");
+            report["error"] = json!(e.to_string());
+        }
+        if multi && folder.is_dir() {
+            fs::write(
+                folder.join("report.json"),
+                serde_json::to_vec_pretty(&report)
+                    .map_err(|e| MapError::Internal(e.to_string()))?,
+            )?;
+        }
+        summaries.push(json!({"index": index, "levels_file": level_paths[index],
+            "folder": if multi { format!("profile-{index:04}") } else { ".".into() },
+            "status": report["status"], "valid_pixels": valid,
+            "render_seconds": render_seconds, "write_seconds": write_seconds}));
+        last_report = report;
+        if let Err(e) = result {
+            if multi {
+                failure = Some((index, e));
+                break;
+            }
+            fs::write(
+                output.join("report.json"),
+                serde_json::to_vec_pretty(&last_report)
+                    .map_err(|e| MapError::Internal(e.to_string()))?,
+            )?;
+            return Err(e);
+        }
     }
-    let tick = Instant::now();
-    let result = (|| {
-        crate::horizontal::write_values(&output.join("depth.bin"), &depth)?;
-        crate::horizontal::write_values(&output.join("wse.bin"), &wse)?;
-        Ok::<_, MapError>(())
-    })();
-    // Additive report fields; wall seconds on the calling thread.
-    report["threads"] = json!(threads);
-    report["timing"] = json!({
-        "read_seconds": read_seconds,
-        "allocate_seconds": alloc_seconds,
-        "surface_prepare_seconds": prepare_seconds,
-        "render_seconds": render_seconds,
-        "write_seconds": tick.elapsed().as_secs_f64(),
-        "total_seconds": started.elapsed().as_secs_f64(),
-    });
-    if let Err(e) = &result {
-        report["status"] = json!("aborted");
-        report["error"] = json!(e.to_string());
+    if !created {
+        // Only reachable when the first multi-profile render refused.
+        return Err(failure
+            .map(|(_, e)| e)
+            .unwrap_or_else(|| MapError::Internal("1D produced no profile".into())));
     }
+    let report = if multi {
+        let mut report = profile_report(0);
+        let obj = report.as_object_mut().unwrap();
+        for key in ["valid_pixels", "depth_file", "wse_file"] {
+            obj.remove(key);
+        }
+        report["profile_count"] = json!(profiles.len());
+        report["profiles"] = json!(summaries);
+        report["timing"] = json!({
+            "read_seconds": read_seconds,
+            "allocate_seconds": alloc_seconds,
+            "surface_prepare_seconds": prepare_seconds,
+            "total_seconds": started.elapsed().as_secs_f64(),
+        });
+        if let Some((index, e)) = &failure {
+            report["status"] = json!("aborted");
+            report["error"] = json!(format!("profile {index}: {e}"));
+        }
+        report
+    } else {
+        last_report
+    };
     fs::write(
         output.join("report.json"),
         serde_json::to_vec_pretty(&report).map_err(|e| MapError::Internal(e.to_string()))?,
     )?;
-    result?;
+    if let Some((_, e)) = failure {
+        return Err(e);
+    }
     Ok(report)
 }

@@ -318,3 +318,100 @@ fn cli_advertises_both_legacy_and_native_methods_and_maps_schema_two() {
         30 * 4
     );
 }
+
+#[test]
+fn multi_profile_requests_match_single_requests_bit_for_bit() {
+    let fixture = Fixture::populated();
+    let profiles: [[f32; 4]; 3] = [
+        [20., 18., 12., 8.],
+        [9., f32::NAN, 7., 6.],
+        [3., 2., 25., 24.],
+    ];
+    let mut names = vec![];
+    for (i, levels) in profiles.iter().enumerate() {
+        let name = format!("levels-{i}.bin");
+        write_f32(&fixture.root.join(&name), levels);
+        let mut single = fixture.request.clone();
+        single["levels_file"] = json!(name);
+        fixture.run(single, &format!("single-{i}")).unwrap();
+        names.push(name);
+    }
+    for threads in [1, 3] {
+        let mut multi = fixture.request.clone();
+        multi.as_object_mut().unwrap().remove("levels_file");
+        multi["levels_files"] = json!(names);
+        multi["threads"] = json!(threads);
+        let out = format!("multi-{threads}");
+        let report = fixture.run(multi, &out).unwrap();
+        assert_eq!(report["status"], "complete");
+        assert_eq!(report["profile_count"], 3);
+        assert!(report.get("depth_file").is_none());
+        for i in 0..3 {
+            let single: Value = serde_json::from_slice(
+                &fs::read(fixture.root.join(format!("single-{i}/report.json"))).unwrap(),
+            )
+            .unwrap();
+            let sub: Value = serde_json::from_slice(
+                &fs::read(
+                    fixture
+                        .root
+                        .join(format!("{out}/profile-{i:04}/report.json")),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(sub["valid_pixels"], single["valid_pixels"]);
+            assert_eq!(
+                report["profiles"][i]["valid_pixels"],
+                single["valid_pixels"]
+            );
+            assert_eq!(sub["method"], single["method"]);
+            for product in ["depth", "wse"] {
+                let a = fs::read(fixture.root.join(format!("single-{i}/{product}.bin"))).unwrap();
+                let b = fs::read(
+                    fixture
+                        .root
+                        .join(format!("{out}/profile-{i:04}/{product}.bin")),
+                )
+                .unwrap();
+                assert_eq!(a, b, "profile {i} {product} threads {threads}");
+            }
+        }
+    }
+}
+
+#[test]
+fn multi_profile_selection_is_refused_before_outputs() {
+    let fixture = Fixture::populated();
+    write_f32(&fixture.root.join("levels-b.bin"), &[1., 2., 3., 4.]);
+    write_f32(&fixture.root.join("short.bin"), &[1., 2., 3.]);
+    let mut both = fixture.request.clone();
+    both["levels_files"] = json!(["levels.bin"]);
+    let mut neither = fixture.request.clone();
+    neither.as_object_mut().unwrap().remove("levels_file");
+    let mut empty = neither.clone();
+    empty["levels_files"] = json!([]);
+    let mut too_many = neither.clone();
+    too_many["levels_files"] = json!(vec!["levels.bin"; one_d_session::MAX_PROFILES + 1]);
+    let mut legacy = neither.clone();
+    legacy["schema"] = json!("fast-map-one-d-diagnostic/1");
+    for key in ["render_order_file", "tile_size"] {
+        legacy.as_object_mut().unwrap().remove(key);
+    }
+    legacy["levels_files"] = json!(["levels.bin"]);
+    let mut short = neither.clone();
+    short["levels_files"] = json!(["levels.bin", "short.bin"]);
+    let mut missing = neither.clone();
+    missing["levels_files"] = json!(["levels-b.bin", "absent.bin"]);
+    for (i, request) in [both, neither, empty, too_many, legacy, short, missing]
+        .into_iter()
+        .enumerate()
+    {
+        let name = format!("refused-{i}");
+        assert!(fixture.run(request, &name).is_err(), "case {i}");
+        assert!(
+            !fixture.root.join(&name).exists(),
+            "case {i} created output"
+        );
+    }
+}
