@@ -8,6 +8,30 @@ still advertises `rasmapper-effective-terrain/1` with request schema 1 only;
 schema 2 is accepted and described under `effective_terrain.parked`, and a
 schema 1 receipt still reports method `/1`.
 
+### Effective terrain: named ground lines (RAS Mapper's system path)
+
+Ground lines with a `System Name`, including a lone named feature, are now
+built as RasMapperLib 7.0.1 builds them instead of being refused
+(interoperability study, prose findings only; no vendor code used or copied).
+Same-name features with equal elevation type and Elev Pt Tolerance are joined
+end to start within 60 ft in feature-ID order. Their profiles are concatenated,
+and each member's first point becomes a control cross section that wins at its
+station, so at a junction the next feature's start elevation replaces the
+previous feature's end. Between cross sections, toe and ridge stream lines are
+grown from the centerline to cross-section lines in lateral steps. A changing
+template with a positive Transition Percent ends its section early. The system
+is drawn once, at its highest member feature ID, with the ribbon TIN and
+rasterizer of single features. New optional ground-line feature fields:
+`transition_percent` and `elev_pt_tolerance` (default 0, `null` = NaN).
+
+Qualification (HEC-RAS 7.0.1 exports, whole terrain):
+- Named writer cases W3, W3n, W4 and M2: no modified pixel differs (before: 1,505 to 1,507 pixels up to 1,032 ft, and 159 pixels up to 77 ft).
+- Synthetic systems (joined channels with a junction gap, Transition Percent 0, 0.5, 1 and NaN, a profile not starting at 0, systems split by elevation type, SetValue systems): 1 of 14,179 pixels differs, at 1/32 ft.
+- Terrain C, on an HDF copy reduced to its 10 accepted layers, including the named systems and a SetValue channel layer: 0 mask and 4 value differences at 1/32 ft in 379.0M pixels (674.6M on the export grid). Every layer is exact except one 1/32 ft pixel.
+- Terrains A and B1-B4 and the earlier synthetic cases are unchanged.
+
+Known difference: RasMapperLib's .NET Framework `Math.Pow` is not correctly rounded. On terrain C this moves four stream-line points by up to 6e-5 ft, with no pixel effect in the measured cases.
+
 ### Effective terrain: RAS Mapper's ground-line ribbon TIN and inclusive ellipses
 
 Ground lines (`terrain_mods`) now follow RasMapperLib 7.0.1's export arithmetic
@@ -23,9 +47,9 @@ the last triangle of a feature winning. Combination is RAS Mapper's binary32
 replacement (strict for SetIfHigher/SetIfLower). Ellipses are inclusive
 (`<= 1`) at output-tile pixel centres and may be rotated (new optional
 `rotation`, degrees). Newly supported: ground-line SetValue and Max Reach <=
-Top Width. Newly refused: any ground line with a `System Name` (new optional
-`system_name`; RAS Mapper builds named ground lines through a separate system
-path, measured 1,506 px apart on one channel) and negative side slopes. New
+Top Width. New optional `system_name` (RAS Mapper builds named ground lines
+through a separate system path, measured 1,506 px apart on one channel; now
+supported, see the entry above). Newly refused: negative side slopes. New
 optional layer field `length_units` (`feet` default, `meters`). Whole terrains
 vs HEC-RAS 7.0.1 exports with modifications (export a, pixels where two
 exports differ excluded): B2 443 -> 0 value differences, B1 3 -> 0, B3, B4 and

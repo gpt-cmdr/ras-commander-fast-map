@@ -34,7 +34,7 @@ layer written as `Type=Channel` leaves the export equal to the base export).
 | Ground line, no System Name, Hi / Lo / Set | Ribbon TIN per feature. Profile: binary32 stations shifted to start at 0, clamped to the length, first value per station; every segment longer than 100 ft (100/3.281 m) adds stations every 100 from a running start that only advances over such long segments; the length is appended when the last station is more than 0.01 short; binary32 query clamped at both ends. Offset lines: toes at Max Reach/2, ridges at Top Width/2, M = centerline station; joints meet at the offset-segment intersection (M averaged) or get the previous end, an arc (split while chord-mid/r < 0.95) and the next start; square ends; self-intersections trimmed; profile stations injected by M fraction. Centre/ridge z = profile, toe z = profile -/+ (MaxReach/2 - TopWidth/2)/slope (H:V, 0 read as 0.001). Five ribbons zipped by the shorter diagonal (not Delaunay); export rasterizer per tile, last triangle wins, clockwise triangles draw nothing. | Real A, B1-B4: no difference inside any footprint (B2 443 -> 0, B1 3 -> 0). Synthetic (blank System Name): channel 22.5 km, levee 21.2 km, combined case: 0 modified px; sharp bends/short segments/crossings/hairpin: 2 of 8,935 at 1/32 ft; short-segment levees: 0 of 2,384; Set: 0 of 5,282 | supported |
 | Ground line, Max Reach <= Top Width | Same rule: the toes fold inside the ridges and their strips draw nothing; the crest remains. | Synthetic, 3 features (one with Max Reach = Top Width, one Lo): 0 of 1,325 | supported |
 | Ground line, Top Width or Max Reach <= 0 | No change (RAS Mapper builds no TIN). | traced, not measured | supported |
-| Ground line with any System Name | RAS Mapper's system path (also for a single feature); not reproduced. | The 22.5 km channel named `chan` differs from its blank-name export on 1,506 px | refused |
+| Ground line with a System Name (also a lone feature), Hi / Lo / Set | RAS Mapper's system path. **Joining:** in feature-ID order an unassigned named feature starts a system; same-name features with equal elevation type and Elev Pt Tolerance whose end is within 60 ft of the system's first point are prepended, those whose start is within 60 ft of its last point appended (nearest first). Centerline = members' vertices concatenated. **Profile:** member profiles concatenated with stations offset by the running last station; each member's first point becomes a control cross section (template of that member; Max Reach <= 0 read as 2 x Top Width) entered before the stored stations, so at a junction the next feature's start elevation wins and the previous feature's end elevation is dropped; densification every 100 ft (30.48 m SI); a closing cross section at the system end. **Sections:** cross-section lines perpendicular to the chord half a reach up and down the centerline carry the trapezoid (Top Width = Max Reach narrowed by 0.01); a changing template with Transition Percent > 0 ends its section Top Width x Transition Percent early and that station enters the centre profile (NaN: nothing); toe and ridge stream lines grown from the centerline to the cross-section points in 4-16 lateral steps (resample, smooth cubic blend, Douglas-Peucker, crossing trims); template values interpolated by station for the toe z. Same ribbon TIN and rasterizer; drawn once at the highest member feature ID. | Writer cases W3, W3n, W4, M2: 0 modified px differ (were 1,505-1,507 and 159 px, max 1,032 and 77 ft, under the unnamed rule). Synthetic systems: 3 joined channels with a 20 ft gap, Transition Percent 0 / 0.5 and a lone NaN-transition channel: 1 of 7,118 at 1/32 ft; levee systems split by elevation type, Transition Percent 1, a profile starting at station 10, SetValue members: 0 of 2,494; SetValue channel system in scrambled feature order: 0 of 4,567. Real C: Hoeys (3 features), Monti, Airline systems in two layers with 0 differences | supported |
 | Ground line, Add | terrain + value on the unrounded terrain. | not measured | refused |
 | Ground line with control points | Profile from control points (not reproduced). | — | refused (caller) |
 | Polygon, constant (Generate Boundary Elevations = 0) | Pixel centre inside (even-odd), constant `Elevation Value`; a stored profile is **ignored**. | B: 108 px and 722 px; C: 10,759 / 17,828 / 6,626 px; synthetic W1/M1 46,8xx px: all 0 diff | supported (Set/Hi/Lo) |
@@ -50,6 +50,24 @@ layer written as `Type=Channel` leaves the export equal to the base export).
 | B2 | 2 / 443 / 1.47 ft (439 on modified px) | 2 / 0 / 0 | 0 |
 | B3 | 2 / 0 / 0 | 2 / 0 / 0 | 0 |
 | B4 | 0 / 0 / 0 | 0 / 0 / 0 | 0 |
+
+Real terrain C (2 ft, 4 sources).
+Scope: an HDF copy reduced to the 10 accepted layers (3 constant polygon
+layers; 7 ground-line layers with 44 features, among them the named systems
+Hoeys (3 features), Monti and Airline (lone features after joining) and the
+SetValue channel layer Palmetto-Washington; many slopes of 0 and Max Reach =
+Top Width). Removed: an Add levee, polygons with boundary elevations, and a
+levee layer with a NaN template. Two base and two modified exports of the
+copy, which agree with each other. Before this change the named layers were
+refused.
+
+| Scope | Pixels | Mask | Value | Max |
+|---|---|---|---|---|
+| Whole terrain, source extent | 379.0M | 0 | 4 | 1/32 ft |
+| Whole terrain, export grid (674.6M px; 73 modified pixels lie beyond the sources) | 674.6M | 0 | 4 | 1/32 ft |
+| Each layer's footprint (engine run with the layer alone) | 0.4M | 0 | 0, except 1 in Palmetto-Washington | 1/32 ft |
+
+The engine's base equals base export a on C.
 
 The remaining mask pixels are not near any feature (base export-TIN pixels).
 
@@ -68,15 +86,26 @@ The remaining mask pixels are not near any feature (base export-TIN pixels).
   ras-commander's writer stores `System Name = <layer name>` and RAS Mapper
   sends every named ground line through its system path. With the name blanked
   and the projects re-exported, they match.
+- The system path was then implemented from the study's description and
+  checked the same way: RasMapperLib's system ribbons for W3 and for terrain
+  C's systems, obtained through pythonnet, equal the engine's point for point
+  (except the 4 points below), and RasMapperLib's rasterization of its own
+  system TIN reproduces the W3 export exactly.
 
 ## Open discrepancies (measured, not explained)
 
-1. **Named ground lines** (any non-empty System Name) use RAS Mapper's system
-   path (shared profile, Transition Percent, ribbon modes). Not reproduced;
-   refused. Writer-authored ground lines are affected until the writer leaves
-   System Name empty.
+1. **Binary64 powers.** RasMapperLib computes distances and cubic blends with
+   .NET Framework's `Math.Pow` (for example `Pow(x, 0.5)`), which is not
+   correctly rounded: it differs from the correctly rounded square root or
+   product on about 0.3% of inputs. The engine uses correctly rounded
+   arithmetic. On terrain C's 3-feature system this moves 4 stream-line points
+   by up to 6e-5 ft; no pixel changed in the measured cases.
 2. **Isolated 1/32 ft roundings at exact ties** (2 px of 8,935 on the sharp-bend
    synthetic case). RAS Mapper rounds the other way; a numeric difference in the
    last bits.
 3. **Ground-line Add** needs the unrounded terrain value (RAS Mapper rounds only
    when it writes); the engine holds rounded values. Not measured.
+4. **Joining candidates.** RAS Mapper looks for the next feature through a
+   spatial index bin around the end point; the engine tests every feature
+   within 60 ft. A candidate in a different bin could join in the engine and
+   not in RAS Mapper. Not observed.

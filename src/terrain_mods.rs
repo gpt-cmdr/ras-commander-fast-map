@@ -42,8 +42,39 @@
 //!     nothing. Features are never dropped for being narrow (the export
 //!     forces rendering).
 //!   - Features with `Top Width <= 0` or `Max Reach <= 0` change nothing.
-//!   - A non-empty `System Name` is refused: RAS Mapper builds every named
-//!     ground line, even a lone one, through a separate system path.
+//! * **Named ground lines** (non-empty `System Name`, also a lone feature)
+//!   follow RAS Mapper's system path:
+//!   - *Joining.* In feature-ID order, an unassigned named feature starts a
+//!     system; features with the same name, elevation type and Elev Pt
+//!     Tolerance whose end lies within 60 ft of the system's first point are
+//!     prepended (nearest first), and those whose start lies within 60 ft of
+//!     its last point appended. The centerline is the members' vertices
+//!     concatenated (a junction vertex appears twice).
+//!   - *Profile and control cross sections.* Member profiles are concatenated:
+//!     each member's stations are offset by the last station so far; its
+//!     first point is not added to the profile but becomes a control cross
+//!     section (station, elevation, Top Width, slopes, Max Reach, Transition
+//!     Percent; Max Reach <= 0 is read as 2 x Top Width). Control cross
+//!     sections enter the profile before the stored stations, so at a
+//!     junction the next feature's start elevation wins. Densification as
+//!     for single features (100 ft, or 30.48 m in SI). A last cross section
+//!     is added at the end of the system with the last cross section's
+//!     template.
+//!   - *Sections.* Between consecutive cross sections, cross-section lines
+//!     (perpendicular to the chord half a reach up and down the centerline)
+//!     carry the trapezoid (toe, ridge, ridge, toe; a template whose Top Width
+//!     equals Max Reach is narrowed by 0.01). When the template changes and
+//!     Transition Percent is positive, the section ends Top Width x Transition
+//!     Percent before the next cross section (that station enters the centre
+//!     profile); a NaN Transition Percent adds nothing. Toe and ridge lines
+//!     are stream lines grown from the centerline to the cross-section points
+//!     in 4-16 lateral steps (resampled, smoothly blended between the
+//!     upstream and downstream offsets, Douglas-Peucker filtered, trimmed at
+//!     crossings).
+//!   - *Elevations.* As for single features, with Max Reach, Top Width and
+//!     slopes interpolated linearly by station between cross sections.
+//!   - The system is drawn once, in the place of its highest feature ID,
+//!     with the five-ribbon TIN and rasterizer above.
 //! * **Polygons** with a constant elevation: pixel centres inside (even-odd).
 //! * **Ellipses**: output-tile pixel centres inside or on the ellipse (`<= 1`,
 //!   rotation in degrees); a circle (equal radii) uses the centre distance
@@ -111,11 +142,22 @@ pub struct GroundLine {
     pub points: Vec<[f64; 2]>,
     /// Stored `[station, elevation]` pairs.
     pub profile: Vec<[f64; 2]>,
-    /// The feature's `System Name` attribute. Optional; a non-empty name is
-    /// refused (RAS Mapper builds every named ground line, even a single one,
-    /// through its system path, which is not reproduced).
+    /// The feature's `System Name` attribute (optional). Named features are
+    /// joined into systems and built through RAS Mapper's system path.
     #[serde(default)]
     pub system_name: String,
+    /// `Transition Percent` (optional, default 0; `null` = NaN). Used by
+    /// named features only.
+    #[serde(default, deserialize_with = "nan_if_null")]
+    pub transition_percent: f64,
+    /// `Elev Pt Tolerance` (optional, default 0; `null` = NaN). Named
+    /// features join only with equal tolerances.
+    #[serde(default, deserialize_with = "nan_if_null")]
+    pub elev_pt_tolerance: f64,
+}
+
+fn nan_if_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    Ok(Option::<f64>::deserialize(d)?.unwrap_or(f64::NAN))
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -186,24 +228,27 @@ pub fn method_record() -> Value {
         "basis": "ground lines and ellipses: interoperability study of RasMapperLib 7.0.1 (no vendor code used or copied); polygons: fitted against HEC-RAS 7.0.1 exports",
         "supported": {
             "ground_line": {"subtypes": ["levee", "channel"], "elevation_types": ["SetValue", "SetIfHigher", "SetIfLower"],
-                             "requires": "one part, a stored profile of >= 2 stations, slopes >= 0, empty System Name, no control points",
-                             "length_units": "feet (default) or meters: profile densification every 100 ft or 100/3.281 m"},
+                             "requires": "one part, a stored profile of >= 2 stations, finite template, slopes >= 0, no control points",
+                             "named": "non-empty system_name: joined systems through RAS Mapper's system path (transition_percent, elev_pt_tolerance optional; null = NaN)",
+                             "length_units": "feet (default) or meters: profile densification every 100 ft (single features 100/3.281 m, systems 30.48 m)"},
             "polygon": {"elevation_types": ["SetValue", "SetIfHigher", "SetIfLower"],
                         "requires": "constant Elevation Value (Generate Boundary Elevations off, no control points)"},
             "ellipse": {"elevation_types": ["SetValue", "SetIfHigher", "SetIfLower"], "rotation": "degrees, any"}
         },
         "ground_line_rule": "profile: binary32 stations shifted to start at 0, clamped to the length, first value per station, 100 ft (100/3.281 m) densification from a running start that only advances over segments longer than the spacing, length appended when the last station is > 0.01 short; binary32 linear query clamped at both ends. Offset lines: toes at Max Reach/2, ridges at Top Width/2, M = centerline station; joints meet at the offset-segment intersection (M averaged) or get the previous end, an arc split while chord-mid/r < 0.95, and the next start; square ends; self-intersections trimmed (farthest crossing later segment, M averaged); profile stations injected by M fraction. Centre and ridges z = profile(station); toes z = profile -/+ (Max Reach/2 - Top Width/2)/slope (binary32 half-widths, binary64 product), slope 0 read as 0.001; Max Reach <= Top Width folds the toes inside the ridges (those strips draw nothing). Ribbon TIN (left toe, left ridge, centre, right ridge, right toe; 0.01 dedupe; shorter diagonal, ties advance the right ribbon; fan at the end), rasterized per 256-pixel output tile with the export TIN rasterizer (inclusive, last triangle wins, clockwise triangles draw nothing). Top Width <= 0 or Max Reach <= 0: no change",
+        "system_rule": "named features joined in feature-ID order (same name, elevation type and Elev Pt Tolerance; end-to-start within 60 ft; nearest first), centerline = members' vertices concatenated; profile = member profiles offset by the running last station, each member's first point a control cross section (Max Reach <= 0 read as 2 x Top Width) that enters the centre profile first (the next feature's start elevation wins at a junction); a closing cross section at the system end; per section, cross-section lines perpendicular to the chord half a reach up and down the centerline carry the trapezoid (Top Width = Max Reach narrowed by 0.01), a changing template with positive Transition Percent ends its section Top Width x Transition Percent early (NaN adds nothing); toe and ridge stream lines grown in 4-16 lateral steps (resample, smooth blend, Douglas-Peucker, crossing trims), M-fraction injection, template values interpolated by station; same ribbon TIN and rasterizer; drawn at the highest member feature ID",
         "polygon_rule": "pixel centre inside (even-odd), constant elevation",
         "ellipse_rule": "per output-tile pixel centre: circle (equal radii) distance <= radius; otherwise (c dx + s dy)^2/rx^2 + (s dx - c dy)^2/ry^2 <= 1 with c, s = cos, sin(-rotation degrees)",
         "combine": "binary32: a nodata terrain pixel takes the modification value; SetValue replaces; SetIfHigher/SetIfLower replace when strictly higher/lower; layers stable-sorted by ascending Priority and applied in reverse (Priority 0 last, so it wins), features in stored order",
         "rounding": "binary32, then nearest 1/32 (ties to even), after each feature",
         "qualified": {
             "scope": "fast-map 0.16.0 working tree, ras2fim-batch effective-terrain, request schema 2, HEC-RAS 7.0.1 exports with rasterize_modifications=True, downsample_factor=1, whole terrain",
-            "real terrains A and B1-B4 (pixels where two exports differ excluded; ground lines Hi/Lo without System Name, constant polygons, circles)": "no difference inside any modification footprint: B1 0 values (was 3 at 1/32 ft), B2 0 values (was 443, max 1.47 ft), B3 and B4 0; the remaining pixels (A 322 values, max 0.53 ft; B1, B2 and B3 2 mask pixels each) lie outside every footprint, in export-TIN gap fills",
-            "synthetic T2 terrain, 20 ft (one export each, System Name blank)": "22.5 km channel, 21.2 km levee and channel + polygon + levee: 0 modified pixels differ; four channels with 76-180 degree bends, 50-63 ft segments, a shifted and clamped profile, a crossing and a hairpin overlap: 2 of 8,935 pixels at 1/32 ft; two levees with short segments and a spiral: 0 of 2,384; ground-line SetValue: 0 of 5,282; Max Reach <= Top Width (3 features): 0 of 1,325; five ellipses (exact circle boundary, rotations 0, 30, -63.5, 90 degrees): 0 of 1,005 (2 edge pixels differ in the base export)",
-            "named ground lines": "the 22.5 km channel with System Name 'chan' differs from its blank-name export on 1,506 pixels (RAS Mapper's system path): refused"
+            "real terrains A and B1-B4 (pixels where two exports differ excluded; unnamed ground lines, constant polygons, circles)": "no difference inside any modification footprint: B1 0 values (was 3 at 1/32 ft), B2 0 values (was 443, max 1.47 ft), B3 and B4 0; the remaining pixels (A 322 values, max 0.53 ft; B1, B2 and B3 2 mask pixels each) lie outside every footprint, in export-TIN gap fills",
+            "real terrain C (2 ft, 379.0M px in the source extent; HDF copy reduced to its 10 accepted layers, including systems of 3, 2 and lone named channels and a SetValue channel layer; two base and two modified exports, which agree)": "0 mask and 4 value differences, all at 1/32 ft; per layer 0 except 1 pixel at 1/32 ft in the SetValue channel layer",
+            "synthetic T2 terrain, 20 ft (one export each)": "named writer cases (22.5 km channel, 21.2 km levee, channel + polygon + levee): 0 modified pixels differ (2 edge pixels differ in the base export); three joined channels with differing templates and profiles, a 20 ft junction gap and Transition Percent 0 / 0.5, a lone channel with NaN Transition Percent and an unnamed channel: 1 of 7,118 pixels at 1/32 ft; levee systems split by elevation type (Transition Percent 1, a profile starting at station 10, SetValue members): 0 of 2,494; a SetValue channel system in scrambled feature order: 0 of 4,567; blank-name cases (sharp bends, short segments, SetValue, Max Reach <= Top Width, ellipses) as before"
         },
-        "refused": "ground-line Add (needs the unrounded terrain; not measured), ground lines with a System Name, negative slopes, polygons with boundary profiles, shape Z or control points, multi-part features, any other modification type (the caller also refuses ground-line control points and duplicate priorities)"
+        "known_differences": "RasMapperLib's binary64 powers (.NET Framework Math.Pow, e.g. distances as Pow(x, 0.5)) are not correctly rounded; this engine uses correctly rounded square roots and products. On terrain C's 3-feature system this moves 4 stream-line points by up to 6e-5 ft; no pixel changed in the measured cases",
+        "refused": "ground-line Add (needs the unrounded terrain; not measured), non-finite templates (Top Width, slopes or Max Reach NaN), negative slopes, polygons with boundary profiles, shape Z or control points, multi-part features, any other modification type (the caller also refuses ground-line control points and duplicate priorities)"
     })
 }
 
@@ -220,12 +265,6 @@ pub fn validate(layers: &[Layer]) -> Result<(), MapError> {
         match l {
             Layer::GroundLine { features, name, .. } => {
                 for f in features {
-                    if !f.system_name.trim().is_empty() {
-                        return Err(MapError::Unsupported(format!(
-                            "ground line layer {name:?}: System Name {:?} is not qualified (RAS Mapper builds named ground lines through its system path)",
-                            f.system_name
-                        )));
-                    }
                     if f.points.len() < 2 || f.profile.len() < 2 {
                         return Err(invalid(format!(
                             "ground line layer {name:?}: needs >= 2 points and >= 2 profile stations"
@@ -590,18 +629,39 @@ fn sort_stations(p: &mut Profile) {
 /// The centre profile RAS Mapper derives from the stored profile (no control
 /// points).
 fn levee_profile(stored: &[[f64; 2]], line: &[Pm], len: f64, spacing: f64) -> Profile {
-    let mut keys: Profile = Vec::with_capacity(stored.len());
-    let first = stored[0][0] as f32;
-    let shift = if first != 0.0 { -first } else { 0.0 };
-    for s in stored {
-        let x0 = s[0] as f32;
-        let x = if x0 as f64 > len {
-            len as f32
-        } else {
-            x0 + shift
-        };
+    let stored: Profile = stored.iter().map(|s| (s[0] as f32, s[1] as f32)).collect();
+    seeded_profile(&[], &stored, line, len, spacing)
+}
+
+/// `seed` stations (control cross sections) are entered first; then the
+/// stored stations, shifted so the first is 0 and clamped to the length; the
+/// first value per station wins. Then the long-segment densification and the
+/// appended length.
+fn seeded_profile(
+    seed: &[(f32, f32)],
+    stored: &[(f32, f32)],
+    line: &[Pm],
+    len: f64,
+    spacing: f64,
+) -> Profile {
+    let mut keys: Profile = Vec::with_capacity(seed.len() + stored.len());
+    let put = |keys: &mut Profile, x: f32, y: f32| {
         if !keys.iter().any(|k| k.0 == x) {
-            keys.push((x, s[1] as f32));
+            keys.push((x, y));
+        }
+    };
+    for &(x, y) in seed {
+        put(&mut keys, x, y);
+    }
+    if let Some(&(first, _)) = stored.first() {
+        let shift = if first != 0.0 { -first } else { 0.0 };
+        for &(x0, y) in stored {
+            let x = if x0 as f64 > len {
+                len as f32
+            } else {
+                x0 + shift
+            };
+            put(&mut keys, x, y);
         }
     }
     let mut prof = keys.clone();
@@ -915,6 +975,1025 @@ pub(crate) fn ground_line_tin(
 }
 
 // ---------------------------------------------------------------------------
+// Named ground lines (RAS Mapper's system path)
+// ---------------------------------------------------------------------------
+
+/// Joining radius between a feature end and the next feature's start.
+const SYSTEM_SEARCH_RADIUS: f64 = 60.0;
+
+/// A position on a polyline: point, segment index and fraction.
+#[derive(Clone, Copy, Debug)]
+struct Pop {
+    p: Pm,
+    seg: usize,
+    frac: f64,
+}
+
+fn pop_less(a: &Pop, b: &Pop) -> bool {
+    a.seg < b.seg || (a.seg == b.seg && a.frac < b.frac)
+}
+
+fn first_pop(p: &[Pm]) -> Pop {
+    Pop {
+        p: p[0],
+        seg: 0,
+        frac: 0.0,
+    }
+}
+
+fn last_pop(p: &[Pm]) -> Pop {
+    Pop {
+        p: p[p.len() - 1],
+        seg: p.len().saturating_sub(2),
+        frac: 1.0,
+    }
+}
+
+/// Position at distance `d` from the start (clamped to the ends).
+fn pop_at_distance(p: &[Pm], total: f64, d: f64) -> Pop {
+    if d <= 0.0 {
+        return first_pop(p);
+    }
+    if d >= total {
+        return last_pop(p);
+    }
+    let mut sum = 0.0;
+    for i in 0..p.len() - 1 {
+        let start = sum;
+        let l = dist(p[i], p[i + 1]);
+        sum += l;
+        if sum >= d {
+            let t = (d - start) / l;
+            return Pop {
+                p: lerp(p[i], p[i + 1], t),
+                seg: i,
+                frac: t,
+            };
+        }
+    }
+    last_pop(p)
+}
+
+/// Position at a fraction of the length (point-list variant).
+fn pop_at_fraction(p: &[Pm], f: f64) -> Pop {
+    if f <= 0.0 {
+        return first_pop(p);
+    }
+    if f >= 1.0 {
+        return last_pop(p);
+    }
+    let target = length(p) * f.clamp(0.0, 1.0);
+    if target == 0.0 {
+        return first_pop(p);
+    }
+    let mut sum = 0.0;
+    for i in 0..p.len() - 1 {
+        let start = sum;
+        let l = dist(p[i], p[i + 1]);
+        sum += l;
+        if sum >= target {
+            let t = (target - start) / l;
+            return Pop {
+                p: lerp(p[i], p[i + 1], t),
+                seg: i,
+                frac: t,
+            };
+        }
+    }
+    last_pop(p)
+}
+
+/// Start point, the vertices after it up to the end segment, and the end
+/// point unless it sits at the start of its segment.
+fn point_subsection(p: &[Pm], a: &Pop, b: &Pop) -> Vec<Pm> {
+    let mut out = vec![a.p];
+    for v in p.iter().take(b.seg + 1).skip(a.seg + 1) {
+        out.push(*v);
+    }
+    if b.frac > 0.0 {
+        out.push(b.p);
+    }
+    out
+}
+
+fn is_ring(p: &[Pm], tol: f64) -> bool {
+    p.len() >= 2 && {
+        let (a, b) = (p[0], p[p.len() - 1]);
+        (a.x - b.x).abs() < tol && (a.y - b.y).abs() < tol
+    }
+}
+
+/// Infinite-line intersection, as a point on the first line.
+fn line_point(a0: Pm, a1: Pm, b0: Pm, b1: Pm) -> (f64, f64) {
+    let (dx, dy) = (a1.x - a0.x, a1.y - a0.y);
+    let (ex, ey) = (b1.x - b0.x, b1.y - b0.y);
+    let den = ey * dx - ex * dy;
+    if den == 0.0 {
+        return (0.0, 0.0);
+    }
+    let (oy, ox) = (a0.y - b0.y, a0.x - b0.x);
+    let t1 = (ex * oy - ey * ox) / den;
+    (a0.x + t1 * dx, a0.y + t1 * dy)
+}
+
+/// A trapezoidal control cross section of a system.
+#[derive(Clone, Copy, Debug)]
+struct ControlXs {
+    station: f32,
+    elevation: f32,
+    width: f32,
+    left_slope: f32,
+    right_slope: f32,
+    reach: f32,
+    transition: f32,
+}
+
+/// Cross-section line across `center` at `station`: perpendicular to the
+/// chord between the points half a reach up and down the centerline,
+/// centred on the centerline point.
+fn xs_line(center: &[Pm], station: f32, width: f32, reach: f32) -> Vec<Pm> {
+    let mut num = reach;
+    if num.is_nan() || num < width {
+        num = width;
+    }
+    if num.is_nan() {
+        num = 100.0;
+    }
+    let total = length(center);
+    let at = pop_at_distance(center, total, station as f64);
+    let half = num as f64 / 2.0;
+    let (mut up, mut down) = (station as f64 + half, station as f64 - half);
+    if is_ring(center, half) {
+        if up > total {
+            up -= total;
+        }
+        if down < 0.0 {
+            down += total;
+        }
+    }
+    let b = pop_at_distance(center, total, up).p;
+    let a = pop_at_distance(center, total, down).p;
+    let mid = lerp(a, b, 0.5);
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let (hx, hy) = (dx * 0.5, dy * 0.5);
+    let mut p0 = Pm::xy(mid.x - hy, mid.y + hx);
+    let mut p1 = Pm::xy(mid.x + hy, mid.y - hx);
+    let w = (num / 2.0) as f64;
+    // Offset chords at +w and -w.
+    let (nx, ny) = left_normal(a, b);
+    let off = |d: f64| {
+        (
+            Pm::xy(a.x + nx * d, a.y + ny * d),
+            Pm::xy(b.x + nx * d, b.y + ny * d),
+        )
+    };
+    let (s1, s2) = (off(w), off(-w));
+    // Extend the perpendicular by w / 2 at each end.
+    let l = dist(p0, p1);
+    let (ux, uy) = ((p1.x - p0.x) / l, (p1.y - p0.y) / l);
+    let e = w / 2.0;
+    (p0, p1) = (
+        Pm::xy(p0.x - ux * e, p0.y - uy * e),
+        Pm::xy(p1.x + ux * e, p1.y + uy * e),
+    );
+    let (x, y) = line_point(p0, p1, s1.0, s1.1);
+    let (x2, y2) = line_point(p0, p1, s2.0, s2.1);
+    let (tx, ty) = (at.p.x - mid.x, at.p.y - mid.y);
+    vec![Pm::xy(x + tx, y + ty), Pm::xy(x2 + tx, y2 + ty)]
+}
+
+/// Cross-section profile: left toe, left ridge, right ridge, right toe.
+fn xs_profile(
+    subtype: GroundLineSubtype,
+    elevation: f32,
+    width: f32,
+    ls: f32,
+    rs: f32,
+    reach: f32,
+) -> Profile {
+    let mut w = width;
+    if w == reach && w != 0.0 {
+        let mut k = 2;
+        loop {
+            w = (width as f64 - 10f64.powi(-k)) as f32;
+            if w > 0.0 {
+                break;
+            }
+            k += 1;
+        }
+    }
+    let (mut l, mut r) = (ls, rs);
+    match subtype {
+        GroundLineSubtype::Channel => l = -l,
+        GroundLineSubtype::Levee => r = -r,
+    }
+    let half = reach / 2.0;
+    let run = half - w / 2.0;
+    let toe = elevation - run / l;
+    let ridge = toe + run / l;
+    let x1 = run;
+    let x2 = x1 + w;
+    vec![
+        (0.0, toe),
+        (x1, ridge),
+        (x2, ridge),
+        (2.0 * half, ridge + run / r),
+    ]
+}
+
+/// Polyline with z from `prof` by station; interior profile stations are
+/// injected. `m_station`: M = station (else station / `total`).
+fn z_from_profile(line: &[Pm], prof: &[(f32, f32)], total: f64, m_station: bool) -> Vec<Pm> {
+    if prof.len() < 2 {
+        return line.to_vec();
+    }
+    let mval = |s: f32| {
+        if m_station {
+            s as f64
+        } else {
+            s as f64 / total
+        }
+    };
+    let nseg = line.len() - 1;
+    let mut out = vec![Pm {
+        z: query(prof, 0.0) as f64,
+        m: 0.0,
+        ..line[0]
+    }];
+    let (mut k, mut seg, mut cum) = (1, 0, 0.0);
+    let mut walk = Walk { seg: 0, sum: 0.0 };
+    loop {
+        let rel = if k < prof.len() - 1 {
+            (prof[k].0 as f64 - cum) as f32
+        } else {
+            f32::MAX
+        };
+        let l = dist(line[seg], line[seg + 1]);
+        let vertex = |cum: f64| {
+            let s = (l + cum) as f32;
+            Pm {
+                z: query(prof, s) as f64,
+                m: mval(s),
+                ..line[seg + 1]
+            }
+        };
+        if (rel as f64 - l).abs() < 1e-5 {
+            out.push(vertex(cum));
+            cum += l;
+            k += 1;
+            seg += 1;
+            if seg == nseg {
+                break;
+            }
+        } else if (rel as f64) < l {
+            let q = point_at_distance(line, total, rel as f64 + cum, &mut walk);
+            out.push(Pm {
+                x: q.x,
+                y: q.y,
+                z: prof[k].1 as f64,
+                m: mval(prof[k].0),
+            });
+            k += 1;
+        } else {
+            out.push(vertex(cum));
+            cum += l;
+            seg += 1;
+            if seg == nseg {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// M = cumulative binary32 station / length.
+fn m_fraction(line: &[Pm]) -> Vec<Pm> {
+    let total = length(line);
+    let mut s = 0.0_f32;
+    let mut out = Vec::with_capacity(line.len());
+    for (i, p) in line.iter().enumerate() {
+        if i > 0 {
+            s += dist(line[i - 1], *p) as f32;
+        }
+        out.push(Pm {
+            m: s as f64 / total,
+            ..*p
+        });
+    }
+    out
+}
+
+/// Crossings of `xs` (by its segment order) with the centerline:
+/// `(point, centerline segment, fraction, xs segment, fraction)`.
+fn xs_crossings(center: &[Pm], xs: &[Pm]) -> Vec<(f64, f64, usize, f64, usize, f64)> {
+    let mut out: Vec<(f64, f64, usize, f64, usize, f64)> = Vec::new();
+    for i in 0..xs.len().saturating_sub(1) {
+        for c in 0..center.len() - 1 {
+            if let Some((x, y, t1, t2)) = intersect(center[c], center[c + 1], xs[i], xs[i + 1]) {
+                if out.last().is_some_and(|l| l.0 == x && l.1 == y) {
+                    continue;
+                }
+                out.push((x, y, c, t1, i, t2));
+            }
+        }
+    }
+    out
+}
+
+fn compute_length(p: &[Pm]) -> f64 {
+    let mut s = 0.0;
+    for i in 1..p.len() {
+        s += dist(p[i], p[i - 1]);
+    }
+    s
+}
+
+/// Douglas-Peucker filter keeping the first and last points.
+fn filter_xy(p: &mut Vec<Pm>, tol: f64) {
+    if tol.is_nan() || p.len() <= 2 {
+        return;
+    }
+    let last = p.len() - 1;
+    let mut keep = vec![0, last];
+    let mut last_unique = last;
+    for j in (0..=last).rev() {
+        if !(p[0].x == p[j].x && p[0].y == p[j].y) {
+            last_unique = j;
+            break;
+        }
+    }
+    let tol = tol.max(1e-12);
+    fn dp(p: &[Pm], first: usize, lu: usize, tl: usize, tol: f64, keep: &mut Vec<usize>) {
+        if tl - first <= 1 {
+            return;
+        }
+        let (mut best, mut at) = (0.0, 0);
+        let (ax, ay) = (p[lu].x - p[first].x, p[lu].y - p[first].y);
+        for (i, q) in p.iter().enumerate().take(tl + 1).skip(first + 1) {
+            let v = (ax * (q.y - p[first].y) - ay * (q.x - p[first].x)).abs();
+            if v > best {
+                best = v;
+                at = i;
+            }
+        }
+        let n = (ax.powf(2.0) + ay.powf(2.0)).sqrt();
+        if best / n > tol {
+            keep.push(at);
+            dp(p, first, at, at, tol, keep);
+            dp(p, at, lu, tl, tol, keep);
+        }
+    }
+    dp(p, 0, last_unique, last, tol, &mut keep);
+    keep.sort_unstable();
+    keep.dedup();
+    if keep.len() >= p.len() {
+        return;
+    }
+    let kept: Vec<Pm> = keep.iter().map(|&i| p[i]).collect();
+    *p = kept;
+}
+
+/// Even resampling at about `spacing`, keeping both ends.
+fn resample(p: &[Pm], spacing: f64) -> Vec<Pm> {
+    if p.is_empty() {
+        return Vec::new();
+    }
+    let total = compute_length(p);
+    if p.len() == 1 || total == 0.0 {
+        return vec![p[0]];
+    }
+    let n = (total / spacing).ceil() as usize;
+    let step = total / n as f64;
+    let mut out = vec![p[0]];
+    let (mut at, mut start) = (step, 0.0);
+    for i in 0..p.len() - 1 {
+        let l = dist(p[i], p[i + 1]);
+        while at <= start + l {
+            if out.len() < n {
+                out.push(lerp(p[i], p[i + 1], (at - start) / l));
+            }
+            at += step;
+        }
+        start += l;
+    }
+    out.push(p[p.len() - 1]);
+    out
+}
+
+fn close_xy(a: Pm, b: Pm, d: f64) -> bool {
+    export_tin::close_to(a.x, a.y, b.x, b.y, d)
+}
+
+/// Distance from `q` to segment `a b`.
+fn seg_distance(a: Pm, b: Pm, q: Pm) -> f64 {
+    let l = dist(a, b);
+    let to = |u: Pm| ((u.x - q.x).powi(2) + (u.y - q.y).powi(2)).sqrt();
+    if l == 0.0 {
+        return to(a);
+    }
+    let along = ((b.x - a.x) * (q.x - a.x) + (b.y - a.y) * (q.y - a.y)) / l;
+    if along < 0.0 {
+        return to(a);
+    }
+    if along > l {
+        return to(b);
+    }
+    let h = to(a);
+    let v = h * h - along * along;
+    if v > 0.0 { v.sqrt() } else { 0.0 }
+}
+
+/// Appends `q`, replacing the last point when `q` is within `tol` of it or
+/// the last point is within `tol` of the new last segment.
+fn push_colinear(v: &mut Vec<Pm>, q: Pm, tol: f64) {
+    if v.len() <= 1 {
+        v.push(q);
+        return;
+    }
+    let n = v.len();
+    if close_xy(v[n - 1], q, tol) || seg_distance(v[n - 2], q, v[n - 1]) < tol {
+        v[n - 1] = q;
+    } else {
+        v.push(q);
+    }
+}
+
+fn trim_beginning(v: &mut Vec<Pm>, at: &Pop) {
+    if v.len() <= 1 {
+        return;
+    }
+    if at.seg == 0 {
+        if at.frac > 0.0 {
+            v[0] = at.p;
+        }
+    } else {
+        v[0] = at.p;
+        v.drain(1..1 + at.seg);
+    }
+}
+
+fn trim_end(v: &mut Vec<Pm>, at: &Pop) {
+    if at.seg + 2 == v.len() {
+        if at.frac < 1.0 {
+            let n = v.len();
+            v[n - 1] = at.p;
+        }
+    } else {
+        v.truncate(at.seg + 1);
+        v.push(at.p);
+    }
+}
+
+/// All crossings of `a` with `b`: `(A position on a, B position on b)`.
+fn crossings(a: &[Pm], b: &[Pm]) -> Vec<(Pop, Pop)> {
+    let mut out = Vec::new();
+    for i in 0..a.len().saturating_sub(1) {
+        for j in 0..b.len().saturating_sub(1) {
+            if let Some((x, y, t1, t2)) = intersect(a[i], a[i + 1], b[j], b[j + 1]) {
+                let p = Pm::xy(x, y);
+                out.push((
+                    Pop {
+                        p,
+                        seg: i,
+                        frac: t1,
+                    },
+                    Pop {
+                        p,
+                        seg: j,
+                        frac: t2,
+                    },
+                ));
+            }
+        }
+    }
+    out
+}
+
+fn last_by_b(mut v: Vec<(Pop, Pop)>) -> (Pop, Pop) {
+    v.sort_by(|x, y| {
+        (x.1.seg, x.1.frac)
+            .partial_cmp(&(y.1.seg, y.1.frac))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    v[v.len() - 1]
+}
+
+/// Stream line between two cross-section parts: the centerline part is
+/// moved laterally in steps towards the cross-section points, smoothly from
+/// the upstream to the downstream offset.
+fn stream_offset(stream: &[Pm], usxs: &[Pm], dsxs: &[Pm]) -> Vec<Pm> {
+    let mut st = stream.to_vec();
+    let mut us = usxs.to_vec();
+    let mut ds = dsxs.to_vec();
+    if us.is_empty() {
+        us.push(st[0]);
+    }
+    if ds.is_empty() {
+        ds.push(st[st.len() - 1]);
+    }
+    let n = compute_length(&st);
+    let (n2, n3) = (compute_length(&us), compute_length(&ds));
+    let mean = 0.5 * (n2 + n3);
+    if n2 < 0.1 && n3 < 0.1 {
+        return st;
+    }
+    let mut steps = 4_usize;
+    let mut cnt = (n / (mean / steps as f64)).round_ties_even();
+    while !(cnt >= 8.0 || steps == 16) {
+        steps += 1;
+        cnt = (n / (mean / steps as f64)).round_ties_even();
+    }
+    let tol = (mean / 64.0).max(0.001);
+    filter_xy(&mut st, tol);
+    filter_xy(&mut us, tol);
+    filter_xy(&mut ds, tol);
+    let mut offset = Vec::new();
+    for i in 1..=steps {
+        let f = 1.0 / (steps - i + 1) as f64;
+        let pu = pop_at_fraction(&us, f);
+        let pd = pop_at_fraction(&ds, f);
+        let d0 = dist(pu.p, st[0]);
+        let d1 = dist(pd.p, st[st.len() - 1]);
+        let rs = resample(&st, (d0 + d1) * 0.5);
+        let (mut a, mut b) = (d0, d1);
+        if rs.len() >= 2 {
+            let k = rs.len();
+            a = perp_signed(rs[0], rs[1], pu.p);
+            b = perp_signed(rs[k - 2], rs[k - 1], pd.p);
+        }
+        let delta = b - a;
+        offset.clear();
+        offset.push(pu.p);
+        let k = rs.len() as i64;
+        for j in 2..=(k - 3) {
+            let (s0, s1) = (rs[(j - 1) as usize], rs[(j + 1) as usize]);
+            let fa = j as f64 / k as f64;
+            let factor = a + delta * (-2.0 * fa.powf(3.0) + 3.0 * fa.powf(2.0));
+            let (nx, ny) = left_normal(s0, s1);
+            let mid = lerp(s0, s1, 0.5);
+            let q = Pm {
+                x: mid.x + nx * factor,
+                y: mid.y + ny * factor,
+                z: mid.z + 0.0 * factor,
+                m: mid.m + 0.0 * factor,
+            };
+            push_colinear(&mut offset, q, 1e-6);
+        }
+        push_colinear(&mut offset, pd.p, 1e-6);
+        trim_beginning(&mut us, &pu);
+        trim_beginning(&mut ds, &pd);
+        trim_self_intersections(&mut offset);
+        let hits = crossings(&offset, &us);
+        if hits.len() > 1 {
+            let (pa, pb) = last_by_b(hits);
+            trim_beginning(&mut offset, &pa);
+            trim_beginning(&mut us, &pb);
+        }
+        let hits = crossings(&offset, &ds);
+        if hits.len() > 1 {
+            let (pa, pb) = last_by_b(hits);
+            trim_end(&mut offset, &pa);
+            trim_beginning(&mut ds, &pb);
+        }
+        if i == steps {
+            filter_xy(&mut offset, tol);
+        } else {
+            st = offset.clone();
+        }
+    }
+    offset
+}
+
+fn perp_signed(a: Pm, b: Pm, p: Pm) -> f64 {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let l = (dx * dx + dy * dy).sqrt();
+    if l == 0.0 {
+        return ((a.x - p.x).powi(2) + (a.y - p.y).powi(2)).sqrt();
+    }
+    ((0.0 - (p.x - a.x)) * dy + (p.y - a.y) * dx) / l
+}
+
+/// Offset between the upstream and downstream cross sections towards the
+/// given cross-section points.
+#[allow(clippy::too_many_arguments)]
+fn section_offset(
+    stream: &[Pm],
+    us_at: &Pop,
+    ds_at: &Pop,
+    us_line: &[Pm],
+    us_pt: &Pop,
+    ds_line: &[Pm],
+    ds_pt: &Pop,
+) -> Vec<Pm> {
+    let part = |line: &[Pm], at: &Pop, pt: &Pop| {
+        if pop_less(at, pt) {
+            point_subsection(line, at, pt)
+        } else {
+            let mut v = point_subsection(line, pt, at);
+            v.reverse();
+            v
+        }
+    };
+    stream_offset(
+        stream,
+        &part(us_line, us_at, us_pt),
+        &part(ds_line, ds_at, ds_pt),
+    )
+}
+
+/// Missing or zero values: zeros become `zero_as`; NaNs take the previous
+/// value, leading NaNs the first value (or `default`).
+#[allow(clippy::needless_range_loop)]
+fn fill_values(v: &mut [f32], default: f32, zero_as: f32) {
+    let f = |x: f32| if x == 0.0 { zero_as } else { x };
+    let mut prev = f32::NAN;
+    let mut found = false;
+    for i in 0..v.len() {
+        v[i] = f(v[i]);
+        if v[i].is_nan() && prev.is_nan() {
+            for j in i + 1..v.len() {
+                v[j] = f(v[j]);
+                if !v[j].is_nan() {
+                    prev = v[j];
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                prev = default;
+            }
+            v[i] = prev;
+        } else if v[i].is_nan() {
+            v[i] = prev;
+        } else {
+            found = true;
+            prev = v[i];
+        }
+    }
+}
+
+/// One system: its centerline, the joined profile and the control cross
+/// sections (one per feature, at the feature's first station).
+struct System {
+    line: Vec<Pm>,
+    profile: Profile,
+    xs: Vec<ControlXs>,
+}
+
+fn build_system(features: &[&GroundLine]) -> System {
+    let mut profile: Profile = Vec::new();
+    let mut xs = Vec::new();
+    let mut line = Vec::new();
+    for f in features {
+        let prof: Profile = f
+            .profile
+            .iter()
+            .map(|p| (p[0] as f32, p[1] as f32))
+            .collect();
+        if profile.is_empty() {
+            profile.push(prof[0]);
+        }
+        let base = profile[profile.len() - 1].0;
+        let top = f.top_width as f32;
+        let reach = f.max_reach as f32;
+        xs.push(ControlXs {
+            station: base + prof[0].0,
+            elevation: prof[0].1,
+            width: top,
+            left_slope: f.left_slope as f32,
+            right_slope: f.right_slope as f32,
+            reach: if reach.is_nan() || reach <= 0.0 {
+                top * 2.0
+            } else {
+                reach
+            },
+            transition: f.transition_percent as f32,
+        });
+        for p in &prof[1..] {
+            profile.push((base + p.0, p.1));
+        }
+        line.extend(f.points.iter().map(|p| Pm::xy(p[0], p[1])));
+    }
+    System { line, profile, xs }
+}
+
+/// The five ribbons of a system (left toe, left ridge, centre, right ridge,
+/// right toe), or `None` where RAS Mapper builds no TIN.
+// Negated comparisons keep RAS Mapper's NaN behaviour (a NaN Transition
+// Percent passes `!(tp <= 0)`).
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
+fn system_ribbons(
+    sys: &System,
+    subtype: GroundLineSubtype,
+    units: LengthUnits,
+) -> Option<[Vec<Pm>; 5]> {
+    let line = &sys.line;
+    if line.len() < 2 {
+        return None;
+    }
+    let total = length(line);
+    let spacing = match units {
+        LengthUnits::Feet => 100.0,
+        LengthUnits::Meters => 100.0 * 0.3048,
+    };
+    let seed: Profile = sys.xs.iter().map(|x| (x.station, x.elevation)).collect();
+    let profile = seeded_profile(&seed, &sys.profile, line, total, spacing);
+    // Control cross sections by station (stable), lines at their stations.
+    let mut xs: Vec<(ControlXs, Vec<Pm>)> = sys
+        .xs
+        .iter()
+        .map(|x| {
+            let l = if x.reach > 0.0 {
+                xs_line(line, x.station, x.width, x.reach)
+            } else {
+                Vec::new()
+            };
+            (*x, l)
+        })
+        .collect();
+    xs.sort_by(|a, b| {
+        a.0.station
+            .partial_cmp(&b.0.station)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if let Some(last) = xs.last().cloned()
+        && (last.0.station as f64) < total
+    {
+        let at = total as f32;
+        let mut x = last.0;
+        x.station = at;
+        x.elevation = profile[profile.len() - 1].1;
+        xs.push((x, xs_line(line, at, last.0.width, last.0.reach)));
+    }
+    // Merge the profile and the cross sections (a cross section's elevation
+    // replaces the profile at its station).
+    let mut cp: Profile = Vec::new();
+    let mut p2: Profile = Vec::new();
+    let mut sel: Vec<&(ControlXs, Vec<Pm>)> = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < profile.len() || j < xs.len() {
+        if i < profile.len() && (j == xs.len() || profile[i].0 < xs[j].0.station) {
+            cp.push(profile[i]);
+            i += 1;
+        } else {
+            let x = &xs[j];
+            cp.push((x.0.station, x.0.elevation));
+            p2.push((x.0.station, x.0.elevation));
+            sel.push(x);
+            j += 1;
+        }
+        let last = cp[cp.len() - 1].0;
+        while i < profile.len() && profile[i].0 <= last {
+            i += 1;
+        }
+        while j < xs.len() && xs[j].0.station <= last {
+            j += 1;
+        }
+    }
+    let n = sel.len();
+    let mut tw: Vec<f32> = sel.iter().map(|x| x.0.width).collect();
+    let mut mr: Vec<f32> = sel.iter().map(|x| x.0.reach).collect();
+    let mut ls: Vec<f32> = sel.iter().map(|x| x.0.left_slope).collect();
+    let mut rs: Vec<f32> = sel.iter().map(|x| x.0.right_slope).collect();
+    let tp: Vec<f32> = sel.iter().map(|x| x.0.transition).collect();
+    fill_values(&mut tw, 0.0, 0.0);
+    fill_values(&mut mr, 0.0, 0.0);
+    fill_values(&mut ls, 3.0, 0.001);
+    fill_values(&mut rs, 3.0, 0.001);
+    for k in 0..n {
+        if mr[k] == 0.0 {
+            mr[k] = tw[k];
+        } else if tw[k] > mr[k] {
+            tw[k] = mr[k];
+        }
+    }
+    // Transition stations: a cross section that changes the template ends
+    // its section Top Width x Transition Percent before the next one.
+    if n >= 2 {
+        for k in 0..=(n - 2).min(p2.len() - 2) {
+            if !(tp[k] <= 0.0) && (tw[k] != tw[k + 1] || mr[k] != mr[k + 1]) {
+                let (x, x2) = (p2[k].0, p2[k + 1].0);
+                let s = f32_max(x, x2 - tw[k] * tp[k]);
+                if !(s <= x) && !(s >= x2) && !cp.iter().any(|q| (q.0 - s).abs() <= 0.01) {
+                    let v = query(&cp, s);
+                    cp.push((s, v));
+                }
+            }
+        }
+    }
+    sort_stations(&mut cp);
+    if sel.iter().any(|x| x.1.len() < 2) {
+        return None;
+    }
+    let mut xprof = Vec::with_capacity(n);
+    for k in 0..n {
+        if tw[k].is_nan() || (tw[k] == 0.0 && mr[k] == 0.0) {
+            return None;
+        }
+        xprof.push(xs_profile(subtype, p2[k].1, tw[k], ls[k], rs[k], mr[k]));
+    }
+    match subtype {
+        GroundLineSubtype::Channel => ls.iter_mut().for_each(|v| *v = -*v),
+        GroundLineSubtype::Levee => rs.iter_mut().for_each(|v| *v = -*v),
+    }
+    let mm = m_fraction(line);
+    let mut out: [Vec<Pm>; 4] = Default::default();
+    let with_z = |l: &[Pm], prof: &Profile| -> Option<Vec<Pm>> {
+        let len = length(l);
+        let plen = (prof[prof.len() - 1].0 - prof[0].0) as f64;
+        if (len - plen).abs() > 0.01 && plen > len {
+            return None;
+        }
+        Some(z_from_profile(l, prof, len, true))
+    };
+    let set_m = |v: Vec<Pm>, m: f64| -> Vec<Pm> { v.into_iter().map(|p| Pm { m, ..p }).collect() };
+    for m in 0..n.saturating_sub(1) {
+        let x = p2[m].0;
+        let us = set_m(with_z(&sel[m].1, &xprof[m])?, x as f64 / total);
+        let x2 = p2[m + 1].0;
+        let mut s2 = x2;
+        if tp[m] > 0.0 && (tw[m] != tw[m + 1] || mr[m] != mr[m + 1]) {
+            s2 = f32_max(x, x2 - tw[m] * tp[m]);
+        }
+        let ds_line = xs_line(&mm, s2, tw[m], mr[m]);
+        let ds = set_m(with_z(&ds_line, &xprof[m])?, s2 as f64 / total);
+        let at = |hit: (f64, f64, usize, f64, usize, f64), st: f32| {
+            let p = Pm {
+                x: hit.0,
+                y: hit.1,
+                z: f64::NAN,
+                m: st as f64 / total,
+            };
+            (
+                Pop {
+                    p,
+                    seg: hit.2,
+                    frac: hit.3,
+                },
+                Pop {
+                    p,
+                    seg: hit.4,
+                    frac: hit.5,
+                },
+            )
+        };
+        let h0 = if m == 0 && x == 0.0 {
+            (mm[0].x, mm[0].y, 0, 0.0, 0, 0.5)
+        } else {
+            *xs_crossings(&mm, &us).first()?
+        };
+        let (a0, b0) = at(h0, x);
+        let h1 = if m == n - 2 {
+            let k = mm.len() - 1;
+            (mm[k].x, mm[k].y, k - 1, 1.0, 0, 0.5)
+        } else {
+            *xs_crossings(&mm, &ds).first()?
+        };
+        let (a1, b1) = at(h1, s2);
+        let stream = point_subsection(&mm, &a0, &a1);
+        let us_tot = length(&us);
+        let ds_tot = length(&ds);
+        let targets = [
+            (first_pop(&us), first_pop(&ds)),
+            (last_pop(&us), last_pop(&ds)),
+            (
+                pop_at_distance(&us, us_tot, xprof[m][1].0 as f64),
+                pop_at_distance(&ds, ds_tot, xprof[m][1].0 as f64),
+            ),
+            (
+                pop_at_distance(&us, us_tot, xprof[m][2].0 as f64),
+                pop_at_distance(&ds, ds_tot, xprof[m][2].0 as f64),
+            ),
+        ];
+        for (k, (up, dn)) in targets.iter().enumerate() {
+            let o = section_offset(&stream, &b0, &b1, &us, up, &ds, dn);
+            if o.len() > 1 {
+                out[k].extend(o);
+            }
+        }
+    }
+    let [mut lt, mut rt, mut lr, mut rr] = out;
+    for v in [&mut lt, &mut lr, &mut rr, &mut rt] {
+        let closed = v.len() >= 2 && is_ring(v, 0.01);
+        let tail = if closed { v.pop() } else { None };
+        trim_self_intersections(v);
+        if let Some(t) = tail {
+            v.push(t);
+        }
+    }
+    let fr: Vec<f64> = cp.iter().map(|p| p.0 as f64 / total).collect();
+    let station = |p: &Pm| (p.m * total) as f32;
+    let ridge = |v: &[Pm]| -> Vec<Pm> {
+        inject_fractions(v, &fr)
+            .into_iter()
+            .map(|p| Pm {
+                z: query(&cp, station(&p)) as f64,
+                ..p
+            })
+            .collect()
+    };
+    let along = |vals: &[f32]| -> Profile { p2.iter().zip(vals).map(|(a, &v)| (a.0, v)).collect() };
+    let (pmr, ptw, pls, prs) = (along(&mr), along(&tw), along(&ls), along(&rs));
+    let toe = |v: &[Pm], slopes: &Profile, side: f64| -> Vec<Pm> {
+        inject_fractions(v, &fr)
+            .into_iter()
+            .map(|p| {
+                let s = station(&p);
+                let q = query(&cp, s);
+                let run = query(&pmr, s) / 2.0 - query(&ptw, s) / 2.0;
+                Pm {
+                    z: q as f64 + side * (run as f64 * (1.0 / query(slopes, s) as f64)),
+                    ..p
+                }
+            })
+            .collect()
+    };
+    let centre = z_from_profile(&mm, &cp, total, false);
+    Some([
+        toe(&lt, &pls, -1.0),
+        ridge(&lr),
+        centre,
+        ridge(&rr),
+        toe(&rt, &prs, 1.0),
+    ])
+}
+
+/// .NET `Math.Max` on binary32: NaN when either is NaN.
+fn f32_max(a: f32, b: f32) -> f32 {
+    if a > b || a.is_nan() { a } else { b }
+}
+
+/// Systems of a ground-line layer: named features joined end to start
+/// (within 60 ft, same name, elevation type and Elev Pt Tolerance), in
+/// joined order. Returns the system of each feature.
+fn ground_line_systems(features: &[GroundLine]) -> (Vec<Option<usize>>, Vec<Vec<usize>>) {
+    let n = features.len();
+    let mut of: Vec<Option<usize>> = vec![None; n];
+    let mut systems: Vec<Vec<usize>> = Vec::new();
+    let first = |k: usize| Pm::xy(features[k].points[0][0], features[k].points[0][1]);
+    let last = |k: usize| {
+        let p = features[k].points[features[k].points.len() - 1];
+        Pm::xy(p[0], p[1])
+    };
+    for i in 0..n {
+        let name = features[i].system_name.trim();
+        if of[i].is_some() || name.is_empty() {
+            continue;
+        }
+        let id = systems.len();
+        let mut chain = std::collections::VecDeque::from([i]);
+        of[i] = Some(id);
+        let joins = |k: usize, of: &[Option<usize>]| {
+            k != i
+                && of[k].is_none()
+                && features[k].system_name.trim() == name
+                && features[k].elevation_type == features[i].elevation_type
+                && features[k].elev_pt_tolerance.to_bits()
+                    == features[i].elev_pt_tolerance.to_bits()
+        };
+        for forward in [false, true] {
+            let mut pt = if forward { last(i) } else { first(i) };
+            loop {
+                let mut best: Option<(usize, f64)> = None;
+                for k in 0..n {
+                    if !joins(k, &of) {
+                        continue;
+                    }
+                    let d = dist(pt, if forward { first(k) } else { last(k) });
+                    if d < SYSTEM_SEARCH_RADIUS && best.is_none_or(|b| d < b.1) {
+                        best = Some((k, d));
+                    }
+                }
+                let Some((k, _)) = best else { break };
+                of[k] = Some(id);
+                if forward {
+                    chain.push_back(k);
+                    pt = last(k);
+                } else {
+                    chain.push_front(k);
+                    pt = first(k);
+                }
+            }
+        }
+        systems.push(chain.into_iter().collect());
+    }
+    (of, systems)
+}
+
+/// The ribbon TIN of one system.
+fn system_tin(
+    features: &[GroundLine],
+    members: &[usize],
+    subtype: GroundLineSubtype,
+    units: LengthUnits,
+) -> Option<CleanTin> {
+    let fs: Vec<&GroundLine> = members.iter().map(|&k| &features[k]).collect();
+    let sys = build_system(&fs);
+    let ribbons = system_ribbons(&sys, subtype, units)?;
+    Some(ribbon_tin(&ribbons, 0.01))
+}
+
+// ---------------------------------------------------------------------------
 // Application
 // ---------------------------------------------------------------------------
 
@@ -1030,8 +2109,18 @@ pub fn apply(layers: &[Layer], grid: &Grid, values: &mut [f32]) -> Result<Value,
                 length_units,
                 ..
             } => {
-                for f in features {
-                    let Some(tin) = ground_line_tin(f, *subtype, *length_units) else {
+                let (system_of, systems) = ground_line_systems(features);
+                for (fi, f) in features.iter().enumerate() {
+                    let tin = match system_of[fi] {
+                        None => ground_line_tin(f, *subtype, *length_units),
+                        // A system is drawn once, in the place of its
+                        // highest feature ID, with that feature's type.
+                        Some(s) if systems[s].iter().max() == Some(&fi) => {
+                            system_tin(features, &systems[s], *subtype, *length_units)
+                        }
+                        Some(_) => continue,
+                    };
+                    let Some(tin) = tin else {
                         skipped += 1;
                         continue;
                     };
@@ -1132,6 +2221,8 @@ mod tests {
             points,
             profile,
             system_name: String::new(),
+            transition_percent: 0.0,
+            elev_pt_tolerance: 0.0,
         }
     }
 
@@ -1247,6 +2338,8 @@ mod tests {
             points: vec![[10.0, 50.0], [80.0, 50.0], [80.0, 56.0], [10.0, 56.0]],
             profile: vec![[0.0, 30.0], [76.0, 30.0], [146.0, 10.0]],
             system_name: String::new(),
+            transition_percent: 0.0,
+            elev_pt_tolerance: 0.0,
         };
         let g = grid();
         let mut v = vec![0.0_f32; 100 * 100];
@@ -1334,6 +2427,129 @@ mod tests {
         }
     }
 
+    fn named(points: Vec<[f64; 2]>, z: [f64; 2], name: &str, top: f64, tp: f64) -> GroundLine {
+        let l: f64 = points
+            .windows(2)
+            .map(|w| ((w[1][0] - w[0][0]).powi(2) + (w[1][1] - w[0][1]).powi(2)).sqrt())
+            .sum();
+        let mut f = levee(points, vec![[0.0, z[0]], [l, z[1]]]);
+        f.system_name = name.into();
+        f.top_width = top;
+        f.transition_percent = tp;
+        f
+    }
+
+    #[test]
+    fn named_features_join_end_to_start_within_60_ft() {
+        let a = named(vec![[100.0, 0.0], [200.0, 0.0]], [5.0, 5.0], "S", 10.0, 0.0);
+        let b = named(vec![[0.0, 0.0], [100.0, 0.0]], [5.0, 5.0], "S", 10.0, 0.0);
+        // 30 ft gap: joined after a.
+        let c = named(vec![[230.0, 0.0], [300.0, 0.0]], [5.0, 5.0], "S", 10.0, 0.0);
+        // 60 ft gap: not joined (strictly within 60).
+        let d = named(vec![[360.0, 0.0], [400.0, 0.0]], [5.0, 5.0], "S", 10.0, 0.0);
+        let mut e = named(vec![[300.0, 0.0], [330.0, 0.0]], [5.0, 5.0], "S", 10.0, 0.0);
+        e.elevation_type = ElevationType::SetIfLower;
+        let u = levee(
+            vec![[0.0, 50.0], [10.0, 50.0]],
+            vec![[0.0, 1.0], [10.0, 1.0]],
+        );
+        let (of, systems) = ground_line_systems(&[a, b, c, d, e, u]);
+        assert_eq!(systems, vec![vec![1, 0, 2], vec![3], vec![4]]);
+        assert_eq!(of, vec![Some(0), Some(0), Some(0), Some(1), Some(2), None]);
+    }
+
+    #[test]
+    fn junction_takes_the_next_feature_start_elevation() {
+        let a = named(vec![[0.0, 0.0], [100.0, 0.0]], [5.0, 6.0], "S", 10.0, 0.0);
+        let b = named(vec![[100.0, 0.0], [250.0, 0.0]], [9.0, 9.0], "S", 10.0, 0.0);
+        let sys = build_system(&[&a, &b]);
+        assert_eq!(sys.xs.len(), 2);
+        assert_eq!((sys.xs[1].station, sys.xs[1].elevation), (100.0, 9.0));
+        let seed: Profile = sys.xs.iter().map(|x| (x.station, x.elevation)).collect();
+        let p = seeded_profile(&seed, &sys.profile, &sys.line, length(&sys.line), 100.0);
+        // The previous feature's end elevation (6) is dropped: its profile
+        // now runs to the next feature's start elevation.
+        assert_eq!(query(&p, 100.0), 9.0);
+        assert_eq!(query(&p, 50.0), 7.0);
+    }
+
+    #[test]
+    fn transition_ends_a_section_early() {
+        // Top Width 10 then 30, Transition Percent 0.5: the first section's
+        // template ends 5 ft before the second cross section.
+        let a = named(
+            vec![[0.0, 50.0], [60.0, 50.0]],
+            [20.0, 20.0],
+            "S",
+            10.0,
+            0.5,
+        );
+        let mut b = named(
+            vec![[60.0, 50.0], [95.0, 50.0]],
+            [20.0, 20.0],
+            "S",
+            30.0,
+            0.5,
+        );
+        b.max_reach = 60.0;
+        let sys = build_system(&[&a, &b]);
+        let r = system_ribbons(&sys, GroundLineSubtype::Levee, LengthUnits::Feet).unwrap();
+        let stations: Vec<f64> = r[2].iter().map(|p| p.m * 95.0).collect();
+        assert!(
+            stations.iter().any(|s| (s - 55.0).abs() < 1e-3),
+            "{stations:?}"
+        );
+    }
+
+    #[test]
+    fn cross_section_profile_narrows_an_equal_width() {
+        let p = xs_profile(GroundLineSubtype::Levee, 10.0, 20.0, 2.0, 2.0, 20.0);
+        assert!((p[0].1 - 9.9975).abs() < 1e-5 && p[0].0 == 0.0, "{p:?}");
+        assert_eq!(p[3].0, 20.0);
+        assert!((p[2].0 - p[1].0 - 19.99).abs() < 1e-4, "{p:?}");
+    }
+
+    #[test]
+    fn missing_values_take_neighbours() {
+        let mut v = [f32::NAN, 0.0, 2.0, f32::NAN];
+        fill_values(&mut v, 3.0, 0.001);
+        assert_eq!(v, [0.001, 0.001, 2.0, 2.0]);
+        let mut v = [f32::NAN, f32::NAN];
+        fill_values(&mut v, 3.0, 0.001);
+        assert_eq!(v, [3.0, 3.0]);
+    }
+
+    #[test]
+    fn straight_named_levee_matches_closed_form() {
+        let f = named(
+            vec![[10.0, 50.0], [90.0, 50.0]],
+            [20.0, 20.0],
+            "S",
+            10.0,
+            0.0,
+        );
+        let g = grid();
+        let mut v = vec![0.0_f32; 100 * 100];
+        apply(&[gl_layer(GroundLineSubtype::Levee, vec![f])], &g, &mut v).unwrap();
+        for r in 0..100 {
+            for c in 15..85 {
+                let (x, y) = centre(&g, r, c);
+                let o = (y - 50.0).abs();
+                let slope = if y > 50.0 { 2.0 } else { 4.0 };
+                let want = if o <= 20.0 {
+                    20.0 - (o - 5.0).max(0.0) / slope
+                } else {
+                    0.0
+                };
+                let got = v[r * 100 + c] as f64;
+                assert!(
+                    (got - want).abs() <= 1.0 / 32.0 + 1e-9,
+                    "x {x} y {y}: {got} vs {want}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn unqualified_forms_are_refused() {
         let mut f = levee(vec![[0.0, 0.0], [1.0, 0.0]], vec![[0.0, 0.0], [1.0, 0.0]]);
@@ -1342,8 +2558,7 @@ mod tests {
         assert!(validate(&layers).is_ok());
         f.system_name = "chan".into();
         let layers = [gl_layer(GroundLineSubtype::Channel, vec![f.clone()])];
-        assert!(matches!(validate(&layers), Err(MapError::Unsupported(_))));
-        f.system_name.clear();
+        assert!(validate(&layers).is_ok());
         f.left_slope = -1.0;
         let layers = [gl_layer(GroundLineSubtype::Channel, vec![f])];
         assert!(matches!(validate(&layers), Err(MapError::Unsupported(_))));
