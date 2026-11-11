@@ -18,6 +18,23 @@ Measured on the Whisky Chitto p04 staged schema /2 requests (4,483 XS, 12,919 x
 4 CPUs): render 0.99 s at 1 worker, 0.49 s at 4; call total 4.58 s to 4.10 s;
 outputs SHA256-equal to v0.17.0.
 
+### Engine-written 1D and composition delivery GeoTIFFs
+
+`one-d-diagnostic` schemas /2-/4 and coupled composition schemas /1-/2 accept
+the opt-in sloping `final_format` block with `epsg`, `flooded_depth_range` and
+an optional `aoi_mask_file` (one byte per window pixel). The engine applies the
+mask, reports `depth_finite_pixels` and `flooded_pixels`, and writes
+`depth.tif`/`wse.tif` once through `final_tiff` (tiled DEFLATE, numeric nodata,
+optional full-grid placement and GDAL-average overviews) instead of raw `.bin`.
+Product values are unchanged; NaN and masked pixels become nodata. Every option
+and the mask are validated and the writer admitted before outputs exist.
+Composition accepts `threads` (DEFLATE workers) with `final_format`. The 1D
+native/clipped and non-stored-grid coupled method records advertise
+`native_geotiff_outputs` and `native_final_format`. On Whisky Chitto p04 (full
+12,919 x 17,409 grid, 8 profiles, storage composition) Commander mapping took
+124.9 s against 166.5 s with Python-written GeoTIFFs; files were 249 MB
+against 541 MB, with identical valid bits and nodata masks.
+
 ### Multi-profile 1D requests
 
 `one-d-diagnostic` schemas /2-/4 accept `levels_files` (1-256 profiles) as an

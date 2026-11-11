@@ -415,3 +415,138 @@ fn multi_profile_selection_is_refused_before_outputs() {
         );
     }
 }
+
+fn read_tif(path: &Path) -> (Vec<f32>, Option<f64>, usize, usize) {
+    let mut raster = terrio::LazyRaster::open_tiff(path.to_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let (w, h) = (raster.width(), raster.height());
+    let ds = raster
+        .read_window(
+            terrio::Window {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            },
+            &terrio::WindowOptions {
+                bands: vec![1],
+                overview: None,
+            },
+        )
+        .unwrap();
+    let terrio::raster::RasterData::F32(values) = ds.raster.data else {
+        panic!("not Float32")
+    };
+    (values, raster.nodata(), w, h)
+}
+
+#[test]
+fn final_format_writes_raw_bits_with_mask_and_nodata_for_single_and_multi() {
+    let fixture = Fixture::populated();
+    fixture.run(fixture.request.clone(), "raw").unwrap();
+    // Mask out the first row and one interior pixel.
+    let mut mask = vec![1_u8; 30];
+    mask[..6].fill(0);
+    mask[13] = 0;
+    fs::write(fixture.root.join("mask.u8"), &mask).unwrap();
+    let mut request = fixture.request.clone();
+    request["final_format"] = json!({"nodata": -9999.0, "block_size": 16, "overview_factors": [2]});
+    request["epsg"] = json!(26915);
+    request["aoi_mask_file"] = json!("mask.u8");
+    request["flooded_depth_range"] = json!([0.0, 10000.0]);
+    let report = fixture.run(request.clone(), "final").unwrap();
+    assert_eq!(report["depth_file"], "depth.tif");
+    assert_eq!(report["compression"], "DEFLATE");
+    assert!(!fixture.root.join("final/depth.bin").exists());
+    let raw_depth = read_f32(&fixture.root.join("raw/depth.bin"));
+    let mut finite = 0;
+    let mut flooded = 0;
+    for product in ["depth", "wse"] {
+        let raw = read_f32(&fixture.root.join(format!("raw/{product}.bin")));
+        let (values, nodata, w, h) = read_tif(&fixture.root.join(format!("final/{product}.tif")));
+        assert_eq!((w, h, nodata), (6, 5, Some(-9999.0)));
+        for (i, (r, v)) in raw.iter().zip(&values).enumerate() {
+            if mask[i] == 0 || r.is_nan() {
+                assert_eq!(*v, -9999.0, "{product} {i}");
+            } else {
+                assert_eq!(r.to_bits(), v.to_bits(), "{product} {i}");
+            }
+        }
+    }
+    for (i, d) in raw_depth.iter().enumerate() {
+        if mask[i] == 1 && d.is_finite() {
+            finite += 1;
+            flooded += usize::from(*d > 0.0 && *d <= 10000.0);
+        }
+    }
+    assert!(finite > 0);
+    assert_eq!(report["depth_finite_pixels"], finite);
+    assert_eq!(report["flooded_pixels"], flooded);
+    assert_eq!(report["depth_final"]["valid_pixels"], finite);
+    // Multi-profile delivery writes the same files per profile.
+    let mut multi = request;
+    multi.as_object_mut().unwrap().remove("levels_file");
+    multi["levels_files"] = json!(["levels.bin", "levels.bin"]);
+    multi["threads"] = json!(2);
+    fixture.run(multi, "multi").unwrap();
+    for i in 0..2 {
+        for product in ["depth", "wse"] {
+            assert_eq!(
+                fs::read(fixture.root.join(format!("final/{product}.tif"))).unwrap(),
+                fs::read(
+                    fixture
+                        .root
+                        .join(format!("multi/profile-{i:04}/{product}.tif"))
+                )
+                .unwrap(),
+                "file bytes are independent of workers and batching"
+            );
+        }
+    }
+}
+
+#[test]
+fn final_format_options_are_refused_before_outputs() {
+    let fixture = Fixture::populated();
+    fs::write(fixture.root.join("bad-mask.u8"), [2_u8; 30]).unwrap();
+    fs::write(fixture.root.join("short-mask.u8"), [1_u8; 29]).unwrap();
+    let base = {
+        let mut r = fixture.request.clone();
+        r["final_format"] = json!({"nodata": -9999.0});
+        r["epsg"] = json!(26915);
+        r["flooded_depth_range"] = json!([0.0, 10000.0]);
+        r
+    };
+    let mut cases = vec![];
+    for key in ["epsg", "flooded_depth_range"] {
+        let mut r = base.clone();
+        r.as_object_mut().unwrap().remove(key);
+        cases.push(r);
+    }
+    let mut r = fixture.request.clone();
+    r["epsg"] = json!(26915);
+    cases.push(r);
+    let mut r = base.clone();
+    r["epsg"] = json!(1);
+    cases.push(r);
+    let mut r = base.clone();
+    r["flooded_depth_range"] = json!([1.0, 0.0]);
+    cases.push(r);
+    let mut r = base.clone();
+    r["final_format"] = json!({"nodata": 0.1});
+    cases.push(r);
+    for mask in ["bad-mask.u8", "short-mask.u8", "absent.u8"] {
+        let mut r = base.clone();
+        r["aoi_mask_file"] = json!(mask);
+        cases.push(r);
+    }
+    for (i, request) in cases.into_iter().enumerate() {
+        let name = format!("refused-{i}");
+        assert!(fixture.run(request, &name).is_err(), "case {i}");
+        assert!(
+            !fixture.root.join(&name).exists(),
+            "case {i} created output"
+        );
+    }
+}

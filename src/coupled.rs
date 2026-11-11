@@ -9,7 +9,8 @@ pub const METHOD_ID: &str = "one-d-two-d-coverage-first-diagnostic/1";
 pub const STORAGE_METHOD_ID: &str = "one-d-two-d-storage-coverage-first-diagnostic/1";
 
 pub fn storage_method_record() -> serde_json::Value {
-    serde_json::json!({"method_id": STORAGE_METHOD_ID, "experimental": true,
+    serde_json::json!({"native_geotiff_outputs": true, "native_final_format": crate::one_d_delivery::capability(),
+        "method_id": STORAGE_METHOD_ID, "experimental": true,
         "native_parity_qualified": false,
         "ownership": "caller-supplied global physical 2D and storage labels; 0 unowned, row index + 1 owned",
         "precedence": "disjoint 2D and storage coverage override XS before wet/dry filtering",
@@ -19,7 +20,8 @@ pub fn storage_method_record() -> serde_json::Value {
 }
 
 pub fn method_record() -> serde_json::Value {
-    serde_json::json!({"method_id": METHOD_ID, "experimental": true,
+    serde_json::json!({"native_geotiff_outputs": true, "native_final_format": crate::one_d_delivery::capability(),
+        "method_id": METHOD_ID, "experimental": true,
         "native_parity_qualified": false,
         "ownership": "caller-supplied global physical 2D cell labels; 0 unowned, row index + 1 owned",
         "precedence": "2D coverage wins before wet/dry filtering; otherwise use XS product",

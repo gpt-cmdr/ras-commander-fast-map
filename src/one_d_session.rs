@@ -80,6 +80,26 @@ pub struct Request {
     /// render independently, so outputs are identical for every worker count.
     #[serde(default)]
     pub threads: Option<usize>,
+    /// Opt-in engine-written delivery GeoTIFFs (schemas /2-/4); see `one_d_delivery`.
+    #[serde(default)]
+    pub final_format: Option<crate::native_output::FinalFormat>,
+    #[serde(default)]
+    pub epsg: Option<u32>,
+    #[serde(default)]
+    pub aoi_mask_file: Option<PathBuf>,
+    #[serde(default)]
+    pub flooded_depth_range: Option<[f32; 2]>,
+}
+
+impl Request {
+    fn delivery(&self) -> crate::one_d_delivery::Options {
+        crate::one_d_delivery::Options {
+            final_format: self.final_format.clone(),
+            epsg: self.epsg,
+            aoi_mask_file: self.aoi_mask_file.clone(),
+            flooded_depth_range: self.flooded_depth_range,
+        }
+    }
 }
 
 pub(crate) fn read_records<const N: usize, T>(
@@ -261,6 +281,28 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
     } else {
         PreparedSurface::planned_bytes(req.point_count, req.triangle_count, req.segment_count)?
     };
+    let output_gt = layout
+        .map(|l| l.window_transform([window.col, window.row, window.width, window.height]))
+        .unwrap_or([
+            gt[0] + window.col as f64 * gt[1],
+            gt[1],
+            0.,
+            gt[3] + window.row as f64 * gt[5],
+            0.,
+            gt[5],
+        ]);
+    if !native && req.delivery().requested() {
+        return Err(MapError::Unsupported(
+            "1D final_format requires schemas /2-/4".into(),
+        ));
+    }
+    let delivery = req
+        .delivery()
+        .plan(window.width, window.height, output_gt)?;
+    let delivery_bytes = match &delivery {
+        Some(plan) => plan.planned_bytes(threads)?,
+        None => 0,
+    };
     // Each extra render worker: tile claim bytes plus triangle candidate references.
     let worker_extra = req
         .tile_size
@@ -293,6 +335,9 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         // Float32 conversion scratch, BufWriter, and bounded report overhead.
         .and_then(|v| v.checked_add(65536 + 8192 + 65536))
         .and_then(|v| v.checked_add(worker_extra))
+        .ok_or_else(|| MapError::Budget("1D request allocation overflow".into()))?;
+    let planned = planned
+        .checked_add(delivery_bytes)
         .ok_or_else(|| MapError::Budget("1D request allocation overflow".into()))?;
     if planned > req.max_working_bytes {
         return Err(MapError::Budget(format!(
@@ -356,6 +401,10 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         )?);
     }
     let terrain = read_records(&base.join(&req.terrain_file), pixels, f32::from_le_bytes)?;
+    let mask = match &delivery {
+        Some(plan) => plan.read_mask(base)?,
+        None => None,
+    };
     if terrain.iter().any(|v| v.is_infinite()) {
         return Err(MapError::Invalid("1D terrain must be finite or NaN".into()));
     }
@@ -434,7 +483,7 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         None
     };
     let prepare_seconds = tick.elapsed().as_secs_f64();
-    let pool = if threads > 1 {
+    let pool = if threads > 1 || delivery.is_some() {
         Some(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
@@ -444,16 +493,6 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
     } else {
         None
     };
-    let output_gt = layout
-        .map(|l| l.window_transform([window.col, window.row, window.width, window.height]))
-        .unwrap_or([
-            gt[0] + window.col as f64 * gt[1],
-            gt[1],
-            0.,
-            gt[3] + window.row as f64 * gt[5],
-            0.,
-            gt[5],
-        ]);
     let method = if clipped {
         crate::one_d_native::clipped_method_record()
     } else if native {
@@ -541,9 +580,14 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
             if multi {
                 fs::create_dir(&folder)?;
             }
+            if let (Some(plan), Some(pool)) = (&delivery, &pool) {
+                return plan
+                    .deliver(&folder, mask.as_deref(), &mut depth, &mut wse, pool)
+                    .map(Some);
+            }
             crate::horizontal::write_values(&folder.join("depth.bin"), &depth)?;
             crate::horizontal::write_values(&folder.join("wse.bin"), &wse)?;
-            Ok::<_, MapError>(())
+            Ok::<_, MapError>(None)
         })();
         let write_seconds = tick.elapsed().as_secs_f64();
         // Additive report fields; wall seconds on the calling thread. Shared
@@ -557,9 +601,17 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
             "write_seconds": write_seconds,
             "total_seconds": started.elapsed().as_secs_f64(),
         });
-        if let Err(e) = &result {
-            report["status"] = json!("aborted");
-            report["error"] = json!(e.to_string());
+        match &result {
+            Ok(Some(fields)) => {
+                for (key, value) in fields.as_object().into_iter().flatten() {
+                    report[key] = value.clone();
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                report["status"] = json!("aborted");
+                report["error"] = json!(e.to_string());
+            }
         }
         if multi && folder.is_dir() {
             fs::write(

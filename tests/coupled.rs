@@ -475,3 +475,126 @@ fn storage_only_composition_requires_empty_dry_mesh_and_preserves_legacy_refusal
     assert_eq!(d, [123.; 3]);
     assert_eq!(w, [456.; 3]);
 }
+
+#[test]
+fn storage_composition_final_format_writes_composed_bits() {
+    use std::fs;
+    let root = std::env::temp_dir().join(format!(
+        "coupled-final-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&root).unwrap();
+    let nan = f32::NAN;
+    for (name, values) in [
+        ("xs-depth", [5., 7., 9.]),
+        ("xs-wse", [100., 110., 120.]),
+        ("mesh-depth", [3., nan, nan]),
+        ("mesh-wse", [95., nan, nan]),
+        ("storage-depth", [nan, nan, 0.5]),
+        ("storage-wse", [nan, nan, 90.]),
+    ] {
+        fs::write(
+            root.join(name),
+            values
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    }
+    for (name, labels) in [
+        ("mesh-owners", [1_u32, 0, 0]),
+        ("storage-owners", [0, 1, 2]),
+    ] {
+        fs::write(
+            root.join(name),
+            labels
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    }
+    fs::write(root.join("mask"), [1_u8, 1, 0]).unwrap();
+    let component = |name: &str| {
+        serde_json::json!({"profile_id":"steady:Big", "crs":"prepared-crs",
+        "width":3,"height":1,"geo_transform":[500000.,1.,0.,4000000.,0.,-1.],
+        "depth_file":format!("{name}-depth"),"wse_file":format!("{name}-wse")})
+    };
+    let wire = |extra: serde_json::Value| {
+        let mut r = serde_json::json!({"schema":"fast-map-coupled-diagnostic/2",
+            "xs":component("xs"),"two_d":component("mesh"),"two_d_owners_file":"mesh-owners","two_d_cell_count":1,
+            "storage":{"component":component("storage"),"owners_file":"storage-owners","area_count":2},"max_working_bytes":4_000_000});
+        for (k, v) in extra.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        serde_json::from_value::<ras_commander_fast_map::coupled_session::Request>(r).unwrap()
+    };
+    let raw = ras_commander_fast_map::coupled_session::run(
+        &wire(serde_json::json!({})),
+        &root,
+        &root.join("raw"),
+    )
+    .unwrap();
+    let report = ras_commander_fast_map::coupled_session::run(
+        &wire(
+            serde_json::json!({"final_format":{"nodata":-9999.0,"block_size":16},"epsg":26915,
+            "aoi_mask_file":"mask","flooded_depth_range":[0.0,10000.0],"threads":2}),
+        ),
+        &root,
+        &root.join("final"),
+    )
+    .unwrap();
+    assert_eq!(report["counts"], raw["counts"]);
+    assert_eq!(report["depth_finite_pixels"], 1);
+    assert_eq!(report["flooded_pixels"], 1);
+    for product in ["depth", "wse"] {
+        let bits: Vec<f32> = fs::read(root.join(format!("raw/{product}.bin")))
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        let mut raster = terrio::LazyRaster::open_tiff(
+            root.join(format!("final/{product}.tif")).to_str().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let ds = raster
+            .read_window(
+                terrio::Window {
+                    x: 0,
+                    y: 0,
+                    width: 3,
+                    height: 1,
+                },
+                &terrio::WindowOptions {
+                    bands: vec![1],
+                    overview: None,
+                },
+            )
+            .unwrap();
+        let terrio::raster::RasterData::F32(values) = ds.raster.data else {
+            panic!()
+        };
+        assert_eq!(values[0].to_bits(), bits[0].to_bits());
+        assert_eq!(values[1], -9999.0); // composed NaN
+        assert_eq!(values[2], -9999.0); // masked storage pixel
+    }
+    // threads without final_format and stored-grid final_format are refused.
+    assert!(
+        ras_commander_fast_map::coupled_session::run(
+            &wire(serde_json::json!({"threads":2})),
+            &root,
+            &root.join("bad")
+        )
+        .is_err()
+    );
+    assert!(!root.join("bad").exists());
+    fs::remove_dir_all(root).unwrap();
+}

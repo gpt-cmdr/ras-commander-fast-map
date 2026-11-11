@@ -34,6 +34,8 @@ pub fn method_record() -> serde_json::Value {
         "render_workers": {"control": "threads", "default": 1, "min": 1, "max": 64,
             "split": "whole source tile rows; per-tile claims, candidate order and scanline increments unchanged",
             "outputs": "bit-identical for every worker count", "report_timing": true},
+        "native_geotiff_outputs": true,
+        "native_final_format": crate::one_d_delivery::capability(),
         "multi_profile": {"control": "levels_files", "min": 1, "max": crate::one_d_session::MAX_PROFILES,
             "layout": "profile-NNNN/{depth,wse}.bin and report.json per profile; top-level report lists profiles",
             "shared": "inputs, terrain and prepared surface are read and built once",

@@ -54,6 +54,7 @@ pub mod model;
 pub mod native_output;
 pub mod one_d;
 pub mod one_d_clip;
+pub mod one_d_delivery;
 pub mod one_d_native;
 pub mod one_d_order;
 pub mod one_d_session;
