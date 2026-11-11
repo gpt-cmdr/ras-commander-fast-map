@@ -48,7 +48,7 @@ The tie behaviour that the earlier fitted rule could not explain (pixel centres 
 source cell centres choosing different neighbours at 1e-9-cell perturbations) is
 fully determined by items 1 and 2.
 
-## Qualification (HEC-RAS 7.0.1, CLB-08 `work\T33`)
+## Qualification (HEC-RAS 7.0.1)
 
 Five real terrains, two independent exports each, modifications off. "No TIN"
 runs the engine with the stored stitch TIN disabled, isolating rules 1-5:
