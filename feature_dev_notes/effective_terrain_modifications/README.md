@@ -1,11 +1,15 @@
-# Effective terrain with terrain modifications (parked, 2026-10-31)
+# Effective terrain with terrain modifications
 
-**Status: parked.** The code is kept on branch `feat/effective-terrain-modifications`
-(draft PR #21, CI green), with the commander side on gpt-cmdr/ras-commander branch
-`feat/fim-effective-terrain-modifications` (draft PR #790). Neither is merged or
-released. Pick the work up from here.
+**Status (2026-11-11): qualified and advertised.** Parked on 2026-10-31; resumed on
+2026-11-10 on branch `feat/effective-terrain-modifications-main` (rebased on
+`main`). The base mosaic, the per-tile export TIN and every RAS-Mapper-authored
+modification form in the corpora are now reproduced (`base_mosaic_rule.md`,
+`modification_rules.md`, `roadmap.md`), and `ras2fim-batch method` advertises
+`rasmapper-effective-terrain/2`. The history below records why it was parked.
+Callers still decide separately whether to use the engine for modified
+terrains (ras2cng's policy check, Commander's `read_layers`).
 
-## Decision
+## Decision at parking (2026-10-31, superseded)
 
 Rust terrain operations are used **only on unmodified terrains**. Any terrain with
 modifications goes to RAS Mapper (the HEC-RAS terrain export, and RAS Mapper's

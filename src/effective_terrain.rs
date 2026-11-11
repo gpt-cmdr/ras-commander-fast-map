@@ -164,19 +164,13 @@ pub struct Request {
 
 pub fn method_record() -> Value {
     json!({
-        "method_id": METHOD_ID_V1,
-        "request_schema": SCHEMA_V1,
-        "request_schemas": [SCHEMA_V1],
-        "reference": "RasTerrain.export_rasmapper_terrain(downsample_factor=1, rasterize_modifications=False), HEC-RAS 7.0.1",
-        // Terrain modifications are parked: schema 2 is accepted, but no whole
-        // modified terrain equals the HEC-RAS export yet, so it is not advertised.
-        "parked": {
-            "method_id": METHOD_ID,
-            "request_schema": SCHEMA,
-            "status": "unqualified; accepted but not advertised",
-            "reference": "RasTerrain.export_rasmapper_terrain(downsample_factor=1, rasterize_modifications=True), HEC-RAS 7.0.1",
-            "modifications": crate::terrain_mods::method_record()
-        },
+        "method_id": METHOD_ID,
+        "compatible_method_ids": [METHOD_ID_V1],
+        "request_schema": SCHEMA,
+        "request_schemas": [SCHEMA_V1, SCHEMA],
+        "reference": "RasTerrain.export_rasmapper_terrain(downsample_factor=1, rasterize_modifications=False) for schema 1; rasterize_modifications=True with modification_layers (schema 2); HEC-RAS 7.0.1, or 6.6 with hecras_version",
+        "receipt_method_id": "rasmapper-effective-terrain/1 for schema 1 requests, /2 for schema 2",
+        "modifications": crate::terrain_mods::method_record(),
         "lattice": "finest source by extent-derived cell size (ties: priority), union of source extents snapped outward; or a supplied grid. Pixel centres follow the export's 256-pixel tiles with recomputed tile pitch and pixel size",
         "order": "sources in priority order, first to answer wins; then the per-tile export TIN overwrites the pixels it covers",
         "source_test": "render block (quad between four source cell centres, 256-block tiles half a cell inside the source extent) located with recomputed tile geometry; the block answers when bit 0 of its level-0 mask byte is set",
@@ -192,7 +186,7 @@ pub fn method_record() -> Value {
             "BaldEagleCrkMulti2D Terrain50 (2 sources, 20 ft + 36.5 ft)": "not re-run since the render-block rule"
         },
         "known_differences": "inside export-TIN gap fills: the order of segments with equal hash comes from RAS Mapper's parallel collection and its hash seed varies by process, which decides cocircular Delaunay ties; this engine fixes one order (type id 7, 8 range partitions). On terrain A another seed order (type id 23) leaves 82 value differences in an independent prototype, consistent with the remaining differences being ordering ties. RAS Mapper's own repeated exports also disagree on some of these pixels",
-        "refused": "terrains with modifications (parked; see parked.modifications), non-float32/rotated/non-square sources, sources in different CRSs"
+        "refused": "modification forms listed in modifications.refused, non-float32/rotated/non-square sources, sources in different CRSs"
     })
 }
 

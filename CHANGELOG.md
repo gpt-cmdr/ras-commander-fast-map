@@ -2,11 +2,13 @@
 
 ## Unreleased
 
-Parked: no whole modified terrain yet equals the HEC-RAS export; see
-`feature_dev_notes/effective_terrain_modifications/`. `ras2fim-batch method`
-still advertises `rasmapper-effective-terrain/1` with request schema 1 only;
-schema 2 is accepted and described under `effective_terrain.parked`, and a
-schema 1 receipt still reports method `/1`.
+Terrain modifications are no longer parked: `ras2fim-batch method` advertises
+`effective_terrain` as `rasmapper-effective-terrain/2` (request schemas 1 and
+2; `/1` listed as compatible), with the qualified modification forms and every
+refused form under `effective_terrain.modifications`. A schema 1 request still
+reports method `/1` in its receipt. Whole modified real terrains match the
+HEC-RAS 7.0.1 export on values except pixels in export-TIN gap fills and
+isolated 1/32 ft ties; see `feature_dev_notes/effective_terrain_modifications/`.
 
 ### Effective terrain: control points, boundary elevations, Add, NaN templates, HEC-RAS 6.6
 

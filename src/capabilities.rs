@@ -136,7 +136,7 @@ pub fn engine_method_record() -> serde_json::Value {
         ),
         (
             "effective_terrain",
-            crate::effective_terrain::SCHEMA_V1,
+            crate::effective_terrain::SCHEMA,
             "effective-terrain",
             "terrain",
         ),

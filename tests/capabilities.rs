@@ -67,7 +67,7 @@ fn discovery_preserves_existing_registry_keys_and_method_ids() {
         ("sloping", "rasmapper-plain-sloping/1"),
         ("depth_groups", "masked-float32-depth-group-maximum/1"),
         ("whole_simulation", "native-whole-simulation-horizontal/1"),
-        ("effective_terrain", "rasmapper-effective-terrain/1"),
+        ("effective_terrain", "rasmapper-effective-terrain/2"),
     ] {
         assert_eq!(record[key]["method_id"], method_id, "{key}");
     }
@@ -203,7 +203,7 @@ fn capabilities_preserve_dispatch_schemas_flags_and_qualification_limits() {
         ),
         (
             "effective_terrain",
-            "ras-commander-effective-terrain-request/1",
+            "ras-commander-effective-terrain-request/2",
             "effective-terrain",
             "terrain",
             "not_declared",
