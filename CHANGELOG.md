@@ -110,9 +110,9 @@ nodata pixel inside takes the modification value; layers in descending Priority
 polygons with boundary elevations, rotated ellipses, unknown kinds. Schema 1 is
 unchanged; sources may carry their own caller-verified `crs_identity` when
 their WKT text differs from the first source's. Qualification (outside the
-stitch TIN): HCFCD Prop_Topo 0 differences; Kingswood TerrainAlt1 3 px off by
-1/32 ft at exact ties; TerrainAlt2 432 px (96 above 1/32, max 0.84 ft) on one
-levee/channel pair with short segments, so it is not yet exact.
+stitch TIN, at the time of parking): terrain A 0 differences; B1 3 px off by
+1/32 ft at exact ties; B2 432 px (96 above 1/32, max 0.84 ft) on one
+levee/channel pair with short segments. Superseded by the entries above.
 
 ## 0.16.0 - 2026-11-09
 
