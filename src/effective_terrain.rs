@@ -183,7 +183,7 @@ pub fn method_record() -> Value {
         "qualified": {
             "real terrains B1-B4 (HEC-RAS 7.0.1, 1-2 sources, 254.7M valid px each, modifications off, whole terrain vs export a)": "B3 bit-identical; B4 1 pixel nodata where the export is valid; B1 and B2 1 such pixel plus 2 pixels valid where the export is nodata; 0 value differences on all four",
             "real terrain A (HEC-RAS 7.0.1, 5 sources, 164.3M valid px, modifications off)": "0 mask differences; 354 value differences vs export a and 406 vs export b (the two exports differ on 160 px); all inside export-TIN gap fills",
-            "synthetic HEC-RAS 7.0.1 terrains (1-3 sources)": "not re-run with the export TIN (4 of 5 were bit-identical under the stored stitch TIN)",
+            "synthetic HEC-RAS 7.0.1 terrains T1-T5 (1-3 sources, one export each)": "valid mask identical on all five; values: T1 identical, T2 and T4 2 px, T3 and T5 4 px (max 1.53 ft), all in export-TIN gap fills",
             "BaldEagleCrkMulti2D Terrain50 (2 sources, 20 ft + 36.5 ft)": "not re-run since the render-block rule"
         },
         "known_differences": "inside export-TIN gap fills: the order of segments with equal hash comes from RAS Mapper's parallel collection and its hash seed varies by process, which decides cocircular Delaunay ties; this engine fixes one order (type id 7, 8 range partitions). On terrain A another seed order (type id 23) leaves 82 value differences in an independent prototype, consistent with the remaining differences being ordering ties. RAS Mapper's own repeated exports also disagree on some of these pixels",

@@ -329,7 +329,7 @@
     "src/coupled.rs": "55edb29a6e75618731735bdb36eb4746aad5a0d781eb306cf776973837f34560",
     "src/coupled_session.rs": "fb27634e158f5741aae0f6cb05ad415955c4f99a6f31ff160621177ca07b3857",
     "src/depth_groups.rs": "ae69a0839cd9a763aba59f0a22e0d2da9c09c5036e1f08102411438855ae37b3",
-    "src/effective_terrain.rs": "e9e052e30e05f898773ea6e7aef7c653482db95b9e54a48f64a39d1767dc46bb",
+    "src/effective_terrain.rs": "07b129bc9bdd14b14b4cd66b403862f0e75e28ef7592648863ecf824beb2d2ca",
     "src/export_tin.rs": "5167d9f61285dcd2e4d95a12de01cc997eb384f192510ba0c1ace228c3f89697",
     "src/finalize.rs": "9bcc0f993f54f790b8d7ea785d0255a9abb050df230856600033a9110315bc3c",
     "src/geotiff.rs": "2e577515beb60fd96c4a2db12cecb6704a07e7072edcbe0bfdb784badb14cf3d",

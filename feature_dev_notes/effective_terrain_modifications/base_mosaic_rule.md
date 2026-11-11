@@ -103,12 +103,18 @@ B2 599 / 6, B3 3,227 / 0, B4 1,389 / 1.
 
 Engine time on the qualification build host (release build, 4 threads): 5.0-5.1 s for the B
 terrains and 1.2 s for A, of which the export TIN takes 0.1-0.4 s (sampling only:
-4.5-4.9 s and 1.1 s); peak working set 1.7-2.2 GiB (B) and 0.75 GiB (A). The
-synthetic T1-T5 terrains and BaldEagleCrkMulti2D Terrain50 have not been re-run
-with the export TIN.
+4.5-4.9 s and 1.1 s); peak working set 1.7-2.2 GiB (B) and 0.75 GiB (A).
+
+Synthetic T1-T5 (one export each, so RAS Mapper's own variation cannot be
+excluded): valid mask identical on all five; values T1 identical, T2 and T4
+2 px, T3 and T5 4 px (max 1.53 ft), all inside export-TIN gap fills. Under the
+stored stitch TIN they were T1, T2, T4, T5 identical and T3 5 px. Two
+exports of T2 were already known to disagree on two TIN pixels.
+BaldEagleCrkMulti2D Terrain50 has not been re-run.
 
 ## Next
 
-Re-run the synthetic T1-T5 terrains and Terrain50. The residual pixels depend on
+Re-run Terrain50, and repeat-export the synthetic terrains to separate RAS
+Mapper's own variation from rule gaps. The residual pixels depend on
 RAS Mapper's per-process hash seed and parallel scheduling, so bit equality on
 them is not expected from a fixed order.
