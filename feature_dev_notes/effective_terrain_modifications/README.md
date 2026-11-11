@@ -25,10 +25,11 @@ in the *base* mosaic (the rule from #19), with modifications switched off too.
 
 ## What is on the branch (2026-11-11)
 
-- `ras2fim-batch effective-terrain`, advertised as `rasmapper-effective-terrain/2`
-  (request schemas 1 and 2): RAS Mapper's render-block base mosaic, its per-tile
-  export TIN, and modification layers applied in descending Priority, with values
-  rounded to 1/32 once at the end. `ras2fim-batch method` lists the supported and
+- `ras2fim-batch effective-terrain`, advertised as `rasmapper-effective-terrain/2`:
+  RAS Mapper's render-block base mosaic and its per-tile export TIN, with values
+  rounded to 1/32 once at the end. Request schema 1 is for unmodified terrains
+  only (it refuses modification layers); schema 2 carries the terrain's
+  modification layers, applied in descending Priority. Both report `/2`. `ras2fim-batch method` lists the supported and
   refused forms under `effective_terrain.modifications`.
 - Supported forms: ground lines (levees and channels, SetValue/Add/SetIfHigher/
   SetIfLower, NaN templates, negative slopes, Max Reach <= Top Width, named and
