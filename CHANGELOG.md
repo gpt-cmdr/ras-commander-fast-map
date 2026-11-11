@@ -4,9 +4,11 @@
 
 Terrain modifications are no longer parked: `ras2fim-batch method` advertises
 `effective_terrain` as `rasmapper-effective-terrain/2` (request schemas 1 and
-2; `/1` listed as compatible), with the qualified modification forms and every
-refused form under `effective_terrain.modifications`. A schema 1 request still
-reports method `/1` in its receipt. Whole modified real terrains match the
+2), with the qualified modification forms and every refused form under
+`effective_terrain.modifications`. Schema 1 requests are still accepted but
+run the /2 rule, so their receipts report `/2`; their values differ from /1
+engines (render-block sampling and the export TIN), and `/1` is no longer
+listed as compatible. Whole modified real terrains match the
 HEC-RAS 7.0.1 export on values except pixels in export-TIN gap fills and
 isolated 1/32 ft ties; see `feature_dev_notes/effective_terrain_modifications/`.
 

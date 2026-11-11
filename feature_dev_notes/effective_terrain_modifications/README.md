@@ -23,17 +23,28 @@ terrain modifications. The modification rules below are largely solved, but
 as a whole**: 6 carry modification forms not yet derived, and the other 5 differ
 in the *base* mosaic (the rule from #19), with modifications switched off too.
 
-## What is on the branch
+## What is on the branch (2026-11-11)
 
-- `ras2fim-batch effective-terrain`, contract `rasmapper-effective-terrain/2`:
-  the base mosaic from #19 plus modification layers, applied in descending
-  Priority. Advertises the supported forms in `ras2fim-batch method` and refuses
-  everything unqualified with a reason.
-- Supported forms: ground lines (levees and channels, SetIfHigher/SetIfLower),
-  constant polygons (SetValue/Hi/Lo), unrotated ellipses.
+- `ras2fim-batch effective-terrain`, advertised as `rasmapper-effective-terrain/2`
+  (request schemas 1 and 2): RAS Mapper's render-block base mosaic, its per-tile
+  export TIN, and modification layers applied in descending Priority, with values
+  rounded to 1/32 once at the end. `ras2fim-batch method` lists the supported and
+  refused forms under `effective_terrain.modifications`.
+- Supported forms: ground lines (levees and channels, SetValue/Add/SetIfHigher/
+  SetIfLower, NaN templates, negative slopes, Max Reach <= Top Width, named and
+  joined `System Name` systems, control points); polygons (constant, stored
+  boundary profiles, control points, interior points; SetValue/Add/Hi/Lo);
+  ellipses and circles, rotated or not. Optional `hecras_version` (`7.0.1`
+  default, `6.6`).
+- Refused with a reason: boundary elevations sampled from the terrain, shape-Z
+  polygons, multi-part polygons that need a TIN, named ground lines with control
+  points or a NaN template (and under 6.6), a NaN Top Width with a finite Max
+  Reach, other modification types.
 - Optional per-source `crs_identity` (sources whose WKT text differs but whose CRS
-  is equal were refused without it).
-- Tests: 4 new lib tests in `terrain_mods`, 2 new in `tests/effective_terrain.rs`.
+  is equal).
+- Tests: `terrain_mods` and `export_tin` unit tests and `tests/effective_terrain.rs`
+  integration tests (run `cargo test --locked --all-targets`); real-data
+  qualification is opt-in and described in `reproduction.md`.
 
 ## Files
 

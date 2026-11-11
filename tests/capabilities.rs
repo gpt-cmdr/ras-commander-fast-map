@@ -214,11 +214,12 @@ fn capabilities_preserve_dispatch_schemas_flags_and_qualification_limits() {
     for (key, schema, command, intended_use, status) in dispatch {
         let entry = entries.iter().find(|entry| entry["key"] == key).unwrap();
         assert!(seen.insert(key));
-        assert_eq!(
-            entry["request_schemas"],
-            serde_json::json!([schema]),
-            "{key}"
-        );
+        let schemas = if key == "effective_terrain" {
+            serde_json::json!(["ras-commander-effective-terrain-request/1", schema])
+        } else {
+            serde_json::json!([schema])
+        };
+        assert_eq!(entry["request_schemas"], schemas, "{key}");
         assert_eq!(entry["cli_command"], command, "{key}");
         assert_eq!(entry["api_contract"], "stable", "{key}");
         assert_eq!(entry["intended_use"], intended_use, "{key}");

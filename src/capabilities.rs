@@ -202,6 +202,12 @@ fn capability(
             "flags": qualification_flags
         }
     });
+    if key == "effective_terrain" {
+        entry["request_schemas"] = serde_json::json!([
+            crate::effective_terrain::SCHEMA_V1,
+            crate::effective_terrain::SCHEMA
+        ]);
+    }
     if let Some(version) = record.get("method_version") {
         entry["method_version"] = version.clone();
     }

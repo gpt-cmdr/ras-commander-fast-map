@@ -64,7 +64,8 @@ use std::{
 };
 
 pub const METHOD_ID: &str = "rasmapper-effective-terrain/2";
-/// The unmodified-terrain contract, still accepted.
+/// The earlier unmodified-terrain rule. Schema 1 requests now run the /2
+/// rule and report /2.
 pub const METHOD_ID_V1: &str = "rasmapper-effective-terrain/1";
 pub const SCHEMA: &str = "ras-commander-effective-terrain-request/2";
 pub const SCHEMA_V1: &str = "ras-commander-effective-terrain-request/1";
@@ -165,11 +166,10 @@ pub struct Request {
 pub fn method_record() -> Value {
     json!({
         "method_id": METHOD_ID,
-        "compatible_method_ids": [METHOD_ID_V1],
         "request_schema": SCHEMA,
         "request_schemas": [SCHEMA_V1, SCHEMA],
         "reference": "RasTerrain.export_rasmapper_terrain(downsample_factor=1, rasterize_modifications=False) for schema 1; rasterize_modifications=True with modification_layers (schema 2); HEC-RAS 7.0.1, or 6.6 with hecras_version",
-        "receipt_method_id": "rasmapper-effective-terrain/1 for schema 1 requests, /2 for schema 2",
+        "receipt_method_id": "rasmapper-effective-terrain/2 for both request schemas: schema 1 (no modifications) is still accepted, but its values follow the /2 rule, which differs numerically from /1 engines",
         "modifications": crate::terrain_mods::method_record(),
         "lattice": "finest source by extent-derived cell size (ties: priority), union of source extents snapped outward; or a supplied grid. Pixel centres follow the export's 256-pixel tiles with recomputed tile pitch and pixel size",
         "order": "sources in priority order, first to answer wins; then the per-tile export TIN overwrites the pixels it covers",
@@ -760,15 +760,29 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
     let remaining = req
         .max_working_bytes
         .saturating_sub(out_bytes + req.max_working_bytes / 4);
-    let batch = (4 * threads).min(remaining / (2 * export_tin::TILE_RESULT_BYTES));
-    if batch == 0 {
-        return Err(MapError::Budget(format!(
-            "export TIN needs at least {} bytes beyond the output grid; max_working_bytes is {}",
-            2 * export_tin::TILE_RESULT_BYTES + out_bytes,
-            req.max_working_bytes
-        )));
-    }
-    let tin_share = (remaining - batch * export_tin::TILE_RESULT_BYTES) / threads;
+    // Each tile in flight holds its result (TILE_RESULT_BYTES) until the
+    // batch is merged, and each running worker needs a share large enough
+    // for a tile result plus its segments and TIN. Shrink the batch (and so
+    // the number of concurrent workers) until that holds, or refuse before
+    // any read.
+    let tr = export_tin::TILE_RESULT_BYTES;
+    let min_share = 2 * tr;
+    let mut batch = (4 * threads).min(remaining / (2 * tr));
+    let tin_share = loop {
+        if batch == 0 {
+            return Err(MapError::Budget(format!(
+                "export TIN needs at least {} bytes beyond the output grid and source caches; max_working_bytes is {}",
+                tr + min_share,
+                req.max_working_bytes
+            )));
+        }
+        let workers = threads.min(batch);
+        let share = remaining.saturating_sub(batch * tr) / workers;
+        if share >= min_share {
+            break share;
+        }
+        batch -= 1;
+    };
     let mut values = vec![NODATA; grid.width * grid.height];
 
     let pool = rayon::ThreadPoolBuilder::new()
@@ -915,11 +929,9 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
     }
     let mods_seconds = mods_started.elapsed().as_secs_f64();
     let valid = values.iter().filter(|v| **v != NODATA).count() as u64;
-    let method_id = if req.schema == SCHEMA_V1 {
-        METHOD_ID_V1
-    } else {
-        METHOD_ID
-    };
+    // Both request schemas run the /2 rule, so every receipt names it; a
+    // schema 1 request is the /2 rule with no modification layers.
+    let method_id = METHOD_ID;
     let report = json!({
         "method_id": method_id,
         "grid": {"origin_x": grid.origin_x, "origin_y": grid.origin_y, "cell_size": grid.cell_size,

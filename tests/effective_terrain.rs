@@ -2,7 +2,7 @@
 //! export-TIN gap fill, rounding, lattice, terrain modifications and refusals on small synthetic
 //! sources.
 use ras_commander_fast_map::effective_terrain::{
-    self, Effective, Grid, METHOD_ID, METHOD_ID_V1, NODATA, Request, quantize, snap_grid,
+    self, Effective, Grid, METHOD_ID, NODATA, Request, quantize, snap_grid,
 };
 use serde_json::{Value, json};
 use std::{
@@ -167,7 +167,8 @@ fn single_source_interior_is_source_and_edges_need_a_full_quad() {
             }
         }
     }
-    assert_eq!(out.report["method_id"], METHOD_ID_V1);
+    // Schema 1 runs the /2 rule, so the receipt names /2.
+    assert_eq!(out.report["method_id"], METHOD_ID);
 }
 
 #[test]
