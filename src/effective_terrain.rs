@@ -41,8 +41,9 @@
 //!    does not use it either. The request's `stitch_tin` is still accepted
 //!    and validated for schema compatibility, and ignored.
 //!
-//! Every value is rounded to binary32 and then to the nearest 1/32 (ties to
-//! even), as RAS Mapper stores terrain values.
+//! Values are held in binary32 through the export TIN and the terrain
+//! modifications, and rounded to the nearest 1/32 (ties to even) once at the
+//! end, as RAS Mapper's TIFF writer does.
 //!
 //! Terrain modifications (schema 2) are applied after the mosaic by
 //! `terrain_mods`; unqualified modification forms are refused.
@@ -153,6 +154,10 @@ pub struct Request {
     /// Schema 2: every modification layer of the terrain (see `terrain_mods`).
     #[serde(default)]
     pub modification_layers: Vec<crate::terrain_mods::Layer>,
+    /// HEC-RAS version whose modification rules to follow: `7.0.1`
+    /// (default) or `6.6`.
+    #[serde(default)]
+    pub hecras_version: Option<String>,
     pub threads: usize,
     pub max_working_bytes: u64,
 }
@@ -212,6 +217,7 @@ impl Request {
                 )));
             }
             crate::terrain_mods::validate(&self.modification_layers)?;
+            crate::terrain_mods::RasVersion::parse(self.hecras_version.as_deref())?;
         } else {
             return Err(invalid(format!("schema must be {SCHEMA} or {SCHEMA_V1}")));
         }
@@ -824,7 +830,9 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
                                 }
                                 let Some((bc, fx)) = *colf else { continue };
                                 if let Some(v) = interpolate(band, br, bc, fx, fy) {
-                                    out[o - r0 * width] = quantize(v);
+                                    // Held in binary32 like RAS Mapper's tile
+                                    // buffer; rounded to 1/32 at the end.
+                                    out[o - r0 * width] = v as f32;
                                     counts[k] += 1;
                                 }
                             }
@@ -885,11 +893,7 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
                 for j in 0..TILE.min(width - m * TILE) {
                     let z = buf[i * TILE + j];
                     if !z.is_nan() {
-                        values[row + j] = if z == NODATA {
-                            NODATA
-                        } else {
-                            quantize(z as f64)
-                        };
+                        values[row + j] = z;
                         n_px += 1;
                     }
                 }
@@ -906,7 +910,15 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
     });
 
     let mods_started = Instant::now();
-    let mods = crate::terrain_mods::apply(&req.modification_layers, &grid, &mut values)?;
+    let version = crate::terrain_mods::RasVersion::parse(req.hecras_version.as_deref())?;
+    let mods =
+        crate::terrain_mods::apply_version(&req.modification_layers, &grid, &mut values, version)?;
+    // The TIFF writer's rounding, once, after the modifications.
+    for v in values.iter_mut() {
+        if *v != NODATA {
+            *v = quantize(*v as f64);
+        }
+    }
     let mods_seconds = mods_started.elapsed().as_secs_f64();
     let valid = values.iter().filter(|v| **v != NODATA).count() as u64;
     let method_id = if req.schema == SCHEMA_V1 {

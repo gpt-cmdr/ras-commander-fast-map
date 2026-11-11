@@ -8,6 +8,43 @@ still advertises `rasmapper-effective-terrain/1` with request schema 1 only;
 schema 2 is accepted and described under `effective_terrain.parked`, and a
 schema 1 receipt still reports method `/1`.
 
+### Effective terrain: control points, boundary elevations, Add, NaN templates, HEC-RAS 6.6
+
+Source: an interoperability study of RasMapperLib 7.0.1 (no vendor code used
+or copied), checked against HEC-RAS exports.
+
+Pipeline:
+- The mosaic and the export TIN keep binary32 values through the modifications.
+- Values are rounded to 1/32 once at the end, as RAS Mapper's TIFF writer does.
+- Base output is unchanged.
+
+New forms supported:
+- **Ground-line control points.** Points within the Elev Pt Tolerance set the profile at their nearest centerline station. With no stored profile, the ends take the first and last point's elevation.
+- **Polygons with a control point inside, or with boundary elevations.** These use RAS Mapper's perimeter TIN, built on the export TIN's Delaunay factory. The boundary profile comes from perimeter control points, or else from the stored profile; points inside the polygon are mass points.
+- **Add**, for ground lines and polygons: terrain plus the modification, in binary32 on the unrounded terrain.
+- **NaN templates and negative slopes.** A NaN Max Reach draws nothing, a NaN slope is read as 3, and negative slopes need no special case.
+- **`hecras_version: "6.6"`.** Ground lines with Max Reach not wider than one cell are not drawn. Named ground lines and terrain-sampled boundaries are refused under 6.6.
+
+New optional request fields:
+- Layer `control_points` (`x`, `y`, `elevation`; `null` = NaN).
+- Polygon `generate_boundary`, `use_shape_z`, `profile`, `vertex_z`, `elev_pt_tolerance`, and polygon-layer `length_units`.
+- Ground-line template values accept `null`.
+- Request `hecras_version`.
+
+Qualification (whole terrains vs HEC-RAS 7.0.1 exports; pixels where two exports differ excluded):
+- Terrain C, all 13 layers, now unreduced: 0 mask and 4 value differences at 1/32 ft in 379.0M px.
+- Terrain E, 5 of 6 layers (a 2,862-point control-point levee layer among them), 1.14G px: 0 mask, 3 values at 1/32 ft.
+- Terrain D, 228 of 229 layers (202 boundary-elevation polygon layers and 20 channel layers with control points), 924.6M px: 0 mask, 3 values at 1/32 ft.
+- Synthetic cases for each form: at most 2 px at 1/32 ft per case.
+- HEC-RAS 6.6 exports of the synthetic cases: every accepted case matches under `hecras_version: "6.6"`.
+
+Still refused:
+- Boundary elevations sampled from the terrain. This is the one remaining layer each in D and E.
+- Shape-Z polygons.
+- Multi-part polygons that need a TIN.
+- Named ground lines with control points or a NaN template.
+- A NaN Top Width with a finite Max Reach, which makes RAS Mapper's export fail.
+
 ### Effective terrain: named ground lines (RAS Mapper's system path)
 
 Ground lines with a `System Name`, including a lone named feature, are now

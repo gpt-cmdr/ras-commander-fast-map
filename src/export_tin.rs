@@ -778,6 +778,11 @@ impl Factory {
 
     /// Make segment A->B a constraint edge, splitting crossed edges.
     fn enforce(&mut self, seg: &Seg, off: (f64, f64)) -> Result<(), TinError> {
+        self.enforce_edge(seg, off, false)
+    }
+
+    /// `enforce` with the edges marked as perimeter (`perim`) or breakline.
+    fn enforce_edge(&mut self, seg: &Seg, off: (f64, f64), perim: bool) -> Result<(), TinError> {
         let (mut ax, mut ay) = (seg.a[0] + off.0, seg.a[1] + off.1);
         let (bx, by) = (seg.b[0] + off.0, seg.b[1] + off.1);
         let (t, p) = self.find_nearest(bx, by);
@@ -801,7 +806,7 @@ impl Factory {
             let (az, am) = (self.z[p2 as usize], self.m[p2 as usize]);
             let (t2, e, tr) = self.wedge(t2, p2, bx, by)?;
             if tr.v.contains(&p) {
-                self.set_edge_type(t2, p2, p, false);
+                self.set_edge_type(t2, p2, p, perim);
                 return Ok(());
             }
             self.crossings += 1;
@@ -840,7 +845,7 @@ impl Factory {
                 None
             };
             if let Some(q) = snap {
-                self.set_edge_type(t2, p2, q, false);
+                self.set_edge_type(t2, p2, q, perim);
                 self.update_zm(q, pz, pm);
                 (ax, ay) = self.xy(q);
                 continue;
@@ -864,7 +869,7 @@ impl Factory {
                 }
             }
             let t5 = (self.t.len() - 1) as i32;
-            self.set_edge_type(t5, p2, cnt, false);
+            self.set_edge_type(t5, p2, cnt, perim);
             ax = px;
             ay = py;
         }
@@ -1041,37 +1046,9 @@ fn widen(e: (f64, f64, f64, f64), w: f64, h: f64) -> (f64, f64, f64, f64) {
     (mx_x, mn_x, mx_y, mn_y)
 }
 
-/// Triangulate `segs` (non-empty), enforce them, delete and clean.
-pub(crate) fn build_tin(segs: &[Seg]) -> Result<CleanTin, TinError> {
-    let min_m = segs.iter().map(|s| s.a[3]).fold(f64::INFINITY, f64::min);
-    let tol = 0.01_f64.min(min_m * 0.1);
-    let sb = bbox(segs);
-    let (cx, cy) = ((sb.0 + sb.1) * 0.5, (sb.2 + sb.3) * 0.5);
-    let mbr = (
-        cx + (sb.0 - cx) * 1.5,
-        cx - (cx - sb.1) * 1.5,
-        cy + (sb.2 - cy) * 1.5,
-        cy - (cy - sb.3) * 1.5,
-    );
-    let mut e = widen(sb, tol * 10.0, tol * 10.0);
-    let (dx, dy) = (e.0 - e.1, e.2 - e.3);
-    if dx > dy {
-        let nn = dx * 0.125;
-        if dy < nn {
-            e = widen(e, 0.0, nn);
-        }
-    } else {
-        let nn = dy * 0.125;
-        if dx < nn {
-            e = widen(e, nn, 0.0);
-        }
-    }
-    let (mx_x, mn_x, mx_y, mn_y) = (
-        e.0.max(mbr.0),
-        e.1.min(mbr.1),
-        e.2.max(mbr.2),
-        e.3.min(mbr.3),
-    );
+/// An empty TIN over the extent (`max x, min x, max y, min y`): the
+/// octagonal super polygon in coordinates offset by the lower-left corner.
+fn octagon(tol: f64, mx_x: f64, mn_x: f64, mx_y: f64, mn_y: f64) -> (Factory, (f64, f64)) {
     let off = (-mn_x, -mn_y);
     let (ex1, ex0, ey1, ey0) = (mx_x + off.0, mn_x + off.0, mx_y + off.1, mn_y + off.1);
     let num = (ex1 - ex0).max(ey1 - ey0) * 0.05;
@@ -1111,6 +1088,41 @@ pub(crate) fn build_tin(segs: &[Seg]) -> Result<CleanTin, TinError> {
     for (v, n) in start {
         f.add_tri(v, n);
     }
+    (f, off)
+}
+
+/// Triangulate `segs` (non-empty), enforce them, delete and clean.
+pub(crate) fn build_tin(segs: &[Seg]) -> Result<CleanTin, TinError> {
+    let min_m = segs.iter().map(|s| s.a[3]).fold(f64::INFINITY, f64::min);
+    let tol = 0.01_f64.min(min_m * 0.1);
+    let sb = bbox(segs);
+    let (cx, cy) = ((sb.0 + sb.1) * 0.5, (sb.2 + sb.3) * 0.5);
+    let mbr = (
+        cx + (sb.0 - cx) * 1.5,
+        cx - (cx - sb.1) * 1.5,
+        cy + (sb.2 - cy) * 1.5,
+        cy - (cy - sb.3) * 1.5,
+    );
+    let mut e = widen(sb, tol * 10.0, tol * 10.0);
+    let (dx, dy) = (e.0 - e.1, e.2 - e.3);
+    if dx > dy {
+        let nn = dx * 0.125;
+        if dy < nn {
+            e = widen(e, 0.0, nn);
+        }
+    } else {
+        let nn = dy * 0.125;
+        if dx < nn {
+            e = widen(e, nn, 0.0);
+        }
+    }
+    let (mx_x, mn_x, mx_y, mn_y) = (
+        e.0.max(mbr.0),
+        e.1.min(mbr.1),
+        e.2.max(mbr.2),
+        e.3.min(mbr.3),
+    );
+    let (mut f, off) = octagon(tol, mx_x, mn_x, mx_y, mn_y);
     for s in segs {
         f.insert(s.a[0] + off.0, s.a[1] + off.1, s.a[2] + 0.0, s.a[3] + 0.0)?;
         f.insert(s.b[0] + off.0, s.b[1] + off.1, s.b[2] + 0.0, s.b[3] + 0.0)?;
@@ -1143,6 +1155,96 @@ pub(crate) fn build_tin(segs: &[Seg]) -> Result<CleanTin, TinError> {
     // 3. The data side of every segment.
     for s in segs {
         f.delete_right_of(s, off)?;
+    }
+    let points = (0..f.x.len())
+        .map(|i| [f.x[i] + mn_x, f.y[i] + mn_y, f.z[i] + 0.0])
+        .collect();
+    let triangles = f.t.iter().filter(|t| t.f & DEL == 0).map(|t| t.v).collect();
+    Ok(CleanTin {
+        points,
+        triangles,
+        crossings: f.crossings,
+    })
+}
+
+/// RAS Mapper's perimeter-constrained TIN (polygon modifications): extent of
+/// the perimeter and mass points (at least 10 x `tol` and 1:8), widened to
+/// three times the perimeter's extent; perimeter points, then mass points;
+/// perimeter edges enforced (a failing edge stops the enforcement, as RAS
+/// Mapper swallows the error); triangles touching the super polygon deleted
+/// and the deletion flooded across every non-perimeter edge.
+pub(crate) fn perimeter_tin(
+    perim: &[[f64; 3]],
+    mass: &[[f64; 3]],
+    tol: f64,
+) -> Result<CleanTin, TinError> {
+    let ext = |pts: &mut dyn Iterator<Item = &[f64; 3]>| {
+        let mut e = (
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+        );
+        for p in pts {
+            e = (e.0.max(p[0]), e.1.min(p[0]), e.2.max(p[1]), e.3.min(p[1]));
+        }
+        e
+    };
+    let pe = ext(&mut perim.iter());
+    let all = ext(&mut perim.iter().chain(mass.iter()));
+    let mut e = widen(all, tol * 10.0, tol * 10.0);
+    let (dx, dy) = (e.0 - e.1, e.2 - e.3);
+    if dx > dy {
+        let nn = dx * 0.125;
+        if dy < nn {
+            e = widen(e, 0.0, nn);
+        }
+    } else {
+        let nn = dy * 0.125;
+        if dx < nn {
+            e = widen(e, nn, 0.0);
+        }
+    }
+    let (cx, cy) = ((pe.0 + pe.1) * 0.5, (pe.2 + pe.3) * 0.5);
+    let (hx, hy) = ((pe.0 - pe.1) * 3.0, (pe.2 - pe.3) * 3.0);
+    let mbr = (cx + hx * 0.5, cx - hx * 0.5, cy + hy * 0.5, cy - hy * 0.5);
+    let (mx_x, mn_x, mx_y, mn_y) = (
+        e.0.max(mbr.0),
+        e.1.min(mbr.1),
+        e.2.max(mbr.2),
+        e.3.min(mbr.3),
+    );
+    let (mut f, off) = octagon(tol, mx_x, mn_x, mx_y, mn_y);
+    for p in perim.iter().chain(mass.iter()) {
+        f.insert(p[0] + off.0, p[1] + off.1, p[2] + 0.0, f64::NAN)?;
+    }
+    for w in perim.windows(2) {
+        let seg = Seg {
+            a: [w[0][0], w[0][1], w[0][2], f64::NAN],
+            b: [w[1][0], w[1][1], w[1][2], f64::NAN],
+        };
+        if f.enforce_edge(&seg, off, true).is_err() {
+            break;
+        }
+    }
+    let mut stack = Vec::new();
+    for i in 0..f.t.len() {
+        if f.t[i].v.iter().any(|&p| p < 8) {
+            f.t[i].f |= DEL;
+            stack.push(i as i32);
+        }
+    }
+    if perim.len() > 3 {
+        while let Some(t) = stack.pop() {
+            f.t[t as usize].f |= DEL;
+            let tr = f.t[t as usize];
+            for k in 0..3 {
+                let a = tr.n[k];
+                if a != NONE && f.t[a as usize].f & DEL == 0 && tr.f & (8 << k) == 0 {
+                    stack.push(a);
+                }
+            }
+        }
     }
     let points = (0..f.x.len())
         .map(|i| [f.x[i] + mn_x, f.y[i] + mn_y, f.z[i] + 0.0])

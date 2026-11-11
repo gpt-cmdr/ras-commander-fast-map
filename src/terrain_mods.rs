@@ -41,7 +41,15 @@
 //!     triangle of the feature wins, clockwise (folded) triangles draw
 //!     nothing. Features are never dropped for being narrow (the export
 //!     forces rendering).
-//!   - Features with `Top Width <= 0` or `Max Reach <= 0` change nothing.
+//!   - Features with `Top Width <= 0` or `Max Reach <= 0`, or a NaN Max
+//!     Reach, change nothing; a NaN slope is read as 3, a negative slope is
+//!     used as is (the toe moves to the other side). A NaN Top Width with a
+//!     finite Max Reach makes RAS Mapper's export fail and is refused.
+//!   - *Control points* of the layer within the feature's Elev Pt Tolerance
+//!     of the centerline set the profile at the station of their nearest
+//!     centerline point (after the stored stations, so they win); with no
+//!     stored profile the ends take the elevations of the first and last
+//!     such point.
 //! * **Named ground lines** (non-empty `System Name`, also a lone feature)
 //!   follow RAS Mapper's system path:
 //!   - *Joining.* In feature-ID order, an unassigned named feature starts a
@@ -75,18 +83,40 @@
 //!     slopes interpolated linearly by station between cross sections.
 //!   - The system is drawn once, in the place of its highest feature ID,
 //!     with the five-ribbon TIN and rasterizer above.
-//! * **Polygons** with a constant elevation: pixel centres inside (even-odd).
+//! * **Polygons** with a constant elevation and no control point inside:
+//!   pixel centres inside (even-odd). Otherwise (boundary elevations, a
+//!   control point inside, single ring) RAS Mapper's perimeter TIN:
+//!   - *Perimeter profile.* With boundary elevations on, control points
+//!     within the Elev Pt Tolerance of the perimeter give the profile (at
+//!     their nearest perimeter station); without such points the stored
+//!     perimeter profile is used. With boundary elevations off the profile
+//!     is the constant Elevation Value. The profile is filtered (Douglas-
+//!     Peucker, 0.01 ft or 0.01 x 0.3048 m, binary32).
+//!   - *Perimeter points.* The ring with the profile's stations injected and
+//!     z from the profile; vertices before the first or after the last
+//!     station interpolate across the ring's start.
+//!   - *TIN.* The export TIN's Delaunay factory (tolerance 0.1 ft or 0.1 x
+//!     0.3048 m in binary32): perimeter points, then control points inside
+//!     the polygon as mass points, the perimeter enforced, triangles outside
+//!     deleted; rasterized per output tile, combined over the cells holding
+//!     the polygon's extent.
 //! * **Ellipses**: output-tile pixel centres inside or on the ellipse (`<= 1`,
 //!   rotation in degrees); a circle (equal radii) uses the centre distance
 //!   `<= radius`.
 //!
-//! Combination (per feature, binary32): a nodata terrain pixel takes the
-//! modification value; `SetValue` replaces, `SetIfHigher` / `SetIfLower`
-//! replace when strictly higher / lower. Layers are sorted by ascending
-//! `Priority` (stable) and applied in reverse, so Priority 0 is applied last
-//! and wins; features in stored order. Every result is rounded to binary32
-//! and then to 1/32 like the terrain itself (RAS Mapper rounds once when it
-//! writes; for these three types the results are the same).
+//! Combination (per feature, binary32, on the unrounded terrain): a nodata
+//! terrain pixel takes the modification value; `SetValue` replaces, `Add`
+//! adds, `SetIfHigher` / `SetIfLower` replace when strictly higher / lower.
+//! Layers are sorted by ascending `Priority` (stable) and applied in reverse,
+//! so Priority 0 is applied last and wins; features in stored order. The
+//! caller rounds every value to 1/32 once, after all modifications, as RAS
+//! Mapper's TIFF writer does.
+//!
+//! `hecras_version` 6.6 (measured on HEC-RAS 6.6 exports): ground lines
+//! whose Max Reach is not wider than one cell of the output tile are not
+//! drawn; named ground lines (6.6 builds systems differently) and boundary
+//! elevations without perimeter control points (6.6 samples the terrain) are
+//! refused; everything else follows the 7.0.1 rules.
 use crate::{
     MapError,
     effective_terrain::{Grid, OutputLattice},
@@ -102,6 +132,8 @@ pub enum ElevationType {
     SetValue,
     SetIfHigher,
     SetIfLower,
+    /// Terrain plus the modification value (binary32, unrounded terrain).
+    Add,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -134,9 +166,15 @@ impl LengthUnits {
 #[serde(deny_unknown_fields)]
 pub struct GroundLine {
     pub elevation_type: ElevationType,
+    /// Template values; `null` = NaN (a NaN slope is read as 3, a NaN Max
+    /// Reach draws nothing).
+    #[serde(deserialize_with = "nan_if_null")]
     pub top_width: f64,
+    #[serde(deserialize_with = "nan_if_null")]
     pub left_slope: f64,
+    #[serde(deserialize_with = "nan_if_null")]
     pub right_slope: f64,
+    #[serde(deserialize_with = "nan_if_null")]
     pub max_reach: f64,
     /// Centerline vertices `[x, y]` (one part).
     pub points: Vec<[f64; 2]>,
@@ -167,6 +205,32 @@ pub struct Polygon {
     pub elevation: f64,
     /// Rings of `[x, y]`; inside is even-odd over all rings.
     pub rings: Vec<Vec<[f64; 2]>>,
+    /// `Generate Boundary Elevations` (optional, default false).
+    #[serde(default)]
+    pub generate_boundary: bool,
+    /// `Use ShapeFile Z Elevations` (optional, default false).
+    #[serde(default)]
+    pub use_shape_z: bool,
+    /// Stored perimeter profile `[station, elevation]` (optional).
+    #[serde(default)]
+    pub profile: Vec<[f64; 2]>,
+    /// Vertex z of the (single) ring, one per ring vertex (shape Z).
+    #[serde(default)]
+    pub vertex_z: Vec<f64>,
+    /// `Elev Pt Tolerance` (optional, default 0; `null` = NaN).
+    #[serde(default, deserialize_with = "nan_if_null")]
+    pub elev_pt_tolerance: f64,
+}
+
+/// A point of a layer's `Control Points` group.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlPoint {
+    pub x: f64,
+    pub y: f64,
+    /// `null` = NaN (ignored, as RAS Mapper does).
+    #[serde(deserialize_with = "nan_if_null")]
+    pub elevation: f64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -193,11 +257,20 @@ pub enum Layer {
         #[serde(default)]
         length_units: LengthUnits,
         features: Vec<GroundLine>,
+        /// The layer's control points (optional).
+        #[serde(default)]
+        control_points: Vec<ControlPoint>,
     },
     Polygon {
         name: String,
         priority: i64,
         features: Vec<Polygon>,
+        /// The layer's control points (optional).
+        #[serde(default)]
+        control_points: Vec<ControlPoint>,
+        /// Default `feet` (sets the 0.01 / 0.1 profile and TIN tolerances).
+        #[serde(default)]
+        length_units: LengthUnits,
     },
     Ellipse {
         name: String,
@@ -227,28 +300,34 @@ pub fn method_record() -> Value {
     json!({
         "basis": "ground lines and ellipses: interoperability study of RasMapperLib 7.0.1 (no vendor code used or copied); polygons: fitted against HEC-RAS 7.0.1 exports",
         "supported": {
-            "ground_line": {"subtypes": ["levee", "channel"], "elevation_types": ["SetValue", "SetIfHigher", "SetIfLower"],
-                             "requires": "one part, a stored profile of >= 2 stations, finite template, slopes >= 0, no control points",
+            "ground_line": {"subtypes": ["levee", "channel"], "elevation_types": ["SetValue", "SetIfHigher", "SetIfLower", "Add"],
+                             "requires": "one part, a stored profile of >= 2 stations unless the layer has control points; named features: finite template and no layer control points",
+                             "control_points": "layer control_points within the feature's elev_pt_tolerance of an unnamed centerline set the profile",
+                             "nan_template": "NaN Max Reach draws nothing, NaN slope read as 3; NaN Top Width with a finite Max Reach refused (RAS Mapper's export fails)",
                              "named": "non-empty system_name: joined systems through RAS Mapper's system path (transition_percent, elev_pt_tolerance optional; null = NaN)",
                              "length_units": "feet (default) or meters: profile densification every 100 ft (single features 100/3.281 m, systems 30.48 m)"},
-            "polygon": {"elevation_types": ["SetValue", "SetIfHigher", "SetIfLower"],
-                        "requires": "constant Elevation Value (Generate Boundary Elevations off, no control points)"},
+            "polygon": {"elevation_types": ["SetValue", "SetIfHigher", "SetIfLower", "Add"],
+                        "constant": "no boundary elevations and no control point inside: constant fill",
+                        "tin": "boundary elevations from perimeter control points or a stored perimeter profile, interior control points as mass points; one ring"},
             "ellipse": {"elevation_types": ["SetValue", "SetIfHigher", "SetIfLower"], "rotation": "degrees, any"}
         },
         "ground_line_rule": "profile: binary32 stations shifted to start at 0, clamped to the length, first value per station, 100 ft (100/3.281 m) densification from a running start that only advances over segments longer than the spacing, length appended when the last station is > 0.01 short; binary32 linear query clamped at both ends. Offset lines: toes at Max Reach/2, ridges at Top Width/2, M = centerline station; joints meet at the offset-segment intersection (M averaged) or get the previous end, an arc split while chord-mid/r < 0.95, and the next start; square ends; self-intersections trimmed (farthest crossing later segment, M averaged); profile stations injected by M fraction. Centre and ridges z = profile(station); toes z = profile -/+ (Max Reach/2 - Top Width/2)/slope (binary32 half-widths, binary64 product), slope 0 read as 0.001; Max Reach <= Top Width folds the toes inside the ridges (those strips draw nothing). Ribbon TIN (left toe, left ridge, centre, right ridge, right toe; 0.01 dedupe; shorter diagonal, ties advance the right ribbon; fan at the end), rasterized per 256-pixel output tile with the export TIN rasterizer (inclusive, last triangle wins, clockwise triangles draw nothing). Top Width <= 0 or Max Reach <= 0: no change",
         "system_rule": "named features joined in feature-ID order (same name, elevation type and Elev Pt Tolerance; end-to-start within 60 ft; nearest first), centerline = members' vertices concatenated; profile = member profiles offset by the running last station, each member's first point a control cross section (Max Reach <= 0 read as 2 x Top Width) that enters the centre profile first (the next feature's start elevation wins at a junction); a closing cross section at the system end; per section, cross-section lines perpendicular to the chord half a reach up and down the centerline carry the trapezoid (Top Width = Max Reach narrowed by 0.01), a changing template with positive Transition Percent ends its section Top Width x Transition Percent early (NaN adds nothing); toe and ridge stream lines grown in 4-16 lateral steps (resample, smooth blend, Douglas-Peucker, crossing trims), M-fraction injection, template values interpolated by station; same ribbon TIN and rasterizer; drawn at the highest member feature ID",
-        "polygon_rule": "pixel centre inside (even-odd), constant elevation",
+        "polygon_rule": "constant: pixel centre inside (even-odd). TIN: perimeter profile from control points within Elev Pt Tolerance of the perimeter (boundary elevations on), else the stored profile (on), else the constant Elevation Value; Douglas-Peucker filtered at 0.01 ft (binary32); perimeter points with z from the profile (wrapping across the ring start); Delaunay factory of the export TIN at 0.1 ft (binary32 widened), extent of perimeter and mass points (10 x tolerance, 1:8) widened to 3 x the perimeter's, perimeter then interior control points inserted, perimeter enforced, triangles touching the super polygon deleted and the deletion flooded across non-perimeter edges; rasterized per output tile over the cells holding the polygon's extent",
         "ellipse_rule": "per output-tile pixel centre: circle (equal radii) distance <= radius; otherwise (c dx + s dy)^2/rx^2 + (s dx - c dy)^2/ry^2 <= 1 with c, s = cos, sin(-rotation degrees)",
-        "combine": "binary32: a nodata terrain pixel takes the modification value; SetValue replaces; SetIfHigher/SetIfLower replace when strictly higher/lower; layers stable-sorted by ascending Priority and applied in reverse (Priority 0 last, so it wins), features in stored order",
-        "rounding": "binary32, then nearest 1/32 (ties to even), after each feature",
+        "combine": "binary32 on the unrounded terrain (the mosaic and export TIN hold binary32 values; 1/32 rounding once after all modifications): a nodata terrain pixel takes the modification value; SetValue replaces; Add adds; SetIfHigher/SetIfLower replace when strictly higher/lower; layers stable-sorted by ascending Priority and applied in reverse (Priority 0 last, so it wins), features in stored order",
+        "rounding": "binary32 throughout, then nearest 1/32 (ties to even) once at the end",
+        "hecras_version": "7.0.1 (default) or 6.6. 6.6 (measured on HEC-RAS 6.6 exports of the synthetic cases): ground lines with Max Reach not wider than one output-tile cell are not drawn; named ground lines and boundary elevations without perimeter control points are refused (6.6 builds systems differently and samples the terrain); all else as 7.0.1",
         "qualified": {
             "scope": "fast-map 0.16.0 working tree, ras2fim-batch effective-terrain, request schema 2, HEC-RAS 7.0.1 exports with rasterize_modifications=True, downsample_factor=1, whole terrain",
             "real terrains A and B1-B4 (pixels where two exports differ excluded; unnamed ground lines, constant polygons, circles)": "no difference inside any modification footprint: B1 0 values (was 3 at 1/32 ft), B2 0 values (was 443, max 1.47 ft), B3 and B4 0; the remaining pixels (A 322 values, max 0.53 ft; B1, B2 and B3 2 mask pixels each) lie outside every footprint, in export-TIN gap fills",
-            "real terrain C (2 ft, 379.0M px in the source extent; HDF copy reduced to its 10 accepted layers, including systems of 3, 2 and lone named channels and a SetValue channel layer; two base and two modified exports, which agree)": "0 mask and 4 value differences, all at 1/32 ft; per layer 0 except 1 pixel at 1/32 ft in the SetValue channel layer",
-            "synthetic T2 terrain, 20 ft (one export each)": "named writer cases (22.5 km channel, 21.2 km levee, channel + polygon + levee): 0 modified pixels differ (2 edge pixels differ in the base export); three joined channels with differing templates and profiles, a 20 ft junction gap and Transition Percent 0 / 0.5, a lone channel with NaN Transition Percent and an unnamed channel: 1 of 7,118 pixels at 1/32 ft; levee systems split by elevation type (Transition Percent 1, a profile starting at station 10, SetValue members): 0 of 2,494; a SetValue channel system in scrambled feature order: 0 of 4,567; blank-name cases (sharp bends, short segments, SetValue, Max Reach <= Top Width, ellipses) as before"
+            "real terrain C, previous round (2 ft, 379.0M px in the source extent; HDF copy reduced to its 10 then-accepted layers, including systems of 3, 2 and lone named channels and a SetValue channel layer; two base and two modified exports, which agree)": "0 mask and 4 value differences, all at 1/32 ft; per layer 0 except 1 pixel at 1/32 ft in the SetValue channel layer",
+            "synthetic T2 terrain, 20 ft (one export each)": "named writer cases (22.5 km channel, 21.2 km levee, channel + polygon + levee): 0 modified pixels differ (2 edge pixels differ in the base export); three joined channels with differing templates and profiles, a 20 ft junction gap and Transition Percent 0 / 0.5, a lone channel with NaN Transition Percent and an unnamed channel: 1 of 7,118 pixels at 1/32 ft; levee systems split by elevation type (Transition Percent 1, a profile starting at station 10, SetValue members): 0 of 2,494; a SetValue channel system in scrambled feature order: 0 of 4,567; blank-name cases (sharp bends, short segments, SetValue, Max Reach <= Top Width, ellipses) as before",
+            "control points, boundary elevations, Add, NaN templates": "real terrain C, all 13 layers (2 ft, 379.0M px): 0 mask, 4 values at 1/32 ft; real terrain E without its terrain-sampled polygon layer (3 ft, 1.14G px; a 14-feature levee layer with 2,862 control points): 0 mask, 3 values at 1/32 ft; real terrain D without its terrain-sampled polygon layer (228 layers, 924.6M px; 202 boundary-elevation polygon layers with perimeter control points, 20 channel layers with control points): 0 mask, 3 values at 1/32 ft; synthetic polygons (interior points, stored profile, perimeter points, one point, Add): 2 of 12,805 px at 1/32 ft; synthetic ground lines with control points and Add: 1 of 2,499 px at 1/32 ft; NaN and negative templates: exact",
+            "hecras_version 6.6": "HEC-RAS 6.6 exports of the synthetic cases: narrow ground lines 474 of 474 px, bends, short segments, SetValue, narrow templates, ellipses, control points, NaN templates, constant polygons: at most 2 px at 1/32 ft per case"
         },
         "known_differences": "RasMapperLib's binary64 powers (.NET Framework Math.Pow, e.g. distances as Pow(x, 0.5)) are not correctly rounded; this engine uses correctly rounded square roots and products. On terrain C's 3-feature system this moves 4 stream-line points by up to 6e-5 ft; no pixel changed in the measured cases",
-        "refused": "ground-line Add (needs the unrounded terrain; not measured), non-finite templates (Top Width, slopes or Max Reach NaN), negative slopes, polygons with boundary profiles, shape Z or control points, multi-part features, any other modification type (the caller also refuses ground-line control points and duplicate priorities)"
+        "refused": "boundary elevations sampled from the terrain (no stored profile and no perimeter control point: RAS Mapper samples each source raster and the stored stitch TIN), shape-Z polygons (vertex z storage not measured), multi-part polygons needing a TIN, named ground lines with a NaN template or in a layer with control points, a NaN Top Width with a finite Max Reach, multi-part features, any other modification type (the caller also refuses duplicate priorities)"
     })
 }
 
@@ -263,16 +342,36 @@ fn finite(v: f64) -> bool {
 pub fn validate(layers: &[Layer]) -> Result<(), MapError> {
     for l in layers {
         match l {
-            Layer::GroundLine { features, name, .. } => {
+            Layer::GroundLine {
+                features,
+                name,
+                control_points,
+                ..
+            } => {
+                let with_cps = !control_points.is_empty();
+                if control_points
+                    .iter()
+                    .any(|c| !(finite(c.x) && finite(c.y)) || c.elevation.is_infinite())
+                {
+                    return Err(invalid(format!(
+                        "ground line layer {name:?}: non-finite control point"
+                    )));
+                }
                 for f in features {
-                    if f.points.len() < 2 || f.profile.len() < 2 {
+                    // With control points RAS Mapper builds the profile from
+                    // them, so a stored profile may be empty.
+                    if f.points.len() < 2 || (!with_cps && f.profile.len() < 2) {
                         return Err(invalid(format!(
                             "ground line layer {name:?}: needs >= 2 points and >= 2 profile stations"
                         )));
                     }
-                    let ok = [f.top_width, f.left_slope, f.right_slope, f.max_reach]
-                        .iter()
-                        .all(|v| finite(*v))
+                    if with_cps && !f.system_name.trim().is_empty() {
+                        return Err(MapError::Unsupported(format!(
+                            "ground line layer {name:?}: named ground lines with control points are not qualified"
+                        )));
+                    }
+                    let template = [f.top_width, f.left_slope, f.right_slope, f.max_reach];
+                    let ok = template.iter().all(|v| !v.is_infinite())
                         && f.points.iter().flatten().all(|v| finite(*v))
                         && f.profile.iter().flatten().all(|v| finite(*v));
                     if !ok {
@@ -280,9 +379,17 @@ pub fn validate(layers: &[Layer]) -> Result<(), MapError> {
                             "ground line layer {name:?}: non-finite geometry, template or profile"
                         )));
                     }
-                    if f.left_slope < 0.0 || f.right_slope < 0.0 {
+                    let named = !f.system_name.trim().is_empty();
+                    if named && template.iter().any(|v| v.is_nan()) {
                         return Err(MapError::Unsupported(format!(
-                            "ground line layer {name:?}: negative side slopes are not qualified"
+                            "ground line layer {name:?}: named ground lines with a NaN template are not qualified"
+                        )));
+                    }
+                    // Measured on HEC-RAS 7.0.1: a NaN Top Width with a finite
+                    // Max Reach makes the export itself fail.
+                    if f.top_width.is_nan() && !f.max_reach.is_nan() {
+                        return Err(MapError::Unsupported(format!(
+                            "ground line layer {name:?}: a NaN Top Width with a finite Max Reach fails in RAS Mapper's export"
                         )));
                     }
                     if f.points.windows(2).any(|w| w[0] == w[1]) {
@@ -324,6 +431,7 @@ pub fn validate(layers: &[Layer]) -> Result<(), MapError> {
 }
 
 /// Rounding of every stored terrain value (binary32, then 1/32 ties to even).
+#[cfg(test)]
 fn quantize(v: f64) -> f32 {
     let f = v as f32 as f64;
     ((f * 32.0).round_ties_even() / 32.0) as f32
@@ -366,32 +474,33 @@ fn centre(grid: &Grid, r: usize, c: usize) -> (f64, f64) {
     )
 }
 
-/// RAS Mapper's per-pixel replacement in binary32, then the terrain rounding.
+/// RAS Mapper's per-pixel replacement in binary32 on the unrounded terrain
+/// (the caller rounds to 1/32 once, after every modification).
 fn combine(base: f32, m: f32, et: ElevationType) -> f32 {
-    let v = if base == NODATA {
-        m
-    } else if m == NODATA {
-        base
-    } else {
-        match et {
-            ElevationType::SetValue => m,
-            ElevationType::SetIfHigher => {
-                if m > base {
-                    m
-                } else {
-                    base
-                }
-            }
-            ElevationType::SetIfLower => {
-                if m < base {
-                    m
-                } else {
-                    base
-                }
+    if base == NODATA {
+        return m;
+    }
+    if m == NODATA {
+        return base;
+    }
+    match et {
+        ElevationType::SetValue => m,
+        ElevationType::Add => base + m,
+        ElevationType::SetIfHigher => {
+            if m > base {
+                m
+            } else {
+                base
             }
         }
-    };
-    quantize(v as f64)
+        ElevationType::SetIfLower => {
+            if m < base {
+                m
+            } else {
+                base
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -628,9 +737,15 @@ fn sort_stations(p: &mut Profile) {
 
 /// The centre profile RAS Mapper derives from the stored profile (no control
 /// points).
-fn levee_profile(stored: &[[f64; 2]], line: &[Pm], len: f64, spacing: f64) -> Profile {
+fn levee_profile(
+    stored: &[[f64; 2]],
+    line: &[Pm],
+    len: f64,
+    spacing: f64,
+    cps: Option<(&[ControlPoint], f32)>,
+) -> Profile {
     let stored: Profile = stored.iter().map(|s| (s[0] as f32, s[1] as f32)).collect();
-    seeded_profile(&[], &stored, line, len, spacing)
+    seeded_profile(&[], &stored, line, len, spacing, cps)
 }
 
 /// `seed` stations (control cross sections) are entered first; then the
@@ -643,6 +758,7 @@ fn seeded_profile(
     line: &[Pm],
     len: f64,
     spacing: f64,
+    cps: Option<(&[ControlPoint], f32)>,
 ) -> Profile {
     let mut keys: Profile = Vec::with_capacity(seed.len() + stored.len());
     let put = |keys: &mut Profile, x: f32, y: f32| {
@@ -663,6 +779,9 @@ fn seeded_profile(
             };
             put(&mut keys, x, y);
         }
+    }
+    if let Some((cps, tol)) = cps {
+        control_point_stations(&mut keys, stored.is_empty(), cps, tol, line, len);
     }
     let mut prof = keys.clone();
     sort_stations(&mut prof);
@@ -904,16 +1023,22 @@ pub(crate) fn ground_line_tin(
     f: &GroundLine,
     subtype: GroundLineSubtype,
     units: LengthUnits,
+    cps: &[ControlPoint],
 ) -> Option<CleanTin> {
     let reach = f.max_reach as f32;
     let top = f.top_width as f32;
-    // Finite (validated), so these are RAS Mapper's `<= 0` skips.
-    if reach <= 0.0 || top <= 0.0 {
+    // RAS Mapper's `<= 0` skips; a NaN Max Reach draws nothing (measured).
+    if reach.is_nan() || reach <= 0.0 || top <= 0.0 {
         return None;
     }
     let line: Vec<Pm> = f.points.iter().map(|p| Pm::xy(p[0], p[1])).collect();
     let total = length(&line);
-    let prof = levee_profile(&f.profile, &line, total, units.profile_spacing());
+    let cp = if cps.is_empty() {
+        None
+    } else {
+        Some((cps, f.elev_pt_tolerance as f32))
+    };
+    let prof = levee_profile(&f.profile, &line, total, units.profile_spacing(), cp);
     let stream = dedupe_xy(&line, 0.001_f32 as f64);
     if stream.len() < 2 {
         return None;
@@ -947,7 +1072,13 @@ pub(crate) fn ground_line_tin(
     };
     let usable = |s: f64| {
         let s = s as f32;
-        if s == 0.0 { 0.001_f32 } else { s }
+        if s.is_nan() {
+            3.0_f32
+        } else if s == 0.0 {
+            0.001_f32
+        } else {
+            s
+        }
     };
     let (mut ls, mut rs) = (usable(f.left_slope), usable(f.right_slope));
     match subtype {
@@ -1697,7 +1828,7 @@ fn system_ribbons(
         LengthUnits::Meters => 100.0 * 0.3048,
     };
     let seed: Profile = sys.xs.iter().map(|x| (x.station, x.elevation)).collect();
-    let profile = seeded_profile(&seed, &sys.profile, line, total, spacing);
+    let profile = seeded_profile(&seed, &sys.profile, line, total, spacing, None);
     // Control cross sections by station (stable), lines at their stations.
     let mut xs: Vec<(ControlXs, Vec<Pm>)> = sys
         .xs
@@ -1994,6 +2125,326 @@ fn system_tin(
 }
 
 // ---------------------------------------------------------------------------
+// Control points and polygon TINs
+// ---------------------------------------------------------------------------
+
+/// Nearest position on `line` (first segment at the smallest distance) and
+/// that distance.
+fn nearest_on(line: &[Pm], q: Pm) -> (Pop, f64) {
+    let (mut best, mut seg) = (f64::MAX, 0);
+    for i in 0..line.len() - 1 {
+        let d = seg_distance(line[i], line[i + 1], q);
+        if d < best {
+            best = d;
+            seg = i;
+        }
+    }
+    let (a, b) = (line[seg], line[seg + 1]);
+    let l = dist(a, b);
+    let (p, t) = if l == 0.0 {
+        (a, 0.0)
+    } else {
+        let along = ((b.x - a.x) * (q.x - a.x) + (b.y - a.y) * (q.y - a.y)) / l;
+        if along < 0.0 {
+            (a, 0.0)
+        } else if along > l {
+            (b, 1.0)
+        } else {
+            let t = along / dist(a, b);
+            (lerp(a, b, t), t)
+        }
+    };
+    (Pop { p, seg, frac: t }, best)
+}
+
+/// Distance along `line` to `at` (segment lengths summed in order).
+fn distance_along(line: &[Pm], at: &Pop) -> f64 {
+    let mut s = 0.0;
+    for i in 0..at.seg {
+        s += dist(line[i], line[i + 1]);
+    }
+    s + dist(line[at.seg], line[at.seg + 1]) * at.frac
+}
+
+/// Cumulative segment ends.
+fn cumulative(line: &[Pm]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(line.len().saturating_sub(1));
+    let mut s = 0.0;
+    for w in line.windows(2) {
+        s += dist(w[0], w[1]);
+        out.push(s);
+    }
+    out
+}
+
+/// Distance along with precomputed cumulative lengths.
+fn distance_along_fast(line: &[Pm], cum: &[f64], at: &Pop) -> f64 {
+    let base = if at.seg > 0 { cum[at.seg - 1] } else { 0.0 };
+    base + dist(line[at.seg], line[at.seg + 1]) * at.frac
+}
+
+/// Vertex `i` as RAS Mapper lists polyline vertices: the first at the start
+/// of segment 0, the others at the end of the previous segment.
+fn vertex_pop(line: &[Pm], i: usize) -> Pop {
+    if i == 0 {
+        Pop {
+            p: line[0],
+            seg: 0,
+            frac: 0.0,
+        }
+    } else {
+        Pop {
+            p: line[i],
+            seg: i - 1,
+            frac: 1.0,
+        }
+    }
+}
+
+/// Control-point stations of a ground line: points within the Elev Pt
+/// Tolerance of the centerline set the profile at their nearest station
+/// (overriding stored stations); with no stored profile the ends take the
+/// elevations of the first and last such point.
+fn control_point_stations(
+    keys: &mut Profile,
+    stored_empty: bool,
+    cps: &[ControlPoint],
+    tol: f32,
+    line: &[Pm],
+    len: f64,
+) {
+    let has = |keys: &Profile, x: f32| keys.iter().any(|k| k.0 == x);
+    let mut at_start = has(keys, 0.0);
+    let mut at_end = has(keys, len as f32);
+    let (mut lo_v, mut lo_s, mut hi_v, mut hi_s) = (0.0_f32, f64::MAX, 0.0_f32, f64::MIN);
+    let (first, last) = (line[0], line[line.len() - 1]);
+    for cp in cps {
+        if cp.elevation.is_nan() {
+            continue;
+        }
+        let e = cp.elevation as f32;
+        let (at, d) = nearest_on(line, Pm::xy(cp.x, cp.y));
+        if d <= tol as f64 {
+            let s = distance_along(line, &at);
+            let k = s as f32;
+            match keys.iter_mut().find(|q| q.0 == k) {
+                Some(q) => q.1 = e,
+                None => keys.push((k, e)),
+            }
+            if s < lo_s {
+                lo_s = s;
+                lo_v = e;
+            }
+            if s > hi_s {
+                hi_s = s;
+                hi_v = e;
+            }
+            if at.p.x == first.x && at.p.y == first.y {
+                at_start = true;
+            }
+            if at.p.x == last.x && at.p.y == last.y {
+                at_end = true;
+            }
+        }
+    }
+    if !cps.is_empty() && stored_empty {
+        if !at_start && !has(keys, 0.0) {
+            keys.push((0.0, lo_v));
+        }
+        if !at_end {
+            let (at, _) = nearest_on(line, last);
+            let s = distance_along(line, &at) as f32;
+            if !has(keys, s) {
+                keys.push((s, hi_v));
+            }
+        }
+    }
+}
+
+/// Douglas-Peucker filter of a profile in binary32 (first and last kept).
+fn profile_filter(p: &Profile, tol: f32) -> Profile {
+    let n = p.len();
+    let mut keep = Vec::new();
+    if n > 0 {
+        keep.push(0);
+    }
+    if n > 1 {
+        keep.push(n - 1);
+    }
+    fn dp(p: &Profile, first: usize, last: usize, tol: f32, keep: &mut Vec<usize>) {
+        if last - first <= 1 {
+            return;
+        }
+        let (a, b) = (p[first], p[last]);
+        let d3 = (((b.0 - a.0) as f64).powi(2) + ((b.1 - a.1) as f64).powi(2)).sqrt() as f32;
+        let (mut best, mut at) = (0.0_f32, 0);
+        for (i, q) in p.iter().enumerate().take(last).skip(first + 1) {
+            let v =
+                (a.0 * b.1 + b.0 * q.1 + q.0 * a.1 - b.0 * a.1 - q.0 * b.1 - a.0 * q.1).abs() / d3;
+            if v > best {
+                best = v;
+                at = i;
+            }
+        }
+        if best > tol {
+            keep.push(at);
+            dp(p, first, at, tol, keep);
+            dp(p, at, last, tol, keep);
+        }
+    }
+    if n > 1 {
+        dp(p, 0, n - 1, tol, &mut keep);
+    }
+    keep.sort_unstable();
+    keep.iter().map(|&i| p[i]).collect()
+}
+
+/// The perimeter's points with z from the perimeter profile; vertices before
+/// the first or after the last station interpolate across the ring's start.
+fn perimeter_points(ring: &[Pm], prof: &Profile) -> Option<Vec<Pm>> {
+    let len0 = length(ring);
+    if prof.len() >= 2 {
+        let plen = (prof[prof.len() - 1].0 - prof[0].0) as f64;
+        if (len0 - plen).abs() > 0.01 && plen > len0 {
+            return None;
+        }
+    }
+    let line = z_from_profile(ring, prof, len0, true);
+    let total = length(&line);
+    let cum = cumulative(&line);
+    let key = |p: &Pm| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits(), p.m.to_bits()];
+    let mut map = std::collections::HashMap::new();
+    for i in 0..line.len() {
+        map.insert(key(&line[i]), vertex_pop(&line, i));
+    }
+    let (p0, pn) = (prof[0], prof[prof.len() - 1]);
+    let wrap: Profile = vec![pn, (total as f32 + p0.0, p0.1)];
+    let mut out = line.clone();
+    for (j, p) in line.iter().enumerate() {
+        let at = map[&key(p)];
+        let s = distance_along_fast(&line, &cum, &at) as f32;
+        if s <= p0.0 {
+            out[j].z = query(&wrap, (total + s as f64) as f32) as f64;
+        } else if s > pn.0 {
+            out[j].z = query(&wrap, s) as f64;
+        } else {
+            out[j].z = query(prof, s) as f64;
+        }
+    }
+    Some(out)
+}
+
+/// Whether a polygon needs RAS Mapper's perimeter TIN rather than the
+/// constant fill: boundary elevations, shape Z, or a control point inside.
+fn polygon_needs_tin(f: &Polygon, cps: &[ControlPoint]) -> bool {
+    f.generate_boundary
+        || f.use_shape_z
+        || cps
+            .iter()
+            .any(|c| !c.elevation.is_nan() && point_in_rings(&f.rings, c.x, c.y))
+}
+
+/// The perimeter TIN of a polygon (single ring).
+fn polygon_tin(
+    f: &Polygon,
+    cps: &[ControlPoint],
+    units: LengthUnits,
+    name: &str,
+    v66: bool,
+) -> Result<Option<CleanTin>, MapError> {
+    if f.rings.len() != 1 {
+        return Err(MapError::Unsupported(format!(
+            "polygon layer {name:?}: multi-part polygons with boundary elevations, shape Z or control points are not qualified"
+        )));
+    }
+    let mut ring: Vec<Pm> = f.rings[0].iter().map(|p| Pm::xy(p[0], p[1])).collect();
+    if f.use_shape_z {
+        if f.vertex_z.len() != ring.len() {
+            return Err(MapError::Unsupported(format!(
+                "polygon layer {name:?}: shape Z needs one vertex_z per ring vertex"
+            )));
+        }
+        for (p, z) in ring.iter_mut().zip(&f.vertex_z) {
+            p.z = *z;
+        }
+    }
+    let (a, b) = (ring[0], ring[ring.len() - 1]);
+    if !(a.x == b.x && a.y == b.y) {
+        ring.push(a);
+    }
+    let si = units == LengthUnits::Meters;
+    let tol = f.elev_pt_tolerance as f32;
+    let total = length(&ring);
+    let cum = cumulative(&ring);
+    let mut pf: Profile = Vec::new();
+    let mut stations: Vec<f64> = Vec::new();
+    let mut mass: Vec<[f64; 3]> = Vec::new();
+    let mut on_perimeter = 0;
+    for c in cps {
+        if c.elevation.is_nan() {
+            continue;
+        }
+        let e = c.elevation as f32;
+        if point_in_rings(&f.rings, c.x, c.y) {
+            mass.push([c.x, c.y, e as f64]);
+            continue;
+        }
+        let (at, d) = nearest_on(&ring, Pm::xy(c.x, c.y));
+        if f.generate_boundary && !f.use_shape_z && d <= tol as f64 {
+            let s = distance_along_fast(&ring, &cum, &at);
+            if !stations.contains(&s) {
+                pf.push((s as f32, e));
+                stations.push(s);
+                on_perimeter += 1;
+            }
+        }
+    }
+    if f.use_shape_z && !f.generate_boundary {
+        for i in 0..ring.len() {
+            let s = distance_along_fast(&ring, &cum, &vertex_pop(&ring, i));
+            if !stations.contains(&s) {
+                pf.push((s as f32, ring[i].z as f32));
+                stations.push(s);
+            }
+        }
+    } else if f.generate_boundary && on_perimeter == 0 {
+        if v66 {
+            return Err(MapError::Unsupported(format!(
+                "polygon layer {name:?}: HEC-RAS 6.6 samples boundary elevations from the terrain (not qualified)"
+            )));
+        }
+        if f.profile.is_empty() {
+            return Err(MapError::Unsupported(format!(
+                "polygon layer {name:?}: boundary elevations sampled from the terrain (no stored profile, no perimeter control point) are not qualified"
+            )));
+        }
+        for p in &f.profile {
+            let x = p[0] as f32;
+            if !stations.contains(&(x as f64)) {
+                pf.push((x, p[1] as f32));
+                stations.push(x as f64);
+            }
+        }
+    }
+    if pf.is_empty() {
+        let v = f.elevation as f32;
+        pf.push((0.0, v));
+        pf.push((total as f32, v));
+    }
+    sort_stations(&mut pf);
+    let ftol = if si { 0.01_f32 * 0.3048 } else { 0.01_f32 };
+    let pf = profile_filter(&pf, ftol);
+    let Some(pts) = perimeter_points(&ring, &pf) else {
+        return Err(MapError::Unsupported(format!(
+            "polygon layer {name:?}: a perimeter profile longer than the perimeter is not qualified"
+        )));
+    };
+    let perim: Vec<[f64; 3]> = pts.iter().map(|p| [p.x, p.y, p.z]).collect();
+    let ttol = if si { 0.1_f32 * 0.3048 } else { 0.1_f32 } as f64;
+    Ok(export_tin::perimeter_tin(&perim, &mass, ttol).ok())
+}
+
+// ---------------------------------------------------------------------------
 // Application
 // ---------------------------------------------------------------------------
 
@@ -2078,9 +2529,50 @@ fn bbox_of(points: impl Iterator<Item = (f64, f64)>) -> [f64; 4] {
     b
 }
 
-/// Per-layer counts of changed pixels.
+/// The HEC-RAS version whose modification rules apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RasVersion {
+    V7_0_1,
+    V6_6,
+}
+
+impl RasVersion {
+    pub fn parse(v: Option<&str>) -> Result<Self, MapError> {
+        match v.map(str::trim) {
+            None | Some("7.0.1") => Ok(RasVersion::V7_0_1),
+            Some("6.6") => Ok(RasVersion::V6_6),
+            Some(o) => Err(MapError::Unsupported(format!(
+                "hecras_version {o:?}: only 7.0.1 and 6.6 are qualified"
+            ))),
+        }
+    }
+}
+
+/// Per-layer counts of changed pixels (HEC-RAS 7.0.1 rules).
 pub fn apply(layers: &[Layer], grid: &Grid, values: &mut [f32]) -> Result<Value, MapError> {
+    apply_version(layers, grid, values, RasVersion::V7_0_1)
+}
+
+/// Per-layer counts of changed pixels under `version`'s rules.
+pub fn apply_version(
+    layers: &[Layer],
+    grid: &Grid,
+    values: &mut [f32],
+    version: RasVersion,
+) -> Result<Value, MapError> {
     validate(layers)?;
+    let v66 = version == RasVersion::V6_6;
+    if v66 {
+        for l in layers {
+            if let Layer::GroundLine { features, name, .. } = l
+                && features.iter().any(|f| !f.system_name.trim().is_empty())
+            {
+                return Err(MapError::Unsupported(format!(
+                    "ground line layer {name:?}: named ground lines under HEC-RAS 6.6 are not qualified (its system path differs)"
+                )));
+            }
+        }
+    }
     let tiles = Tiles::new(grid);
     // Ascending Priority (stable), applied in reverse: Priority 0 is applied
     // last and wins.
@@ -2107,12 +2599,13 @@ pub fn apply(layers: &[Layer], grid: &Grid, values: &mut [f32]) -> Result<Value,
                 subtype,
                 features,
                 length_units,
+                control_points,
                 ..
             } => {
                 let (system_of, systems) = ground_line_systems(features);
                 for (fi, f) in features.iter().enumerate() {
                     let tin = match system_of[fi] {
-                        None => ground_line_tin(f, *subtype, *length_units),
+                        None => ground_line_tin(f, *subtype, *length_units, control_points),
                         // A system is drawn once, in the place of its
                         // highest feature ID, with that feature's type.
                         Some(s) if systems[s].iter().max() == Some(&fi) => {
@@ -2125,7 +2618,19 @@ pub fn apply(layers: &[Layer], grid: &Grid, values: &mut [f32]) -> Result<Value,
                         continue;
                     };
                     let b = bbox_of(tin.points.iter().map(|p| (p[0], p[1])));
+                    let reach = match system_of[fi] {
+                        None => f.max_reach as f32,
+                        Some(s) => systems[s]
+                            .iter()
+                            .map(|&k| features[k].max_reach as f32)
+                            .fold(f32::NAN, f32::max),
+                    };
                     for (l, m, tg, rows, cols) in tiles.over(b) {
+                        // HEC-RAS 6.6 does not draw ground lines whose Max
+                        // Reach is not wider than one cell of the tile.
+                        if v66 && reach as f64 / tg.cs <= 1.0 {
+                            continue;
+                        }
                         buf.fill(f32::NAN);
                         export_tin::rasterize(&tin, &tg, &mut buf);
                         for i in 0..rows {
@@ -2139,8 +2644,47 @@ pub fn apply(layers: &[Layer], grid: &Grid, values: &mut [f32]) -> Result<Value,
                     }
                 }
             }
-            Layer::Polygon { features, .. } => {
+            Layer::Polygon {
+                features,
+                control_points,
+                length_units,
+                name,
+                ..
+            } => {
                 for f in features {
+                    if polygon_needs_tin(f, control_points) {
+                        let Some(tin) = polygon_tin(f, control_points, *length_units, name, v66)?
+                        else {
+                            skipped += 1;
+                            continue;
+                        };
+                        let b = bbox_of(f.rings.iter().flatten().map(|p| (p[0], p[1])));
+                        for (l, m, tg, rows, cols) in tiles.over(b) {
+                            buf.fill(f32::NAN);
+                            export_tin::rasterize(&tin, &tg, &mut buf);
+                            // RAS Mapper combines over the cells holding the
+                            // polygon's extent.
+                            let cell = |v: f64, lo: f64| ((v - lo) / tg.cs).floor() as i64;
+                            let (c0, c1) = (cell(b[0], tg.min_x), cell(b[2], tg.min_x));
+                            let (r0, r1) = (
+                                ((tg.max_y - b[3]) / tg.cs).floor() as i64,
+                                ((tg.max_y - b[1]) / tg.cs).floor() as i64,
+                            );
+                            for i in 0..rows {
+                                for j in 0..cols {
+                                    let (ii, jj) = (i as i64, j as i64);
+                                    if ii < r0 || ii > r1 || jj < c0 || jj > c1 {
+                                        continue;
+                                    }
+                                    let z = buf[i * TILE + j];
+                                    if !z.is_nan() {
+                                        set(l * TILE + i, m * TILE + j, z, f.elevation_type);
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     let b = bbox_of(f.rings.iter().flatten().map(|p| (p[0], p[1])));
                     let Some(w) = window(grid, b) else { continue };
                     for r in w.r0..w.r1 {
@@ -2227,13 +2771,49 @@ mod tests {
     }
 
     fn gl_layer(subtype: GroundLineSubtype, features: Vec<GroundLine>) -> Layer {
+        gl_layer_cp(subtype, features, Vec::new())
+    }
+
+    fn gl_layer_cp(
+        subtype: GroundLineSubtype,
+        features: Vec<GroundLine>,
+        control_points: Vec<ControlPoint>,
+    ) -> Layer {
         Layer::GroundLine {
             name: "l".into(),
             priority: 0,
             subtype,
             length_units: LengthUnits::Feet,
             features,
+            control_points,
         }
+    }
+
+    fn poly(ring: Vec<[f64; 2]>, et: ElevationType, elevation: f64) -> Polygon {
+        Polygon {
+            elevation_type: et,
+            elevation,
+            rings: vec![ring],
+            generate_boundary: false,
+            use_shape_z: false,
+            profile: Vec::new(),
+            vertex_z: Vec::new(),
+            elev_pt_tolerance: 20.0,
+        }
+    }
+
+    fn poly_layer(features: Vec<Polygon>, control_points: Vec<ControlPoint>) -> Layer {
+        Layer::Polygon {
+            name: "p".into(),
+            priority: 0,
+            features,
+            control_points,
+            length_units: LengthUnits::Feet,
+        }
+    }
+
+    fn cp(x: f64, y: f64, elevation: f64) -> ControlPoint {
+        ControlPoint { x, y, elevation }
     }
 
     #[test]
@@ -2269,7 +2849,7 @@ mod tests {
             vec![[0.0, 0.0], [80.0, 0.0]],
         );
         f.elevation_type = ElevationType::SetIfLower;
-        let tin = ground_line_tin(&f, GroundLineSubtype::Channel, LengthUnits::Feet).unwrap();
+        let tin = ground_line_tin(&f, GroundLineSubtype::Channel, LengthUnits::Feet, &[]).unwrap();
         // Left toe: 15 / 2 above; right toe: 15 / 4 above; centre and ridges 0.
         let zs: Vec<f64> = tin.points.iter().map(|p| p[2]).collect();
         assert!(zs.contains(&7.5) && zs.contains(&3.75));
@@ -2282,7 +2862,7 @@ mod tests {
             .iter()
             .map(|p| Pm::xy(p[0], p[1]))
             .collect();
-        let p = levee_profile(&[[5.0, 1.0], [305.0, 4.0]], &line, 300.0, 100.0);
+        let p = levee_profile(&[[5.0, 1.0], [305.0, 4.0]], &line, 300.0, 100.0, None);
         // Shifted by -5, clamped to 300 (first value per station wins); the
         // 250 ft segment adds 100 and 200 from a start of 0, not 50.
         let st: Vec<f32> = p.iter().map(|q| q.0).collect();
@@ -2355,20 +2935,19 @@ mod tests {
         let g = grid();
         let mut v = vec![NODATA; 100 * 100];
         apply(
-            &[Layer::Polygon {
-                name: "p".into(),
-                priority: 0,
-                features: vec![Polygon {
-                    elevation_type: ElevationType::SetIfLower,
-                    elevation: 7.3,
-                    rings: vec![vec![[10.0, 10.0], [20.0, 10.0], [20.0, 20.0], [10.0, 20.0]]],
-                }],
-            }],
+            &[poly_layer(
+                vec![poly(
+                    vec![[10.0, 10.0], [20.0, 10.0], [20.0, 20.0], [10.0, 20.0]],
+                    ElevationType::SetIfLower,
+                    7.3,
+                )],
+                Vec::new(),
+            )],
             &g,
             &mut v,
         )
         .unwrap();
-        assert_eq!(v[(100 - 15) * 100 + 15], quantize(7.3));
+        assert_eq!(v[(100 - 15) * 100 + 15], 7.3_f32);
         assert_eq!(v[0], NODATA);
     }
 
@@ -2466,7 +3045,14 @@ mod tests {
         assert_eq!(sys.xs.len(), 2);
         assert_eq!((sys.xs[1].station, sys.xs[1].elevation), (100.0, 9.0));
         let seed: Profile = sys.xs.iter().map(|x| (x.station, x.elevation)).collect();
-        let p = seeded_profile(&seed, &sys.profile, &sys.line, length(&sys.line), 100.0);
+        let p = seeded_profile(
+            &seed,
+            &sys.profile,
+            &sys.line,
+            length(&sys.line),
+            100.0,
+            None,
+        );
         // The previous feature's end elevation (6) is dropped: its profile
         // now runs to the next feature's start elevation.
         assert_eq!(query(&p, 100.0), 9.0);
@@ -2551,6 +3137,161 @@ mod tests {
     }
 
     #[test]
+    fn control_points_set_ground_line_stations() {
+        // Flat stored profile at 20; a control point 3 ft off the centerline
+        // at station 40 sets 30 there; one 80 ft away is beyond tolerance.
+        let mut f = levee(
+            vec![[10.0, 50.0], [90.0, 50.0]],
+            vec![[0.0, 20.0], [80.0, 20.0]],
+        );
+        f.elev_pt_tolerance = 50.0;
+        let line: Vec<Pm> = f.points.iter().map(|p| Pm::xy(p[0], p[1])).collect();
+        let cps = [cp(50.0, 53.0, 30.0), cp(30.0, 130.0, 99.0)];
+        let p = levee_profile(&f.profile, &line, 80.0, 100.0, Some((&cps, 50.0)));
+        assert_eq!(query(&p, 40.0), 30.0);
+        assert_eq!(query(&p, 20.0), 25.0);
+        // No stored profile: the ends take the first and last point's value.
+        let p = levee_profile(&[], &line, 80.0, 100.0, Some((&cps[..1], 50.0)));
+        assert_eq!(p, vec![(0.0, 30.0), (40.0, 30.0), (80.0, 30.0)]);
+    }
+
+    #[test]
+    fn interior_control_point_lifts_a_constant_polygon() {
+        let g = grid();
+        let mut v = vec![0.0_f32; 100 * 100];
+        let ring = vec![
+            [20.0, 20.0],
+            [80.0, 20.0],
+            [80.0, 80.0],
+            [20.0, 80.0],
+            [20.0, 20.0],
+        ];
+        apply(
+            &[poly_layer(
+                vec![poly(ring, ElevationType::SetValue, 10.0)],
+                vec![cp(50.5, 50.5, 40.0)],
+            )],
+            &g,
+            &mut v,
+        )
+        .unwrap();
+        let at = |x: f64, y: f64| v[((100.0 - y) as usize) * 100 + x as usize];
+        assert_eq!(at(50.5, 50.5), 40.0);
+        assert!(at(35.5, 50.5) > 10.0 && at(35.5, 50.5) < 40.0);
+        assert_eq!(at(10.5, 50.5), 0.0);
+    }
+
+    #[test]
+    fn stored_boundary_profile_sets_the_perimeter() {
+        // Perimeter 240 ft from (20,20) anticlockwise; elevations 0 at the
+        // start rising to 60 at station 120 and back to 0.
+        let g = grid();
+        let mut v = vec![-5.0_f32; 100 * 100];
+        let ring = vec![
+            [20.0, 20.0],
+            [80.0, 20.0],
+            [80.0, 80.0],
+            [20.0, 80.0],
+            [20.0, 20.0],
+        ];
+        let mut p = poly(ring, ElevationType::SetValue, 0.0);
+        p.generate_boundary = true;
+        p.profile = vec![[0.0, 0.0], [120.0, 60.0], [240.0, 0.0]];
+        apply(&[poly_layer(vec![p], Vec::new())], &g, &mut v).unwrap();
+        let at = |x: f64, y: f64| v[((100.0 - y) as usize) * 100 + x as usize];
+        // Near the far corner (80, 80) (station 120) and on the first edge.
+        assert!((at(79.5, 79.5) - 59.0).abs() < 1.0, "{}", at(79.5, 79.5));
+        assert!((at(50.5, 20.5) - 15.0).abs() < 1.0, "{}", at(50.5, 20.5));
+    }
+
+    #[test]
+    fn boundary_from_the_terrain_is_refused() {
+        let ring = vec![
+            [20.0, 20.0],
+            [80.0, 20.0],
+            [80.0, 80.0],
+            [20.0, 80.0],
+            [20.0, 20.0],
+        ];
+        let mut p = poly(ring, ElevationType::SetValue, 0.0);
+        p.generate_boundary = true;
+        let mut v = vec![0.0_f32; 100 * 100];
+        let r = apply(&[poly_layer(vec![p], Vec::new())], &grid(), &mut v);
+        assert!(matches!(r, Err(MapError::Unsupported(_))));
+    }
+
+    #[test]
+    fn add_uses_the_unrounded_terrain() {
+        assert_eq!(combine(10.01, 3.0, ElevationType::Add), 13.01_f32);
+        assert_eq!(combine(NODATA, 3.0, ElevationType::Add), 3.0);
+        assert_eq!(combine(10.0, 10.0, ElevationType::SetIfHigher), 10.0);
+    }
+
+    #[test]
+    fn nan_templates() {
+        let g = grid();
+        // NaN Max Reach: nothing drawn.
+        let mut f = levee(
+            vec![[10.0, 50.0], [90.0, 50.0]],
+            vec![[0.0, 20.0], [80.0, 20.0]],
+        );
+        f.max_reach = f64::NAN;
+        let mut v = vec![0.0_f32; 100 * 100];
+        apply(
+            &[gl_layer(GroundLineSubtype::Levee, vec![f.clone()])],
+            &g,
+            &mut v,
+        )
+        .unwrap();
+        assert!(v.iter().all(|z| *z == 0.0));
+        // NaN Top Width with a finite Max Reach: refused.
+        f.max_reach = 40.0;
+        f.top_width = f64::NAN;
+        assert!(matches!(
+            validate(&[gl_layer(GroundLineSubtype::Levee, vec![f.clone()])]),
+            Err(MapError::Unsupported(_))
+        ));
+        // NaN slopes are read as 3.
+        f.top_width = 10.0;
+        f.left_slope = f64::NAN;
+        let mut v = vec![0.0_f32; 100 * 100];
+        apply(&[gl_layer(GroundLineSubtype::Levee, vec![f])], &g, &mut v).unwrap();
+        let at = |x: f64, y: f64| v[((100.0 - y) as usize) * 100 + x as usize];
+        assert!((at(50.5, 65.5) as f64 - (20.0 - 10.5 / 3.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn negative_slope_flips_the_side() {
+        // Channel at 0 with a negative left slope: the left toe is below.
+        let mut f = levee(
+            vec![[10.0, 50.0], [90.0, 50.0]],
+            vec![[0.0, 0.0], [80.0, 0.0]],
+        );
+        f.elevation_type = ElevationType::SetIfLower;
+        f.left_slope = -2.0;
+        let tin = ground_line_tin(&f, GroundLineSubtype::Channel, LengthUnits::Feet, &[]).unwrap();
+        assert!(tin.points.iter().any(|p| p[2] == -7.5));
+    }
+
+    #[test]
+    fn hecras_6_6_skips_narrow_ground_lines() {
+        assert_eq!(RasVersion::parse(None).unwrap(), RasVersion::V7_0_1);
+        assert!(RasVersion::parse(Some("6.5")).is_err());
+        let mut f = levee(
+            vec![[10.0, 50.5], [90.0, 50.5]],
+            vec![[0.0, 20.0], [80.0, 20.0]],
+        );
+        f.top_width = 0.5;
+        f.max_reach = 1.0; // one cell
+        let layers = [gl_layer(GroundLineSubtype::Levee, vec![f])];
+        let mut v = vec![0.0_f32; 100 * 100];
+        apply_version(&layers, &grid(), &mut v, RasVersion::V6_6).unwrap();
+        assert!(v.iter().all(|z| *z == 0.0));
+        apply(&layers, &grid(), &mut v).unwrap();
+        assert!(v.contains(&20.0));
+    }
+
+    #[test]
     fn unqualified_forms_are_refused() {
         let mut f = levee(vec![[0.0, 0.0], [1.0, 0.0]], vec![[0.0, 0.0], [1.0, 0.0]]);
         f.elevation_type = ElevationType::SetValue;
@@ -2559,8 +3300,11 @@ mod tests {
         f.system_name = "chan".into();
         let layers = [gl_layer(GroundLineSubtype::Channel, vec![f.clone()])];
         assert!(validate(&layers).is_ok());
-        f.left_slope = -1.0;
-        let layers = [gl_layer(GroundLineSubtype::Channel, vec![f])];
+        let layers = [gl_layer_cp(
+            GroundLineSubtype::Channel,
+            vec![f],
+            vec![cp(0.0, 0.0, 1.0)],
+        )];
         assert!(matches!(validate(&layers), Err(MapError::Unsupported(_))));
     }
 }
