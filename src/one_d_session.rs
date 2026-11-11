@@ -52,7 +52,13 @@ pub struct Request {
     /// profile `i` is written to `profile-{i:04}/` with its own report.
     #[serde(default)]
     pub levels_files: Option<Vec<PathBuf>>,
-    pub terrain_file: PathBuf,
+    /// Caller-staged little-endian Float32 window terrain (NaN is nodata).
+    /// Exactly one of `terrain_file` and `terrain_tiff`.
+    #[serde(default)]
+    pub terrain_file: Option<PathBuf>,
+    /// Schemas /2-/4: the source GeoTIFF of the request grid, read with terrio.
+    #[serde(default)]
+    pub terrain_tiff: Option<PathBuf>,
     pub width: usize,
     pub height: usize,
     /// Same-CRS north-up pixel-corner geotransform; no reprojection.
@@ -106,6 +112,13 @@ pub struct InlineStorage {
     pub levels_files: Vec<PathBuf>,
     /// Window geotransform; must equal the 1D output window exactly.
     pub geo_transform: [f64; 6],
+}
+
+pub fn terrain_capability() -> Value {
+    json!({"control": "terrain_tiff", "reader": "terrio", "schemas": [NATIVE_SCHEMA, CLIPPED_SCHEMA, STORED_GRID_SCHEMA],
+        "source": "single-band Float32 tiled GeoTIFF with the request width, height and geotransform",
+        "nodata": "GDAL Float32 nodata mask (ARE_REAL_EQUAL) to NaN; other values keep their bits",
+        "equivalent": "masked GDAL window read of the same file, as caller-staged terrain_file"})
 }
 
 pub fn storage_capability() -> Value {
@@ -207,6 +220,13 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         }
     };
     let multi = req.levels_files.is_some();
+    if req.terrain_file.is_some() == req.terrain_tiff.is_some()
+        || (req.terrain_tiff.is_some() && !native)
+    {
+        return Err(MapError::Invalid(
+            "1D requires exactly one of terrain_file or terrain_tiff (schemas /2-/4)".into(),
+        ));
+    }
     if let Some(storage) = &req.storage
         && (stored_grid
             || !native
@@ -398,8 +418,24 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         }
         None => 0,
     };
+    let terrain_source = match &req.terrain_tiff {
+        Some(path) => Some(crate::one_d_terrain::inspect(
+            &base.join(path),
+            req.width,
+            req.height,
+            gt,
+        )?),
+        None => None,
+    };
+    let terrain_bytes = match &terrain_source {
+        Some(source) => source
+            .planned_bytes(window.width, threads)
+            .ok_or_else(|| MapError::Budget("terrain read plan overflow".into()))?,
+        None => 0,
+    };
     let planned = planned
-        .checked_add(storage_bytes)
+        .checked_add(terrain_bytes)
+        .and_then(|v| v.checked_add(storage_bytes))
         .and_then(|v| v.checked_add(delivery_bytes))
         .ok_or_else(|| MapError::Budget("1D request allocation overflow".into()))?;
     if planned > req.max_working_bytes {
@@ -463,7 +499,36 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
             f32::from_le_bytes,
         )?);
     }
-    let terrain = read_records(&base.join(&req.terrain_file), pixels, f32::from_le_bytes)?;
+    let terrain_tick = Instant::now();
+    let terrain = match (&terrain_source, &req.terrain_tiff, &req.terrain_file) {
+        (Some(source), Some(path), _) => {
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(pixels)
+                .map_err(|e| MapError::Budget(e.to_string()))?;
+            values.resize(pixels, f32::NAN);
+            let read_pool = if threads > 1 {
+                Some(
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .map_err(|e| MapError::Internal(e.to_string()))?,
+                )
+            } else {
+                None
+            };
+            source.read(
+                &base.join(path),
+                [window.col, window.row, window.width, window.height],
+                &mut values,
+                read_pool.as_ref(),
+            )?;
+            values
+        }
+        (_, _, Some(path)) => read_records(&base.join(path), pixels, f32::from_le_bytes)?,
+        _ => unreachable!("terrain source validated above"),
+    };
+    let terrain_seconds = terrain_tick.elapsed().as_secs_f64();
     let mask = match &delivery {
         Some(plan) => plan.read_mask(base)?,
         None => None,
@@ -607,6 +672,7 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
                 storage_wse: vec![f32::NAN; pixels],
                 depth: vec![f32::NAN; pixels],
                 wse: vec![f32::NAN; pixels],
+                chunk: 1 << 20,
             })
         }
         None => None,
@@ -688,14 +754,16 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
             Err(e) => return Err(e),
         };
         let storage_fields = match inline.as_mut() {
-            Some(inline) => match inline.compose(&storage_levels[index], &mut depth, &mut wse) {
-                Ok(fields) => Some(fields),
-                Err(e) if multi => {
-                    failure = Some((index, e));
-                    break;
+            Some(inline) => {
+                match inline.compose(&storage_levels[index], &mut depth, &mut wse, pool.as_ref()) {
+                    Ok(fields) => Some(fields),
+                    Err(e) if multi => {
+                        failure = Some((index, e));
+                        break;
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
-            },
+            }
             None => None,
         };
         let render_seconds = tick.elapsed().as_secs_f64();
@@ -729,6 +797,7 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         let shared = index == 0;
         report["timing"] = json!({
             "read_seconds": if shared { read_seconds } else { 0.0 },
+            "terrain_read_seconds": if shared { terrain_seconds } else { 0.0 },
             "allocate_seconds": if shared { alloc_seconds } else { 0.0 },
             "surface_prepare_seconds": if shared { prepare_seconds } else { 0.0 },
             "render_seconds": render_seconds,
@@ -788,6 +857,7 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         report["profiles"] = json!(summaries);
         report["timing"] = json!({
             "read_seconds": read_seconds,
+            "terrain_read_seconds": terrain_seconds,
             "allocate_seconds": alloc_seconds,
             "surface_prepare_seconds": prepare_seconds,
             "total_seconds": started.elapsed().as_secs_f64(),
@@ -821,6 +891,8 @@ struct Inline {
     storage_wse: Vec<f32>,
     depth: Vec<f32>,
     wse: Vec<f32>,
+    /// Pixels per composition chunk.
+    chunk: usize,
 }
 
 impl Inline {
@@ -831,6 +903,7 @@ impl Inline {
         levels: &[f32],
         depth: &mut Vec<f32>,
         wse: &mut Vec<f32>,
+        pool: Option<&rayon::ThreadPool>,
     ) -> Result<Value, MapError> {
         for &p in &self.prepared.pixels {
             self.storage_depth[p] = f32::NAN;
@@ -843,27 +916,66 @@ impl Inline {
             &mut self.storage_depth,
             &mut self.storage_wse,
         )?;
-        self.depth.fill(f32::NAN);
-        self.wse.fill(f32::NAN);
-        let counts = crate::coupled::compose_with_storage_into(
-            &self.zero_owners,
-            0,
-            crate::coupled::Products { depth, wse },
-            crate::coupled::Products {
-                depth: &self.dry,
-                wse: &self.dry,
-            },
-            crate::coupled::Storage {
-                owners: &self.labels,
-                area_count: self.area_count,
-                products: crate::coupled::Products {
-                    depth: &self.storage_depth,
-                    wse: &self.storage_wse,
+        // The kernel validates and writes every pixel of its slices and its
+        // counts are integer sums, so independent chunks give identical bits;
+        // the first error in chunk order is reported.
+        let chunk = self.chunk;
+        let chunks: Vec<_> = self
+            .depth
+            .chunks_mut(chunk)
+            .zip(self.wse.chunks_mut(chunk))
+            .enumerate()
+            .collect();
+        let (xs_depth, xs_wse): (&[f32], &[f32]) = (depth, wse);
+        let compose = |(i, (out_depth, out_wse)): (usize, (&mut [f32], &mut [f32]))| {
+            let range = i * chunk..i * chunk + out_depth.len();
+            crate::coupled::compose_with_storage_into(
+                &self.zero_owners[range.clone()],
+                0,
+                crate::coupled::Products {
+                    depth: &xs_depth[range.clone()],
+                    wse: &xs_wse[range.clone()],
                 },
+                crate::coupled::Products {
+                    depth: &self.dry[range.clone()],
+                    wse: &self.dry[range.clone()],
+                },
+                crate::coupled::Storage {
+                    owners: &self.labels[range.clone()],
+                    area_count: self.area_count,
+                    products: crate::coupled::Products {
+                        depth: &self.storage_depth[range.clone()],
+                        wse: &self.storage_wse[range],
+                    },
+                },
+                out_depth,
+                out_wse,
+            )
+        };
+        let parts: Vec<_> = match pool {
+            Some(pool) => {
+                use rayon::prelude::*;
+                pool.install(|| chunks.into_par_iter().map(compose).collect())
+            }
+            None => chunks.into_iter().map(compose).collect(),
+        };
+        let mut counts = crate::coupled::StorageCounts {
+            base: crate::coupled::Counts {
+                valid_pixels: 0,
+                two_d_owned_pixels: 0,
+                dry_two_d_suppressed_wet_xs: 0,
             },
-            &mut self.depth,
-            &mut self.wse,
-        )?;
+            storage_owned_pixels: 0,
+            dry_storage_suppressed_wet_xs: 0,
+        };
+        for part in parts {
+            let part = part?;
+            counts.base.valid_pixels += part.base.valid_pixels;
+            counts.base.two_d_owned_pixels += part.base.two_d_owned_pixels;
+            counts.base.dry_two_d_suppressed_wet_xs += part.base.dry_two_d_suppressed_wet_xs;
+            counts.storage_owned_pixels += part.storage_owned_pixels;
+            counts.dry_storage_suppressed_wet_xs += part.dry_storage_suppressed_wet_xs;
+        }
         std::mem::swap(depth, &mut self.depth);
         std::mem::swap(wse, &mut self.wse);
         Ok(json!({
@@ -872,5 +984,109 @@ impl Inline {
             "composition": {"method": crate::coupled::storage_method_record(),
                 "counts": serde_json::to_value(counts).map_err(|e| MapError::Internal(e.to_string()))?},
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunked_parallel_composition_matches_one_kernel_call() {
+        let n = 1003;
+        let mut seed = 7_u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as f32 / (1u64 << 31) as f32
+        };
+        let (mut xd, mut xw) = (vec![f32::NAN; n], vec![f32::NAN; n]);
+        let mut labels = vec![0_u32; n];
+        let (mut pixels, mut owners, mut ground) = (vec![], vec![], vec![]);
+        for i in 0..n {
+            if next() < 0.6 {
+                xd[i] = next() * 3.0;
+                xw[i] = 10.0 + next();
+            }
+            if next() < 0.3 {
+                labels[i] = 1 + (i % 3) as u32;
+                pixels.push(i);
+                owners.push(labels[i] - 1);
+                ground.push(if i % 17 == 0 { f32::NAN } else { 9.0 + next() });
+            }
+        }
+        let prepared = crate::storage_area::StorageAreaPixels {
+            pixels,
+            labels: owners,
+            ground,
+            count: 3,
+        };
+        let levels = [9.5_f32, 10.5, 8.0];
+        // Reference: one kernel call over the whole arrays.
+        let (mut sd, mut sw) = (vec![f32::NAN; n], vec![f32::NAN; n]);
+        crate::storage_area::apply(&prepared, &levels, 0., &mut sd, &mut sw).unwrap();
+        let (mut rd, mut rw) = (vec![0.; n], vec![0.; n]);
+        let zero = vec![0_u32; n];
+        let dry = vec![f32::NAN; n];
+        let reference = crate::coupled::compose_with_storage_into(
+            &zero,
+            0,
+            crate::coupled::Products {
+                depth: &xd,
+                wse: &xw,
+            },
+            crate::coupled::Products {
+                depth: &dry,
+                wse: &dry,
+            },
+            crate::coupled::Storage {
+                owners: &labels,
+                area_count: 3,
+                products: crate::coupled::Products {
+                    depth: &sd,
+                    wse: &sw,
+                },
+            },
+            &mut rd,
+            &mut rw,
+        )
+        .unwrap();
+        for (chunk, threads) in [(7, 3), (64, 2), (n, 1), (5000, 4)] {
+            let mut inline = Inline {
+                prepared: crate::storage_area::StorageAreaPixels {
+                    pixels: prepared.pixels.clone(),
+                    labels: prepared.labels.clone(),
+                    ground: prepared.ground.clone(),
+                    count: 3,
+                },
+                labels: labels.clone(),
+                area_count: 3,
+                zero_owners: zero.clone(),
+                dry: dry.clone(),
+                storage_depth: vec![f32::NAN; n],
+                storage_wse: vec![f32::NAN; n],
+                depth: vec![1.0; n],
+                wse: vec![1.0; n],
+                chunk,
+            };
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            // Twice: the second profile must not see the first profile's state.
+            for _ in 0..2 {
+                let (mut d, mut w) = (xd.clone(), xw.clone());
+                let fields = inline
+                    .compose(&levels, &mut d, &mut w, Some(&pool))
+                    .unwrap();
+                assert!(d.iter().zip(&rd).all(|(a, b)| a.to_bits() == b.to_bits()));
+                assert!(w.iter().zip(&rw).all(|(a, b)| a.to_bits() == b.to_bits()));
+                assert_eq!(
+                    fields["composition"]["counts"],
+                    serde_json::to_value(&reference).unwrap()
+                );
+            }
+        }
     }
 }

@@ -58,6 +58,7 @@ pub mod one_d_delivery;
 pub mod one_d_native;
 pub mod one_d_order;
 pub mod one_d_session;
+pub mod one_d_terrain;
 pub mod ownership;
 mod retained;
 pub mod scipy_interp;

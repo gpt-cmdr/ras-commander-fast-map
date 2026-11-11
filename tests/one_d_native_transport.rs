@@ -672,3 +672,78 @@ fn inline_storage_matches_storage_then_composition_bits() {
     assert!(fixture.run(bad, "bad-count").is_err());
     assert!(!fixture.root.join("bad-gt").exists() && !fixture.root.join("bad-count").exists());
 }
+
+#[test]
+fn terrain_tiff_matches_staged_terrain_bits_and_refuses_mismatched_grids() {
+    use ras_commander_fast_map::{final_tiff, native_output::FinalFormat};
+    let fixture = Fixture::populated();
+    let gt = [1000.125, 1.25, 0., 2000.25, 0., -1.25];
+    let format: FinalFormat =
+        serde_json::from_value(json!({"nodata": -9999.0, "block_size": 16})).unwrap();
+    let layout = final_tiff::Layout::new(&format, 6, 5, gt).unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    // NaN pixels become the file's nodata and must read back as NaN.
+    final_tiff::write(
+        &fixture.root.join("terrain.tif"),
+        &fixture.terrain,
+        &layout,
+        26915,
+        &pool,
+    )
+    .unwrap();
+    for (window, threads) in [(None, 1), (Some([1, 1, 4, 3]), 3)] {
+        let mut staged = fixture.request.clone();
+        let mut direct = fixture.request.clone();
+        direct.as_object_mut().unwrap().remove("terrain_file");
+        direct["terrain_tiff"] = json!("terrain.tif");
+        direct["threads"] = json!(threads);
+        direct["max_working_bytes"] = json!(64_000_000);
+        if let Some([col, row, width, height]) = window {
+            let crop: Vec<f32> = (row..row + height)
+                .flat_map(|r| fixture.terrain[r * 6 + col..r * 6 + col + width].to_vec())
+                .collect();
+            write_f32(&fixture.root.join("crop.bin"), &crop);
+            staged["terrain_file"] = json!("crop.bin");
+            for r in [&mut staged, &mut direct] {
+                r["window"] = json!({"col": col, "row": row, "width": width, "height": height});
+            }
+        }
+        let name = format!("{window:?}").replace(['[', ']', ' ', ','], "");
+        let a = fixture.run(staged, &format!("staged{name}")).unwrap();
+        let b = fixture.run(direct, &format!("direct{name}")).unwrap();
+        assert_eq!(a["valid_pixels"], b["valid_pixels"]);
+        for product in ["depth", "wse"] {
+            assert_eq!(
+                fs::read(fixture.root.join(format!("staged{name}/{product}.bin"))).unwrap(),
+                fs::read(fixture.root.join(format!("direct{name}/{product}.bin"))).unwrap(),
+                "{product} {window:?}"
+            );
+        }
+    }
+    // Header mismatches and ambiguous terrain selection refuse before outputs.
+    let other =
+        final_tiff::Layout::new(&format, 6, 5, [1000.0, 1.25, 0., 2000.25, 0., -1.25]).unwrap();
+    final_tiff::write(
+        &fixture.root.join("shifted.tif"),
+        &fixture.terrain,
+        &other,
+        26915,
+        &pool,
+    )
+    .unwrap();
+    let mut shifted = fixture.request.clone();
+    shifted.as_object_mut().unwrap().remove("terrain_file");
+    shifted["terrain_tiff"] = json!("shifted.tif");
+    let mut both = fixture.request.clone();
+    both["terrain_tiff"] = json!("terrain.tif");
+    let mut neither = fixture.request.clone();
+    neither.as_object_mut().unwrap().remove("terrain_file");
+    for (i, request) in [shifted, both, neither].into_iter().enumerate() {
+        let name = format!("terrain-refused-{i}");
+        assert!(fixture.run(request, &name).is_err(), "case {i}");
+        assert!(!fixture.root.join(&name).exists());
+    }
+}

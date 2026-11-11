@@ -37,6 +37,7 @@ pub fn method_record() -> serde_json::Value {
         "native_geotiff_outputs": true,
         "native_final_format": crate::one_d_delivery::capability(),
         "inline_storage": crate::one_d_session::storage_capability(),
+        "terrain_tiff": crate::one_d_session::terrain_capability(),
         "multi_profile": {"control": "levels_files", "min": 1, "max": crate::one_d_session::MAX_PROFILES,
             "layout": "profile-NNNN/{depth,wse}.bin and report.json per profile; top-level report lists profiles",
             "shared": "inputs, terrain and prepared surface are read and built once",

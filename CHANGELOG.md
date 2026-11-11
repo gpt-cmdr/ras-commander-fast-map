@@ -18,6 +18,18 @@ Measured on the Whisky Chitto p04 staged schema /2 requests (4,483 XS, 12,919 x
 4 CPUs): render 0.99 s at 1 worker, 0.49 s at 4; call total 4.58 s to 4.10 s;
 outputs SHA256-equal to v0.17.0.
 
+### 1D terrain read with terrio; parallel inline composition
+
+`one-d-diagnostic` schemas /2-/4 accept `terrain_tiff` (the request grid's
+single-band Float32 GeoTIFF) as an alternative to a caller-staged
+`terrain_file`. The engine checks size and geotransform, decodes tile-row
+stripes with terrio on the request pool and maps GDAL Float32 nodata
+(`ARE_REAL_EQUAL`) to NaN, exactly as a masked GDAL read; method records
+advertise `terrain_tiff` and reports add `terrain_read_seconds`. Inline storage
+composition runs in independent pixel chunks on the request pool with the
+unchanged kernel. On Whisky Chitto p04 (full grid, 8 profiles) Commander
+mapping took 22.1 s against 38.4 s, with identical products.
+
 ### Inline storage composition for 1D requests
 
 `one-d-diagnostic` schemas /2-/3 accept an optional `storage` block (polygon

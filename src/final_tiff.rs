@@ -210,7 +210,7 @@ fn span(d: usize, ratio: f64, source: usize) -> Span {
 /// GDAL's Float32 nodata mask (`GDALNoDataMaskBand`, `ARE_REAL_EQUAL`): a value
 /// within about four units in the last place of the nodata value reads as nodata.
 #[inline]
-fn masked(value: f32, nodata: f32) -> bool {
+pub(crate) fn masked(value: f32, nodata: f32) -> bool {
     value == nodata || (value - nodata).abs() < f32::EPSILON * (value + nodata).abs() * 2.0
 }
 
