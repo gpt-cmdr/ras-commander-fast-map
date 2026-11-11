@@ -1,5 +1,6 @@
-//! Effective terrain (`rasmapper-effective-terrain/1`): priority, footprint,
-//! stitch TIN, rounding, lattice and refusals on small synthetic sources.
+//! Effective terrain (`rasmapper-effective-terrain/2`): priority, footprint,
+//! export-TIN gap fill, rounding, lattice, terrain modifications and refusals on small synthetic
+//! sources.
 use ras_commander_fast_map::effective_terrain::{
     self, Effective, Grid, METHOD_ID, NODATA, Request, quantize, snap_grid,
 };
@@ -41,6 +42,46 @@ fn write_mask(dir: &Path, name: &str, w: usize, h: usize, f: impl Fn(usize, usiz
             if f(r, c) {
                 m[((r / 256) * tx + c / 256) * 65536 + (r % 256) * 256 + c % 256] = 1;
             }
+        }
+    }
+    fs::write(dir.join(name), m).unwrap();
+}
+
+/// Level-0 tile mask as terrain creation writes it: bit 0 where block
+/// `valid(row, col)`, plus bits 16/8/4/2 on valid blocks whose neighbour
+/// above/left/right/below is off (or outside the raster).
+fn write_mask_with_edges(
+    dir: &Path,
+    name: &str,
+    w: usize,
+    h: usize,
+    valid: impl Fn(usize, usize) -> bool,
+) {
+    let (tx, ty) = (w.div_ceil(256), h.div_ceil(256));
+    let mut m = vec![0_u8; tx * ty * 65536];
+    let on = |r: Option<usize>, c: Option<usize>| match (r, c) {
+        (Some(r), Some(c)) if r < h && c < w => valid(r, c),
+        _ => false,
+    };
+    for r in 0..h {
+        for c in 0..w {
+            if !valid(r, c) {
+                continue;
+            }
+            let mut b = 1_u8;
+            if !on(r.checked_sub(1), Some(c)) {
+                b |= 16;
+            }
+            if !on(Some(r), c.checked_sub(1)) {
+                b |= 8;
+            }
+            if !on(Some(r), Some(c + 1)) {
+                b |= 4;
+            }
+            if !on(Some(r + 1), Some(c)) {
+                b |= 2;
+            }
+            m[((r / 256) * tx + c / 256) * 65536 + (r % 256) * 256 + c % 256] = b;
         }
     }
     fs::write(dir.join(name), m).unwrap();
@@ -126,6 +167,7 @@ fn single_source_interior_is_source_and_edges_need_a_full_quad() {
             }
         }
     }
+    // Schema 1 runs the /2 rule, so the receipt names /2.
     assert_eq!(out.report["method_id"], METHOD_ID);
 }
 
@@ -154,7 +196,10 @@ fn coarse_source_uses_the_two_diagonal_mean() {
 }
 
 /// Two sources on one lattice: the high source has a hole; the low source
-/// fills it, and its own pixels under the high source never show.
+/// fills it, and its own pixels under the high source never show. Masks are
+/// per render block (the quad between four cell centres), as terrain
+/// creation writes them: a block is on when its four corners are valid and
+/// no higher-priority source owns it.
 #[test]
 fn priority_footprint_and_fall_through() {
     let dir = scratch();
@@ -166,9 +211,18 @@ fn priority_footprint_and_fall_through() {
     let low = vec![100.0_f32; 400];
     write_source(&dir, "high.tif", g, high);
     write_source(&dir, "low.tif", g, low);
-    write_mask(&dir, "high.u1", 20, 20, |r, c| !hole(r, c));
-    // The low source owns only the hole.
-    write_mask(&dir, "low.u1", 20, 20, hole);
+    let corners_valid = |r: usize, c: usize| {
+        r + 1 < 20
+            && c + 1 < 20
+            && [(r, c), (r, c + 1), (r + 1, c), (r + 1, c + 1)]
+                .iter()
+                .all(|&(a, b)| !hole(a, b))
+    };
+    write_mask(&dir, "high.u1", 20, 20, corners_valid);
+    // The low source owns only blocks the high source leaves off.
+    write_mask(&dir, "low.u1", 20, 20, |r, c| {
+        r + 1 < 20 && c + 1 < 20 && !corners_valid(r, c)
+    });
     let srcs = json!([
         {"path": "high.tif", "mask": mask("high.u1", 20, 20)},
         {"path": "low.tif", "mask": mask("low.u1", 20, 20)},
@@ -176,14 +230,12 @@ fn priority_footprint_and_fall_through() {
     let out = effective_terrain::compute(&request(srcs, json!({})), &dir).unwrap();
     let at = |r: usize, c: usize| out.values[r * 20 + c];
     assert_eq!(at(2, 2), 500.0);
+    assert_eq!(at(5, 14), 500.0);
     assert_eq!(at(9, 9), 100.0, "hole filled from the lower source");
-    // Pixel (7,7): the high pixel containing it is valid, its quad reaches the
-    // hole, and the low quad touches the low footprint at (8,8).
-    assert_eq!(at(7, 7), 100.0);
-    // Pixel (6,6): high quad (6..7, 6..7) complete -> high wins.
-    assert_eq!(at(6, 6), 500.0);
-    // Last row/column: no complete quad in either source -> nodata.
-    assert_eq!(at(19, 5), NODATA);
+    assert_eq!(at(10, 10), 100.0);
+    // Pixel (7,7) sits on a block corner: whichever adjacent block the
+    // lattice picks, one of the two sources answers.
+    assert!([100.0, 500.0].contains(&at(7, 7)));
     // Reversed priority with a mask that owns nothing: the low source never shows.
     write_mask(&dir, "none.u1", 20, 20, |_, _| false);
     let srcs = json!([
@@ -195,13 +247,14 @@ fn priority_footprint_and_fall_through() {
     assert_eq!(out.report["sources"][1]["pixels"], 0);
 }
 
+/// The request's stored stitch TIN is accepted for compatibility but no
+/// longer part of the rule: RAS Mapper's export does not use it.
 #[test]
-fn stitch_tin_wins_over_sources() {
+fn stored_stitch_tin_is_accepted_and_not_used() {
     let dir = scratch();
     let g = grid(0.0, 100.0, 10.0, 10, 10);
     write_source(&dir, "a.tif", g, vec![50.0; 100]);
     write_mask(&dir, "a.u1", 10, 10, |_, _| true);
-    // Triangle covering pixel centres (row 0..2, col 0..2) region, z = 10 + x.
     let pts: [[f64; 4]; 3] = [
         [0.0, 100.0, 10.0, 10.0],
         [40.0, 100.0, 50.0, 10.0],
@@ -214,11 +267,69 @@ fn stitch_tin_wins_over_sources() {
     let tin = json!({"points": {"path": "p.f8", "dtype": "<f8", "shape": [3, 4]},
                      "triangles": {"path": "t.i4", "dtype": "<i4", "shape": [1, 3]}});
     let srcs = json!([{"path": "a.tif", "mask": mask("a.u1", 10, 10)}]);
-    let out = effective_terrain::compute(&request(srcs, json!({"stitch_tin": tin})), &dir).unwrap();
-    assert_eq!(out.values[0], 15.0); // x = 5
-    assert_eq!(out.values[1], 25.0); // x = 15
-    assert_eq!(out.values[5], 50.0);
-    assert_eq!(out.report["stitch_tin"]["pixels"], 10);
+    let out = effective_terrain::compute(&request(srcs.clone(), json!({"stitch_tin": tin})), &dir)
+        .unwrap();
+    assert_eq!(out.values[0], 50.0);
+    assert_eq!(out.values[1], 50.0);
+    assert_eq!(out.report["stitch_tin"]["supplied"], true);
+    assert_eq!(out.report["stitch_tin"]["used"], false);
+    // Still validated.
+    let bad = json!({"points": {"path": "p.f8", "dtype": "<f4", "shape": [3, 4]},
+                     "triangles": {"path": "t.i4", "dtype": "<i4", "shape": [1, 3]}});
+    let err = effective_terrain::compute(&request(srcs, json!({"stitch_tin": bad})), &dir);
+    assert_eq!(err.err().unwrap().kind(), "invalid");
+}
+
+/// A nodata source column `gap` cells wide: one cell (two off render
+/// blocks) is bridged by the per-tile export TIN with the linear value
+/// across the gap; two cells are not.
+fn gap_terrain(gap: usize) -> (Vec<f32>, Vec<f32>) {
+    let dir = scratch();
+    let g = grid(1000.0, 2000.0, 10.0, 20, 12);
+    let plane_values = plane(&g);
+    let hole = |c: usize| (8..8 + gap).contains(&c);
+    let values: Vec<f32> = (0..240)
+        .map(|i| {
+            if hole(i % 20) {
+                NODATA
+            } else {
+                plane_values[i]
+            }
+        })
+        .collect();
+    write_source(&dir, "a.tif", g, values);
+    write_mask_with_edges(&dir, "a.u1", 20, 12, |r, c| {
+        r + 1 < 12 && c + 1 < 20 && !hole(c) && !hole(c + 1)
+    });
+    let req = request(
+        json!([{"path": "a.tif", "mask": mask("a.u1", 20, 12)}]),
+        json!({}),
+    );
+    let out = effective_terrain::compute(&req, &dir).unwrap();
+    assert!(out.report["export_tin"]["segments"].as_u64().unwrap() > 0);
+    assert_eq!(out.report["export_tin"]["failed_tiles"], 0);
+    (out.values, plane_values)
+}
+
+#[test]
+fn export_tin_bridges_a_one_cell_gap() {
+    let (out, plane_values) = gap_terrain(1);
+    for r in 1..11 {
+        for c in [7, 8] {
+            let i = r * 20 + c;
+            assert_eq!(out[i], plane_values[i], "({r},{c})");
+        }
+    }
+}
+
+#[test]
+fn export_tin_leaves_a_two_cell_gap() {
+    let (out, _) = gap_terrain(2);
+    for r in 0..12 {
+        for c in [8, 9] {
+            assert_eq!(out[r * 20 + c], NODATA, "({r},{c})");
+        }
+    }
 }
 
 #[test]
@@ -303,4 +414,84 @@ fn run_writes_tiled_geotiff_and_report() {
     assert_eq!(info.nodata, Some(NODATA as f64));
     assert_eq!(info.block, (256, 256));
     assert!(out.join("report.json").is_file());
+}
+
+/// Schema 2: modification layers are applied after the mosaic, Priority 0
+/// last (it wins), and every result is rounded like the terrain.
+#[test]
+fn modifications_follow_priority_and_round() {
+    let dir = scratch();
+    let g = grid(1000.0, 2000.0, 10.0, 20, 12);
+    write_source(&dir, "a.tif", g, vec![50.0; 20 * 12]);
+    write_mask(&dir, "a.u1", 20, 12, |_, _| true);
+    // A SetValue pad (Priority 1) and a SetIfLower pad (Priority 0) over the
+    // same cells: Priority 0 is applied last, so the lower value survives.
+    let ring = json!([[
+        [1040.0, 1920.0],
+        [1120.0, 1920.0],
+        [1120.0, 1980.0],
+        [1040.0, 1980.0]
+    ]]);
+    let req = request(
+        json!([{"path": "a.tif", "mask": mask("a.u1", 20, 12)}]),
+        json!({
+            "schema": "ras-commander-effective-terrain-request/2",
+            "modifications": 2,
+            "modification_layers": [
+                {"kind": "polygon", "name": "cut", "priority": 0,
+                 "features": [{"elevation_type": "SetIfLower", "elevation": 40.01, "rings": ring}]},
+                {"kind": "polygon", "name": "pad", "priority": 1,
+                 "features": [{"elevation_type": "SetValue", "elevation": 60.0, "rings": ring}]}
+            ]
+        }),
+    );
+    let out = effective_terrain::compute(&req, &dir).unwrap();
+    // Pixel (row 5, col 6): centre (1065, 1945) is inside both pads.
+    assert_eq!(out.values[5 * 20 + 6], quantize(40.01));
+    assert_eq!(out.values[0], 50.0);
+    let layers = out.report["modifications"]["layers"].as_array().unwrap();
+    assert_eq!(layers[0]["name"], "pad");
+    assert_eq!(layers[1]["name"], "cut");
+    assert_eq!(out.report["method_id"], METHOD_ID);
+}
+
+#[test]
+fn modification_count_must_match_and_v1_refuses_layers() {
+    let dir = scratch();
+    let srcs = json!([{"path": "missing.tif", "mask": mask("m.u1", 10, 10)}]);
+    let layer = json!([{"kind": "ellipse", "name": "e", "priority": 0,
+        "features": [{"elevation_type": "SetValue", "elevation": 1.0, "center": [0.0, 0.0], "radius_x": 1.0, "radius_y": 1.0}]}]);
+    let mismatch = request(
+        srcs.clone(),
+        json!({"schema": "ras-commander-effective-terrain-request/2", "modifications": 2, "modification_layers": layer.clone()}),
+    );
+    assert_eq!(
+        effective_terrain::compute(&mismatch, &dir)
+            .err()
+            .unwrap()
+            .kind(),
+        "invalid"
+    );
+    let v1 = request(
+        srcs.clone(),
+        json!({"modifications": 1, "modification_layers": layer}),
+    );
+    assert_eq!(
+        effective_terrain::compute(&v1, &dir).err().unwrap().kind(),
+        "unsupported"
+    );
+    let ground_line_set_value = request(
+        srcs,
+        json!({"schema": "ras-commander-effective-terrain-request/2", "modifications": 1, "modification_layers": [
+            {"kind": "ground_line", "name": "g", "priority": 0, "subtype": "levee", "features": [
+                {"elevation_type": "SetValue", "top_width": 2.0, "left_slope": 1.0, "right_slope": 1.0,
+                 "max_reach": 10.0, "points": [[0.0, 0.0], [5.0, 0.0]], "profile": [[0.0, 1.0], [5.0, 1.0]]}]}]}),
+    );
+    assert_eq!(
+        effective_terrain::compute(&ground_line_set_value, &dir)
+            .err()
+            .unwrap()
+            .kind(),
+        "unsupported"
+    );
 }

@@ -58,8 +58,13 @@ registries that have not yet received this version when retrying publication.
 
 ## Mapping integration gates
 
-Unmodified effective-terrain schema `/1` retains its numerical contract.
-Terrain modifications require separate qualification. Row streaming is opt-in
+Effective terrain runs one rule, `rasmapper-effective-terrain/2`, for both
+request schemas: schema 1 (unmodified terrains) and schema 2 (with
+modification layers). The `/1` numerical contract is intentionally not
+retained: the `/2` rule reproduces the HEC-RAS export more closely, and every
+receipt reports `/2`. Release notes for the first release with `/2` must call
+out that schema 1 values change, and qualification must cover base and
+modified terrains separately, against repeat HEC-RAS exports. Row streaming is opt-in
 (0 default, at most 4096 rows), restricted to plain corner/native TIFF output;
 full ownership and ground remain resident. Installed-wheel/native fixture
 checks must identify the exact artifact, input scope and options. Windows local

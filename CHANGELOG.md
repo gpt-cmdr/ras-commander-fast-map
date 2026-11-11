@@ -1,5 +1,161 @@
 # Changelog
 
+## Unreleased
+
+Terrain modifications are no longer parked: `ras2fim-batch method` advertises
+`effective_terrain` as `rasmapper-effective-terrain/2` (request schemas 1 and
+2), with the qualified modification forms and every refused form under
+`effective_terrain.modifications`. Schema 1 requests are still accepted but
+run the /2 rule, so their receipts report `/2`; their values differ from /1
+engines (render-block sampling and the export TIN), and `/1` is no longer
+listed as compatible. This intentionally replaces the release gate that kept the `/1`
+numerical contract (`docs/releasing.md`). Whole modified real terrains match the
+HEC-RAS 7.0.1 export on values except pixels in export-TIN gap fills and
+isolated 1/32 ft ties; see `feature_dev_notes/effective_terrain_modifications/`.
+
+### Effective terrain: control points, boundary elevations, Add, NaN templates, HEC-RAS 6.6
+
+Source: an interoperability study of RasMapperLib 7.0.1 (no vendor code used
+or copied), checked against HEC-RAS exports.
+
+Pipeline:
+- The mosaic and the export TIN keep binary32 values through the modifications.
+- Values are rounded to 1/32 once at the end, as RAS Mapper's TIFF writer does.
+- Base output is unchanged.
+
+New forms supported:
+- **Ground-line control points.** Points within the Elev Pt Tolerance set the profile at their nearest centerline station. With no stored profile, the ends take the first and last point's elevation.
+- **Polygons with a control point inside, or with boundary elevations.** These use RAS Mapper's perimeter TIN, built on the export TIN's Delaunay factory. The boundary profile comes from perimeter control points, or else from the stored profile; points inside the polygon are mass points.
+- **Add**, for ground lines and polygons: terrain plus the modification, in binary32 on the unrounded terrain.
+- **NaN templates and negative slopes.** A NaN Max Reach draws nothing, a NaN slope is read as 3, and negative slopes need no special case.
+- **`hecras_version: "6.6"`.** Ground lines with Max Reach not wider than one cell are not drawn. Named ground lines and terrain-sampled boundaries are refused under 6.6.
+
+New optional request fields:
+- Layer `control_points` (`x`, `y`, `elevation`; `null` = NaN).
+- Polygon `generate_boundary`, `use_shape_z`, `profile`, `vertex_z`, `elev_pt_tolerance`, and polygon-layer `length_units`.
+- Ground-line template values accept `null`.
+- Request `hecras_version`.
+
+Qualification (whole terrains vs HEC-RAS 7.0.1 exports; pixels where two exports differ excluded):
+- Terrain C, all 13 layers, now unreduced: 0 mask and 4 value differences at 1/32 ft in 379.0M px.
+- Terrain E, 5 of 6 layers (a 2,862-point control-point levee layer among them), 1.14G px: 0 mask, 3 values at 1/32 ft.
+- Terrain D, 228 of 229 layers (202 boundary-elevation polygon layers and 20 channel layers with control points), 924.6M px: 0 mask, 3 values at 1/32 ft.
+- Synthetic cases for each form: at most 2 px at 1/32 ft per case.
+- HEC-RAS 6.6 exports of the synthetic cases: every accepted case matches under `hecras_version: "6.6"`.
+
+Still refused:
+- Boundary elevations sampled from the terrain. This is the one remaining layer each in D and E.
+- Shape-Z polygons.
+- Multi-part polygons that need a TIN.
+- Named ground lines with control points or a NaN template.
+- A NaN Top Width with a finite Max Reach, which makes RAS Mapper's export fail.
+
+### Effective terrain: named ground lines (RAS Mapper's system path)
+
+Ground lines with a `System Name`, including a lone named feature, are now
+built as RasMapperLib 7.0.1 builds them instead of being refused
+(interoperability study, prose findings only; no vendor code used or copied).
+Same-name features with equal elevation type and Elev Pt Tolerance are joined
+end to start within 60 ft in feature-ID order. Their profiles are concatenated,
+and each member's first point becomes a control cross section that wins at its
+station, so at a junction the next feature's start elevation replaces the
+previous feature's end. Between cross sections, toe and ridge stream lines are
+grown from the centerline to cross-section lines in lateral steps. A changing
+template with a positive Transition Percent ends its section early. The system
+is drawn once, at its highest member feature ID, with the ribbon TIN and
+rasterizer of single features. New optional ground-line feature fields:
+`transition_percent` and `elev_pt_tolerance` (default 0, `null` = NaN).
+
+Qualification (HEC-RAS 7.0.1 exports, whole terrain):
+- Named writer cases W3, W3n, W4 and M2: no modified pixel differs (before: 1,505 to 1,507 pixels up to 1,032 ft, and 159 pixels up to 77 ft).
+- Synthetic systems (joined channels with a junction gap, Transition Percent 0, 0.5, 1 and NaN, a profile not starting at 0, systems split by elevation type, SetValue systems): 1 of 14,179 pixels differs, at 1/32 ft.
+- Terrain C, on an HDF copy reduced to its 10 accepted layers, including the named systems and a SetValue channel layer: 0 mask and 4 value differences at 1/32 ft in 379.0M pixels (674.6M on the export grid). Every layer is exact except one 1/32 ft pixel.
+- Terrains A and B1-B4 and the earlier synthetic cases are unchanged.
+
+Known difference: RasMapperLib's .NET Framework `Math.Pow` is not correctly rounded. On terrain C this moves four stream-line points by up to 6e-5 ft, with no pixel effect in the measured cases.
+
+### Effective terrain: RAS Mapper's ground-line ribbon TIN and inclusive ellipses
+
+Ground lines (`terrain_mods`) now follow RasMapperLib 7.0.1's export arithmetic
+instead of the fitted template (interoperability study, prose findings only; no
+vendor code used or copied): binary32 centre profile (stations shifted to 0,
+clamped to the length, 100 ft / 100/3.281 m densification with RAS Mapper's
+running-start arithmetic, clamped queries); toe and ridge offset lines carrying
+the centerline station as M, with intersection or arc joints, square ends,
+self-intersection trimming and M-fraction injection of the profile stations;
+binary32/binary64 ridge and toe elevations; a five-ribbon zipper TIN (not
+Delaunay) rasterized per 256-pixel output tile with the export TIN rasterizer,
+the last triangle of a feature winning. Combination is RAS Mapper's binary32
+replacement (strict for SetIfHigher/SetIfLower). Ellipses are inclusive
+(`<= 1`) at output-tile pixel centres and may be rotated (new optional
+`rotation`, degrees). Newly supported: ground-line SetValue and Max Reach <=
+Top Width. New optional `system_name` (RAS Mapper builds named ground lines
+through a separate system path, measured 1,506 px apart on one channel; now
+supported, see the entry above). Newly refused: negative side slopes. New
+optional layer field `length_units` (`feet` default, `meters`). Whole terrains
+vs HEC-RAS 7.0.1 exports with modifications (export a, pixels where two
+exports differ excluded): B2 443 -> 0 value differences, B1 3 -> 0, B3, B4 and
+A unchanged, and no remaining difference lies inside a modification footprint.
+Synthetic 20 ft terrains with blank System Names: 0 modified pixels differ on a
+22.5 km channel, a 21.2 km levee, a combined case, short-segment levees,
+ground-line SetValue, Max Reach <= Top Width and five rotated ellipses; 2 of
+8,935 pixels at 1/32 ft on a sharp-bend/hairpin channel case. Method IDs and
+request schemas are unchanged; the new fields are optional.
+
+### Effective terrain: RAS Mapper's per-tile export TIN (gap fill)
+
+After sampling, each 256-pixel output tile now triangulates the edges of valid
+render blocks that border off blocks and rasterizes the TIN over the tile, as
+RasMapperLib 7.0.1's export does (interoperability study, prose findings only;
+no vendor code used or copied): segments from every visited source with a
+two-block halo, hash-ordered per source, constrained Delaunay insertion, data
+side and wider-than-2.0001-cells triangles deleted, inclusive edge-function
+rasterization. One-cell gaps and source seams are bridged. The terrain HDF's
+stored stitch TIN is no longer used for values; `stitch_tin` stays accepted and
+validated in the request. On five real HEC-RAS 7.0.1 terrains (modifications
+off, whole terrain vs export a, excluding pixels where two exports differ): B3
+bit-identical; B4 1 mask pixel; B1 and B2 3 mask pixels; 0 values on all B
+terrains; A 0 mask and 300 values (354 vs export a and 406 vs export b
+overall), all inside gap fills where the segment order ties decide. The report
+gains `export_tin` and `sample_seconds`; `stitch_tin` reports
+`{"supplied", "used": false}`. Method IDs and request schemas are unchanged.
+
+### Effective terrain: RAS Mapper's render-block sampling
+
+The base mosaic now samples each source by render block, as RasMapperLib
+7.0.1's export does: 256-pixel output tiles with recomputed tile pitch and
+pixel size, block tiles half a cell inside each source, validity from bit 0 of
+the block's mask byte (first source to answer wins), four-triangle values in
+binary64 with the block-centre term in binary32, and the extent-derived cell
+size for the default lattice. On five real multi-source terrains (HEC-RAS
+7.0.1, modifications off) this leaves no value differences and no extra valid
+pixels outside the stitch TIN. B3 drops from 30,628 to 3,227 mask differences
+and B4 from 479 to 1 value difference. The remaining differences were pixels
+RAS Mapper fills with its own per-tile export TIN, now reproduced (see the
+export TIN entry above). Method IDs are unchanged.
+
+### Terrain modifications on the effective terrain (`rasmapper-effective-terrain/2`)
+
+`ras2fim-batch effective-terrain` accepts request schema
+`ras-commander-effective-terrain-request/2` with `modification_layers` (one
+entry per `/Modifications` layer of the terrain HDF; `modifications` must equal
+their number) and applies them after the mosaic, as
+`RasTerrain.export_rasmapper_terrain(rasterize_modifications=True)` does in
+HEC-RAS 7.0.1. Rules were fitted pixel by pixel on exports of RAS-Mapper-authored
+terrains (no vendor code): ground lines are a triangulated template (centerline
+split at profile stations, crest at Top Width/2, toe at Max Reach/2 = total
+width, H:V slopes, beveled convex and mitered concave joints, square ends,
+Delaunay quad diagonals); constant polygons fill pixel centres inside (even-odd);
+ellipses fill centres strictly inside; SetValue / SetIfHigher / SetIfLower, a
+nodata pixel inside takes the modification value; layers in descending Priority
+(Priority 0 last). Refused: ground-line SetValue/Add, Max Reach <= Top Width,
+polygons with boundary elevations, rotated ellipses, unknown kinds. Schema 1 is
+unchanged; sources may carry their own caller-verified `crs_identity` when
+their WKT text differs from the first source's. Qualification (outside the
+stitch TIN, at the time of parking): terrain A 0 differences; B1 3 px off by
+1/32 ft at exact ties; B2 432 px (96 above 1/32, max 0.84 ft) on one
+levee/channel pair with short segments. Superseded by the entries above.
+
 ## 0.17.0 - 2026-11-10
 
 ### Final-format native delivery
