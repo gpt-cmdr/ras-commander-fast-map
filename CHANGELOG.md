@@ -8,7 +8,8 @@ Terrain modifications are no longer parked: `ras2fim-batch method` advertises
 `effective_terrain.modifications`. Schema 1 requests are still accepted but
 run the /2 rule, so their receipts report `/2`; their values differ from /1
 engines (render-block sampling and the export TIN), and `/1` is no longer
-listed as compatible. Whole modified real terrains match the
+listed as compatible. This intentionally replaces the release gate that kept the `/1`
+numerical contract (`docs/releasing.md`). Whole modified real terrains match the
 HEC-RAS 7.0.1 export on values except pixels in export-TIN gap fills and
 isolated 1/32 ft ties; see `feature_dev_notes/effective_terrain_modifications/`.
 
