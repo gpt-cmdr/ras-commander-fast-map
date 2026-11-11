@@ -10,30 +10,42 @@
 //! 7.0.1 (one to three sources, coarse-over-fine, fine-over-coarse,
 //! non-commensurate lattices, nodata holes).
 //!
-//! Per output pixel centre `p`:
-//! 1. **Stitch TIN first.** If `p` lies in a stitch TIN triangle (inclusive,
-//!    barycentric weights `>= -1e-9`, later triangles overwrite earlier ones),
-//!    the value is the triangle's linear interpolation.
-//! 2. Otherwise each source is tried in priority order. Its *quad* is the four
-//!    pixel centres around `p`. A source answers when all four are valid and,
-//!    once a higher-priority source has a valid pixel *containing* `p`, at
-//!    least one of the four is in the source's footprint (bit 0 of its level-0
-//!    terrain-HDF tile `Mask`). The value is the mean of the two diagonal
-//!    triangulations of the quad (equivalently four triangles around the quad
-//!    centre); the fractional offsets are rounded to binary32, the
-//!    arithmetic is binary64.
-//! 3. Otherwise nodata.
+//! The rule follows RasMapperLib's export path as established by an
+//! interoperability study of HEC-RAS 7.0.1 (prose findings only; no vendor
+//! code is used or copied):
+//!
+//! 1. **Output lattice.** The export is written in 256 x 256 tiles. The tile
+//!    pitch and each tile's pixel size are recomputed from tile extents, and
+//!    pixel centres are `tile_min + pixel * (i + 0.5)` within each tile.
+//!    The default cell size is the finest source's extent-derived cell size
+//!    (extent width / columns or height / rows, whichever is larger), not
+//!    its GeoTIFF cell size.
+//! 2. **Render blocks.** A source is sampled by render block: the quad
+//!    between four adjacent source cell centres, grouped in 256 x 256 block
+//!    tiles that start half a cell inside the source extent. The block and
+//!    its binary32 fractions follow the same recomputed tile geometry; a
+//!    pixel centre that coincides with a source cell centre is assigned by
+//!    that arithmetic, not by a tolerance.
+//! 3. **Validity.** A block answers only when bit 0 of its level-0 terrain-HDF
+//!    tile `Mask` byte is set (all four corners valid and the block owned by
+//!    this source; terrain creation clears blocks under higher-priority
+//!    sources). Sources are tried in priority order; the first to answer a
+//!    pixel wins.
+//! 4. **Value.** The block is split along both diagonals into four
+//!    triangles. Arithmetic is binary64 on the binary32 corner values and
+//!    fractions, with the block-centre term held in binary32.
+//! 5. **Stitch TIN.** Pixels inside the terrain HDF's stored stitch TIN
+//!    (inclusive barycentric weights `>= -1e-9`, later triangles win) take
+//!    the triangle's linear value. RAS Mapper instead triangulates the
+//!    render-block edges of each output tile during the export; that is not
+//!    reproduced yet, so pixels near nodata edges and source seams can differ
+//!    (see `method_record`).
 //!
 //! Every value is rounded to binary32 and then to the nearest 1/32 (ties to
 //! even), as RAS Mapper stores terrain values.
 //!
-//! The output lattice defaults to the export's: the finest source (ties by
-//! priority), over the union of the source extents snapped outward.
-//!
 //! Terrain modifications (schema 2) are applied after the mosaic by
-//! `terrain_mods`. Not reproduced: unqualified modification forms (refused), and
-//! a number of pixels in stitch-TIN
-//! corners where RAS Mapper itself is not stable (see `method_record`).
+//! `terrain_mods`; unqualified modification forms are refused.
 use crate::{
     MapError,
     model::{self, CrsIdentity, NodataPolicy, QueryConvention},
@@ -159,18 +171,19 @@ pub fn method_record() -> Value {
             "reference": "RasTerrain.export_rasmapper_terrain(downsample_factor=1, rasterize_modifications=True), HEC-RAS 7.0.1",
             "modifications": crate::terrain_mods::method_record()
         },
-        "lattice": "finest source (ties: priority), union of source extents snapped outward; or a supplied grid",
-        "order": "stitch TIN first; then sources in priority order",
-        "source_test": "all four quad centres valid; after a higher-priority source has a valid pixel containing the point, at least one quad centre must be in the source footprint (mask bit 0 and valid)",
-        "interpolation": "mean of the two diagonal triangulations of the quad; offsets rounded to binary32, binary64 arithmetic",
-        "stitch_tin": "linear in the containing triangle, weights >= -1e-9, later triangles win",
+        "lattice": "finest source by extent-derived cell size (ties: priority), union of source extents snapped outward; or a supplied grid. Pixel centres follow the export's 256-pixel tiles with recomputed tile pitch and pixel size",
+        "order": "stitch TIN first; then sources in priority order, first to answer wins",
+        "source_test": "render block (quad between four source cell centres, 256-block tiles half a cell inside the source extent) located with recomputed tile geometry; the block answers when bit 0 of its level-0 mask byte is set",
+        "interpolation": "four triangles on both block diagonals; binary32 fractions and corners, binary64 arithmetic, block-centre term held in binary32",
+        "stitch_tin": "stored terrain-HDF stitch TIN: linear in the containing triangle, weights >= -1e-9, later triangles win (RAS Mapper's per-tile export TIN is not reproduced yet)",
         "rounding": "binary32, then nearest 1/32 with ties to even",
         "nodata": NODATA,
         "qualified": {
-            "BaldEagleCrkMulti2D Terrain50 (2 sources, 20 ft + 36.5 ft)": "197,179,058 valid px; valid mask identical; 8 values differ, all in stitch-TIN corners",
-            "synthetic HEC-RAS 7.0.1 terrains (1-3 sources)": "4 of 5 bit-identical; 5 stitch-TIN corner px differ on the fifth (687,908 valid)"
+            "synthetic HEC-RAS 7.0.1 terrains (1-3 sources)": "4 of 5 bit-identical; 5 stitch-TIN corner px differ on the fifth (687,908 valid)",
+            "real multi-source terrains (5, 1-5 sources, 1 ft and 3.28 ft, modifications off)": "with the stored stitch TIN disabled: 0 value differences and no pixel valid where the export is nodata; the only differences are pixels the export fills with its per-tile TIN (2,762 to 24,952 per terrain)",
+            "BaldEagleCrkMulti2D Terrain50 (2 sources, 20 ft + 36.5 ft)": "qualified under the previous rule (8 stitch-TIN values differed); not re-run since the render-block rule"
         },
-        "known_differences": "a few pixels where a stitch TIN triangle meets a nodata corner; RAS Mapper's own exports of one terrain disagree there (2 px of T2 change when an unrelated modification is rasterized)",
+        "known_differences": "near nodata edges and source seams: RAS Mapper triangulates render-block edges per 256-pixel output tile during the export and fills gaps of one cell; this engine uses the stored stitch TIN instead, which fills a different set of pixels. RAS Mapper's own repeated exports also disagree on some of these pixels",
         "refused": "terrains with modifications (parked; see parked.modifications), non-float32/rotated/non-square sources, sources in different CRSs"
     })
 }
@@ -373,11 +386,150 @@ fn rasterize_tin(tin: &Tin, grid: &Grid, out: &mut [f32]) -> (Vec<u64>, u64) {
     (hit, count)
 }
 
-/// One source with its footprint mask file.
+/// One source with its render-block mask file and lattice.
 struct SourceData {
     terrain: NativeTerrain,
     mask_path: std::path::PathBuf,
     tiles_x: usize,
+    lattice: SourceLattice,
+}
+
+/// A source's render-block lattice. A render block is the quad between four
+/// adjacent source cell centres, so the block grid starts half a cell inside
+/// the source extent; blocks are grouped in 256 x 256 tiles. Sizes are
+/// recomputed from extents the way RAS Mapper derives them (not taken from
+/// the GeoTIFF cell size): which block a pixel centre that coincides with a
+/// source cell centre falls into depends on those last bits.
+#[derive(Clone, Copy, Debug)]
+struct SourceLattice {
+    /// Cell size as RAS Mapper derives it: max of extent width / columns and
+    /// extent height / rows.
+    cell: f64,
+    min_x: f64,
+    max_y: f64,
+    /// Block-tile pitch (about 256 source cells).
+    pitch: f64,
+    tiles_x: usize,
+    tiles_y: usize,
+    /// Block height of a tile in block-tile row 0 (used for every column).
+    q_row0: f64,
+    /// Block width of a tile in block-tile column 0 (used for every row).
+    q_col0: f64,
+}
+
+impl SourceLattice {
+    fn new(gt: &[f64; 6], width: usize, height: usize) -> Self {
+        let (w, h) = (width as f64, height as f64);
+        let (left, top) = (gt[0], gt[3]);
+        let (right, bottom) = (left + w * gt[1], top + h * gt[5]);
+        let cell = ((right - left) / w).max((top - bottom) / h);
+        let (tiles_x, tiles_y) = (width.div_ceil(TILE), height.div_ceil(TILE));
+        let tile_span = TILE as f64 * cell;
+        let min_x = left + cell * 0.5;
+        let max_y = top - cell * 0.5;
+        let max_x = min_x + tiles_x as f64 * tile_span;
+        let min_y = max_y - tiles_y as f64 * tile_span;
+        let pitch = ((max_x - min_x) / tiles_x as f64).max((max_y - min_y) / tiles_y as f64);
+        SourceLattice {
+            cell,
+            min_x,
+            max_y,
+            pitch,
+            tiles_x,
+            tiles_y,
+            q_row0: (max_y - (max_y - pitch)) / TILE as f64,
+            q_col0: ((min_x + pitch) - min_x) / TILE as f64,
+        }
+    }
+
+    /// Global block column and binary32 fraction for `x`, or `None` outside
+    /// the block tiles.
+    #[inline]
+    fn col(&self, x: f64) -> Option<(usize, f32)> {
+        let t = ((x - self.min_x) / self.pitch).floor();
+        if !(t >= 0.0 && t < self.tiles_x as f64) {
+            return None;
+        }
+        let lo = self.min_x + self.pitch * t;
+        let q = (((self.min_x + self.pitch * (t + 1.0)) - lo) / TILE as f64).max(self.q_row0);
+        let c = ((x - lo) / q).floor();
+        let (c, f) = if c < 0.0 {
+            (0.0, 0.0)
+        } else if c >= TILE as f64 {
+            (TILE as f64 - 1.0, 1.0)
+        } else {
+            (c, ((x - (lo + q * c)) / q) as f32)
+        };
+        Some((t as usize * TILE + c as usize, f))
+    }
+
+    /// Global block row and binary32 fraction (downward) for `y`.
+    #[inline]
+    fn row(&self, y: f64) -> Option<(usize, f32)> {
+        let t = ((self.max_y - y) / self.pitch).floor();
+        if !(t >= 0.0 && t < self.tiles_y as f64) {
+            return None;
+        }
+        let hi = self.max_y - self.pitch * t;
+        let q = self
+            .q_col0
+            .max((hi - (self.max_y - self.pitch * (t + 1.0))) / TILE as f64);
+        let r = ((hi - y) / q).floor();
+        let (r, f) = if r < 0.0 {
+            (0.0, 0.0)
+        } else if r >= TILE as f64 {
+            (TILE as f64 - 1.0, 1.0)
+        } else {
+            (r, (((hi - q * r) - y) / q) as f32)
+        };
+        Some((t as usize * TILE + r as usize, f))
+    }
+}
+
+/// The export's output lattice: 256-pixel tiles whose pitch and pixel size
+/// RAS Mapper recomputes from tile extents, so pixel centres differ from
+/// `origin + (i + 0.5) * cell` in the last bits.
+struct OutputLattice {
+    min_x: f64,
+    max_y: f64,
+    pitch: f64,
+    tile_w: Vec<f64>,
+    tile_h: Vec<f64>,
+}
+
+impl OutputLattice {
+    fn new(grid: &Grid) -> Self {
+        let (tx, ty) = (grid.width.div_ceil(TILE), grid.height.div_ceil(TILE));
+        let (min_x, max_y, cs) = (grid.origin_x, grid.origin_y, grid.cell_size);
+        let max_x = min_x + tx as f64 * cs * TILE as f64;
+        let min_y = max_y - ty as f64 * cs * TILE as f64;
+        let pitch = ((max_x - min_x) / tx as f64).max((max_y - min_y) / ty as f64);
+        let span = |a: f64, b: f64| (b - a) / TILE as f64;
+        OutputLattice {
+            min_x,
+            max_y,
+            pitch,
+            tile_w: (0..tx)
+                .map(|m| span(min_x + pitch * m as f64, min_x + pitch * (m + 1) as f64))
+                .collect(),
+            tile_h: (0..ty)
+                .map(|l| span(max_y - pitch * (l + 1) as f64, max_y - pitch * l as f64))
+                .collect(),
+        }
+    }
+
+    /// Pixel size of output tile (`l`, `m`).
+    fn pixel(&self, l: usize, m: usize) -> f64 {
+        self.tile_w[m].max(self.tile_h[l])
+    }
+
+    fn x(&self, m: usize, p: f64, i: usize) -> f64 {
+        (self.min_x + self.pitch * m as f64) + p * (i as f64 + 0.5)
+    }
+
+    fn y(&self, l: usize, p: f64, j: usize) -> f64 {
+        (self.max_y - self.pitch * l as f64) - p * (j as f64 + 0.5)
+    }
 }
 
 /// A row band of one source: values (NaN = invalid) and footprint flags.
@@ -436,86 +588,60 @@ impl SourceData {
         })
     }
 
-    /// Source rows needed by output rows `[r0, r1)` (containing pixel and quad).
-    fn rows_for(&self, grid: &Grid, r0: usize, r1: usize) -> Option<(usize, usize)> {
-        let gt = self.terrain.gt;
-        let gy = |r: usize| (gt[3] - (grid.origin_y - (r as f64 + 0.5) * grid.cell_size)) / -gt[5];
-        let lo = (gy(r0) - 0.5).floor() - 1.0;
-        let hi = gy(r1 - 1).floor() + 2.0;
+    /// Source rows `[row0, row0 + rows)` needed by output rows whose pixel
+    /// centres lie between `y_top` and `y_bottom` (each block and the row
+    /// below it, with margin).
+    fn rows_for(&self, y_top: f64, y_bottom: f64) -> Option<(usize, usize)> {
+        let l = &self.lattice;
+        let cell = l.pitch / TILE as f64;
+        let lo = ((l.max_y - y_top) / cell).floor() - 2.0;
+        let hi = ((l.max_y - y_bottom) / cell).floor() + 3.0;
         let h = self.terrain.height as f64;
         let (lo, hi) = (lo.max(0.0), hi.min(h - 1.0));
         (hi >= lo).then_some((lo as usize, (hi - lo) as usize + 1))
     }
 }
 
-#[derive(Clone, Copy)]
-struct Sample {
-    containing_valid: bool,
-    quad_valid: bool,
-    quad_footprint: bool,
-    value: f64,
-}
-
+/// RAS Mapper's render-block interpolation at block (`row`, `col`) with
+/// binary32 fractions `fx` (rightward) and `fy` (downward). `None` when the
+/// block is not valid and owned by this source (bit 0 of its tile mask).
+/// Corners a (top-left), b (top-right), c (bottom-right), d (bottom-left);
+/// the block is split along both diagonals. Arithmetic is binary64 except
+/// the block-centre term, which is held in binary32.
 #[inline]
-fn sample(band: &Band, gt: &[f64; 6], height: usize, x: f64, y: f64) -> Sample {
-    let mut s = Sample {
-        containing_valid: false,
-        quad_valid: false,
-        quad_footprint: false,
-        value: 0.0,
-    };
-    let gx = (x - gt[0]) / gt[1];
-    let gy = (gt[3] - y) / -gt[5];
-    let w = band.width;
-    let at = |row: f64, col: f64| -> Option<usize> {
-        let (r, c) = (row as isize - band.row0 as isize, col as isize);
-        (r >= 0 && (r as usize) < band.rows && c >= 0 && (c as usize) < w)
-            .then(|| r as usize * w + c as usize)
-    };
-    let (nx, ny) = (gx.floor(), gy.floor());
-    if nx >= 0.0
-        && ny >= 0.0
-        && (nx as usize) < w
-        && (ny as usize) < height
-        && let Some(i) = at(ny, nx)
-    {
-        s.containing_valid = !band.values[i].is_nan();
+fn interpolate(band: &Band, row: usize, col: usize, fx: f32, fy: f32) -> Option<f64> {
+    if row < band.row0 || row + 1 >= band.row0 + band.rows || col + 1 >= band.width {
+        return None;
     }
-    let (fx, fy) = (gx - 0.5, gy - 0.5);
-    let (i0, j0) = (fx.floor(), fy.floor());
-    if !(i0 >= 0.0 && j0 >= 0.0 && (i0 as usize) + 1 < w && (j0 as usize) + 1 < height) {
-        return s;
+    let i = (row - band.row0) * band.width + col;
+    if !band.footprint[i] {
+        return None;
     }
-    let (Some(a), Some(c)) = (at(j0, i0), at(j0 + 1.0, i0)) else {
-        return s;
-    };
-    let (v00, v01, v10, v11) = (
-        band.values[a],
-        band.values[a + 1],
-        band.values[c],
-        band.values[c + 1],
+    let j = i + band.width;
+    let (a, b, c, d) = (
+        band.values[i],
+        band.values[i + 1],
+        band.values[j + 1],
+        band.values[j],
     );
-    if v00.is_nan() || v01.is_nan() || v10.is_nan() || v11.is_nan() {
-        return s;
+    if a.is_nan() || b.is_nan() || c.is_nan() || d.is_nan() {
+        return None;
     }
-    s.quad_valid = true;
-    s.quad_footprint =
-        band.footprint[a] || band.footprint[a + 1] || band.footprint[c] || band.footprint[c + 1];
-    let (v00, v01, v10, v11) = (v00 as f64, v01 as f64, v10 as f64, v11 as f64);
-    let tx = ((fx - i0) as f32) as f64;
-    let ty = ((fy - j0) as f32) as f64;
-    let t0 = if tx >= ty {
-        v00 + tx * (v01 - v00) + ty * (v11 - v01)
+    let (a, b, c, d) = (a as f64, b as f64, c as f64, d as f64);
+    let e2 = ((((a + b) + c) + d) * 0.5) as f32 as f64;
+    let (fx, fy) = (fx as f64, fy as f64);
+    let ny = 1.0 - fy;
+    Some(if fx > fy {
+        if fx < ny {
+            a + (b - a) * fx + (e2 - (a + b)) * fy
+        } else {
+            b + (e2 - (b + c)) * (1.0 - fx) + (c - b) * fy
+        }
+    } else if fx > ny {
+        d + (c - d) * fx + (e2 - (c + d)) * ny
     } else {
-        v00 + ty * (v10 - v00) + tx * (v11 - v10)
-    };
-    let t1 = if tx + ty <= 1.0 {
-        v00 + tx * (v01 - v00) + ty * (v10 - v00)
-    } else {
-        v11 + (1.0 - tx) * (v10 - v11) + (1.0 - ty) * (v01 - v11)
-    };
-    s.value = (t0 + t1) / 2.0;
-    s
+        a + (e2 - (d + a)) * fx + (d - a) * fy
+    })
 }
 
 /// The computed effective terrain and its provenance.
@@ -561,19 +687,22 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
         if std::fs::metadata(&mask_path)?.len() != (s.mask.shape[0] * TILE * TILE) as u64 {
             return Err(invalid("source mask length mismatch"));
         }
+        let lattice = SourceLattice::new(&terrain.gt, terrain.width, terrain.height);
         sources.push(SourceData {
             terrain,
             mask_path,
             tiles_x,
+            lattice,
         });
     }
     let grid = match req.grid {
         Some(g) => g,
         None => {
-            // Finest source; the first (highest priority) wins ties.
+            // Finest source by RAS Mapper's extent-derived cell size; the
+            // first (highest priority) wins ties.
             let auth = sources
                 .iter()
-                .min_by(|a, b| a.terrain.gt[1].total_cmp(&b.terrain.gt[1]))
+                .min_by(|a, b| a.lattice.cell.total_cmp(&b.lattice.cell))
                 .expect("sources");
             let extent = req.extent.unwrap_or_else(|| {
                 sources.iter().fold(
@@ -596,7 +725,7 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
                 )
             });
             let g = auth.terrain.gt;
-            snap_grid(extent, g[0], g[3], g[1])
+            snap_grid(extent, g[0], g[3], auth.lattice.cell)
                 .ok_or_else(|| invalid("snapped grid is empty or too large"))?
         }
     };
@@ -628,8 +757,11 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
         .num_threads(req.threads)
         .build()
         .map_err(|e| MapError::Internal(format!("thread pool: {e}")))?;
+    // Strips stay inside one 256-row output tile, so each strip has a
+    // single output tile row.
     const STRIP: usize = 64;
     let width = grid.width;
+    let lattice = OutputLattice::new(&grid);
     let counts: Vec<Result<Vec<u64>, MapError>> = pool.install(|| {
         values
             .par_chunks_mut(STRIP * width)
@@ -637,32 +769,46 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
             .map(|(strip, out)| {
                 let r0 = strip * STRIP;
                 let r1 = r0 + out.len() / width;
+                let l = r0 / TILE;
+                let y_top = grid.origin_y - r0 as f64 * grid.cell_size;
+                let y_bottom = grid.origin_y - r1 as f64 * grid.cell_size;
                 let mut bands = Vec::with_capacity(sources.len());
                 for s in &sources {
-                    bands.push(match s.rows_for(&grid, r0, r1) {
+                    bands.push(match s.rows_for(y_top, y_bottom) {
                         Some((row0, rows)) => Some(s.band(row0, rows)?),
                         None => None,
                     });
                 }
                 let mut counts = vec![0_u64; sources.len()];
-                for r in r0..r1 {
-                    let y = grid.origin_y - (r as f64 + 0.5) * grid.cell_size;
-                    for c in 0..width {
-                        let i = r * width + c;
-                        if hit[i / 64] & (1 << (i % 64)) != 0 {
-                            continue;
+                let mut rows_at: Vec<Option<(usize, f32)>> = vec![None; r1 - r0];
+                let mut cols_at: Vec<Option<(usize, f32)>> = vec![None; TILE];
+                for m in 0..width.div_ceil(TILE) {
+                    let p = lattice.pixel(l, m);
+                    let (c0, c1) = (m * TILE, ((m + 1) * TILE).min(width));
+                    // Sources in priority order; the first to answer a pixel wins.
+                    for (k, (s, band)) in sources.iter().zip(&bands).enumerate() {
+                        let Some(band) = band else { continue };
+                        for (j, slot) in rows_at.iter_mut().enumerate() {
+                            *slot = s.lattice.row(lattice.y(l, p, r0 + j - l * TILE));
                         }
-                        let x = grid.origin_x + (c as f64 + 0.5) * grid.cell_size;
-                        let mut covered = false;
-                        for (k, (s, band)) in sources.iter().zip(&bands).enumerate() {
-                            let Some(band) = band else { continue };
-                            let sm = sample(band, &s.terrain.gt, s.terrain.height, x, y);
-                            if sm.quad_valid && (!covered || sm.quad_footprint) {
-                                out[i - r0 * width] = quantize(sm.value);
-                                counts[k] += 1;
-                                break;
+                        for (i, slot) in cols_at[..c1 - c0].iter_mut().enumerate() {
+                            *slot = s.lattice.col(lattice.x(m, p, i));
+                        }
+                        for (j, rowf) in rows_at.iter().enumerate() {
+                            let Some((br, fy)) = *rowf else { continue };
+                            for (i, colf) in cols_at[..c1 - c0].iter().enumerate() {
+                                let o = (r0 + j) * width + c0 + i;
+                                if out[o - r0 * width] != NODATA
+                                    || hit[o / 64] & (1 << (o % 64)) != 0
+                                {
+                                    continue;
+                                }
+                                let Some((bc, fx)) = *colf else { continue };
+                                if let Some(v) = interpolate(band, br, bc, fx, fy) {
+                                    out[o - r0 * width] = quantize(v);
+                                    counts[k] += 1;
+                                }
                             }
-                            covered |= sm.containing_valid;
                         }
                     }
                 }

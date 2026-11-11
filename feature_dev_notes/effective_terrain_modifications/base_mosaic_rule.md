@@ -1,63 +1,79 @@
-# Base effective terrain (the #19 mosaic rule)
+# Base effective terrain (the mosaic rule)
 
 The base rule rebuilds `RasTerrain.export_rasmapper_terrain(downsample_factor=1,
 rasterize_modifications=False)` from the terrain's source TIFFs, the level-0 tile
-`Mask` of each source and the `Stitch TIN` in the terrain HDF.
+`Mask` of each source and (for now) the stored `Stitch TIN` in the terrain HDF.
 
-## Rule
+## Rule (render-block sampling, 2026-11-11)
 
-1. **Stitch TIN first.** Linear interpolation in the containing triangle. Weights
-   must be >= -1e-9; later triangles win.
-2. **Sources in priority order.** A source answers if all four pixel centres around
-   the point (its "quad") are valid. Once a higher-priority source has a valid pixel
-   *containing* the point, the source also needs at least one quad centre inside its
-   footprint (mask bit 0). Simpler variants (masks ignored, masks required on all
-   corners, ownership by the containing cell) each failed on at least one terrain.
-3. **Value.** The mean of the two diagonal triangulations of the quad (equivalently
-   four triangles around the quad centre). Not bilinear: bilinear reproduces 0.8% of
-   values exactly, 73% after rounding. Fractional offsets are binary32, arithmetic
-   binary64 (binary64 offsets put 412 Bald Eagle values one 1/32 step off).
-4. **Rounding.** Binary32, then 1/32 with ties to even (.NET `Math.Round`).
-5. **Lattice.** The finest source (ties by priority) over the union of source
-   extents, snapped outward (ras-commander's export lattice).
+Established from an interoperability study of RasMapperLib 7.0.1 (prose findings
+only, kept outside this repository; no vendor code used or copied) and checked
+pixel by pixel against exports.
 
-Priority comes from the `Priority` attribute, or for older terrains with none the
-terrain VRT order, highest first.
+1. **Output lattice.** The export is written in 256 x 256 tiles. Tile pitch is
+   recomputed as max(tile-grid width / tiles wide, height / tiles tall), and each
+   tile's pixel size as max(tile width, tile height) / 256. Pixel centres are
+   `tile_min + pixel * (i + 0.5)` per tile. The cell size is the finest source's
+   extent-derived size (max of extent width / columns, height / rows), which can
+   differ from its GeoTIFF cell size in the last bits (3.280844444000001 vs
+   3.28084444399999 on B3).
+2. **Render blocks.** A source is sampled by render block, the quad between four
+   adjacent cell centres. Blocks are grouped in 256 x 256 tiles whose grid starts
+   half a cell inside the source extent; block-tile pitch and block size are
+   recomputed from tile extents the same way. The block index is the floor of the
+   offset over that size; the fraction is cast to binary32.
+3. **Validity.** A block answers only when bit 0 of its mask byte is set. The mask
+   has one byte per render block: bit 0 = all four corners valid and the block is
+   owned by this source; bits 4/3/2/1 (16/8/4/2) = neighbour above/left/right/below
+   is off. Terrain creation clears lower-priority blocks under higher-priority
+   valid blocks (grown by a quarter cell). Sources are tried in priority order;
+   the first to answer wins. There is no fallback to fewer corners.
+4. **Value.** Four triangles on both diagonals of the block. Binary64 arithmetic
+   on the binary32 corners and fractions, with the block-centre term
+   ((a + b + c + d) / 2) held in binary32. Pure binary32 arithmetic leaves
+   thousands of one-step roundings; binary64 throughout leaves 478 on B4.
+5. **Rounding.** Binary32, then 1/32 with ties to even.
+6. **Gap fill (not reproduced yet).** RAS Mapper does not use the stored stitch
+   TIN during the export. For each 256-pixel output tile it collects the edges of
+   valid blocks that border off blocks (mask bits 1-4), within a two-block halo,
+   triangulates them as constrained Delaunay edges (points merged within
+   min(0.01, 0.1 x cell)), deletes triangles on the data side of each edge and any
+   triangle wider or taller than 2.0001 x the largest cell, and rasterizes the rest
+   over the tile (inclusive barycentric test, value = sum(w z) / sum(w)),
+   overwriting source values. Gaps of one cell are bridged; wider gaps are not.
+   The segment order depends on hash values and parallel completion order, which
+   is a likely source of RAS Mapper's own run-to-run differences.
 
-## Qualification (T07, HEC-RAS 7.0.1)
+The tie behaviour that the earlier fitted rule could not explain (pixel centres on
+source cell centres choosing different neighbours at 1e-9-cell perturbations) is
+fully determined by items 1 and 2.
 
-| Terrain | Valid px | Mask diff | Value diff |
-|---|---:|---:|---:|
-| Bald Eagle Terrain50 (20 ft dtm over 36.5 ft dem) | 197,179,058 | 0 | 8 (stitch-TIN corners, max 1.53 ft) |
-| T1 coarse > fine (synthetic) | 767,502 | 0 | 0 |
-| T2 fine > coarse | 767,879 | 0 | 0 |
-| T3 holed coarse > fine | 687,908 | 0 | 5 (stitch-TIN corner, max 2.16 ft) |
-| T4 30 ft offset > 20 ft > 36.5 ft | 767,879 | 0 | 0 |
-| T5 holed coarse > 30 ft offset > 20 ft | 734,567 | 0 | 0 |
+## Qualification (HEC-RAS 7.0.1, CLB-08 `work\T33`)
 
-The residual stitch-TIN pixels are unstable in RAS Mapper itself on these
-terrains: two exports of the same T2 terrain disagree on two TIN pixels.
+Five real terrains, two independent exports each, modifications off. "No TIN"
+runs the engine with the stored stitch TIN disabled, isolating rules 1-5:
 
-## Gaps exposed by the modified corpora (T14)
+| Terrain | Sources | Valid px | No TIN: values differing | No TIN: valid where export is nodata | No TIN: export valid, ours nodata (gap fill) |
+|---|---|---:|---:|---:|---:|
+| A | 5 (1 ft, 3 ft) | 164,348,332 | 0 | 0 | 24,952 |
+| B1 | 2 | 254,759,886 | 0 | 0 | 13,040 |
+| B2 | 2 | 254,759,881 | 0 | 0 | 12,957 |
+| B3 | 1 | 254,743,274 | 0 | 0 | 2,762 |
+| B4 | 2 (near-equal cells) | 254,746,539 | 0 | 0 | 17,059 |
 
-Measured on the base layer of real modified terrains, reproduced with the
-modifications switched off (schema 1 against `rasterize_modifications=False`):
+With the stored stitch TIN enabled (the engine's current behaviour), whole-terrain
+differences against the export are: A 20 mask / 690 values; B1 594 / 7; B2 599 / 6;
+B3 3,227 / 0; B4 1,389 / 1. All of them lie inside stored-TIN triangles. Before
+this rule they were A 20 / 777, B3 30,628 / 0 and B4 1,389 / 479.
 
-| Corpus terrain | Stitch-TIN px differing | Base (non-TIN) differences |
-|---|---|---|
-| A | 748 of 38,900. RAS Mapper differs on 414 TIN px across 5 identical-input exports, but 567 of ours match none of them | 0 |
-| B1 | 597 of 22,554, **stable in RAS Mapper**: a rule gap | 0 |
-| B2 | 612 | 1 |
-| B4 | 1,391 | **478** mosaic px at 1/32 ft |
-| B3 | 3,337 | **27,289 mask px** (nodata disagreement in the mosaic) |
+The synthetic T1-T5 terrains are unchanged (T1, T2, T4, T5 identical; T3 5
+stitch-TIN pixels). BaldEagleCrkMulti2D Terrain50 has not been re-run under this
+rule.
 
-Leads:
-- B-series stitch-TIN pixels are deterministic in RAS Mapper, so the TIN rule can be
-  derived further; the "unstable in RAS Mapper" explanation does not cover them.
-- B-series source cell sizes differ in the 10th digit (3.280833333 vs
-  3.280833333333). The lattice/ownership rule likely treats near-equal cells
-  differently from RAS Mapper. Start the B3/B4 mosaic work there.
+RAS Mapper's own repeated exports differ only on A (160 px base, 90 px with
+modifications); the B terrains reproduce exactly.
 
-Until these are fixed, even the unmodified versions of these terrains are not
-exact, which is why the whole feature is parked rather than only the
-modification part.
+## Next
+
+Reproduce the per-tile export TIN (item 6), then re-qualify with the stored stitch
+TIN removed from the request path.

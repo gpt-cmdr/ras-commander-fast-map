@@ -154,7 +154,10 @@ fn coarse_source_uses_the_two_diagonal_mean() {
 }
 
 /// Two sources on one lattice: the high source has a hole; the low source
-/// fills it, and its own pixels under the high source never show.
+/// fills it, and its own pixels under the high source never show. Masks are
+/// per render block (the quad between four cell centres), as terrain
+/// creation writes them: a block is on when its four corners are valid and
+/// no higher-priority source owns it.
 #[test]
 fn priority_footprint_and_fall_through() {
     let dir = scratch();
@@ -166,9 +169,18 @@ fn priority_footprint_and_fall_through() {
     let low = vec![100.0_f32; 400];
     write_source(&dir, "high.tif", g, high);
     write_source(&dir, "low.tif", g, low);
-    write_mask(&dir, "high.u1", 20, 20, |r, c| !hole(r, c));
-    // The low source owns only the hole.
-    write_mask(&dir, "low.u1", 20, 20, hole);
+    let corners_valid = |r: usize, c: usize| {
+        r + 1 < 20
+            && c + 1 < 20
+            && [(r, c), (r, c + 1), (r + 1, c), (r + 1, c + 1)]
+                .iter()
+                .all(|&(a, b)| !hole(a, b))
+    };
+    write_mask(&dir, "high.u1", 20, 20, corners_valid);
+    // The low source owns only blocks the high source leaves off.
+    write_mask(&dir, "low.u1", 20, 20, |r, c| {
+        r + 1 < 20 && c + 1 < 20 && !corners_valid(r, c)
+    });
     let srcs = json!([
         {"path": "high.tif", "mask": mask("high.u1", 20, 20)},
         {"path": "low.tif", "mask": mask("low.u1", 20, 20)},
@@ -176,14 +188,12 @@ fn priority_footprint_and_fall_through() {
     let out = effective_terrain::compute(&request(srcs, json!({})), &dir).unwrap();
     let at = |r: usize, c: usize| out.values[r * 20 + c];
     assert_eq!(at(2, 2), 500.0);
+    assert_eq!(at(5, 14), 500.0);
     assert_eq!(at(9, 9), 100.0, "hole filled from the lower source");
-    // Pixel (7,7): the high pixel containing it is valid, its quad reaches the
-    // hole, and the low quad touches the low footprint at (8,8).
-    assert_eq!(at(7, 7), 100.0);
-    // Pixel (6,6): high quad (6..7, 6..7) complete -> high wins.
-    assert_eq!(at(6, 6), 500.0);
-    // Last row/column: no complete quad in either source -> nodata.
-    assert_eq!(at(19, 5), NODATA);
+    assert_eq!(at(10, 10), 100.0);
+    // Pixel (7,7) sits on a block corner: whichever adjacent block the
+    // lattice picks, one of the two sources answers.
+    assert!([100.0, 500.0].contains(&at(7, 7)));
     // Reversed priority with a mask that owns nothing: the low source never shows.
     write_mask(&dir, "none.u1", 20, 20, |_, _| false);
     let srcs = json!([

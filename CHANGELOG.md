@@ -8,6 +8,20 @@ still advertises `rasmapper-effective-terrain/1` with request schema 1 only;
 schema 2 is accepted and described under `effective_terrain.parked`, and a
 schema 1 receipt still reports method `/1`.
 
+### Effective terrain: RAS Mapper's render-block sampling
+
+The base mosaic now samples each source by render block, as RasMapperLib
+7.0.1's export does: 256-pixel output tiles with recomputed tile pitch and
+pixel size, block tiles half a cell inside each source, validity from bit 0 of
+the block's mask byte (first source to answer wins), four-triangle values in
+binary64 with the block-centre term in binary32, and the extent-derived cell
+size for the default lattice. On five real multi-source terrains (HEC-RAS
+7.0.1, modifications off) this leaves no value differences and no extra valid
+pixels outside the stitch TIN. B3 drops from 30,628 to 3,227 mask differences
+and B4 from 479 to 1 value difference. The remaining differences are pixels
+RAS Mapper fills with its own per-tile export TIN, which is not reproduced
+yet; the stored stitch TIN is still used. Method IDs are unchanged.
+
 ### Terrain modifications on the effective terrain (`rasmapper-effective-terrain/2`)
 
 `ras2fim-batch effective-terrain` accepts request schema
