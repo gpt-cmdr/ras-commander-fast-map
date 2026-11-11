@@ -197,5 +197,6 @@ Commander staging `final_format`.
 - The CRS is written as an EPSG code (below 65536) in three GeoKeys.
 - Edge-tile padding is nodata; GDAL readers ignore it.
 - A failed write leaves the partial file, as the LZW route does.
-- The writer lives in this crate; terrio 0.4.2 remains the reader and the
-  LZW/strip writer, and its parallel work stays on the request pool.
+- The writer lives in this crate; terrio (0.4.2 when this was qualified,
+  0.8.0 now) remains the reader and the LZW/strip writer. With 0.8.0 its own
+  pool is bounded to the request's thread budget by the CLI.

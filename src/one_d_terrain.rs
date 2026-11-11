@@ -2,7 +2,9 @@
 //!
 //! Replaces caller-staged Float32 buffers: the source GeoTIFF must be the
 //! request's single-band Float32 grid (same size and geotransform). Tile-row
-//! stripes are decoded on the request pool, one reader per worker. Values equal
+//! stripes are decoded on the request pool, one reader per worker, one source
+//! tile per terrio call (a single-chunk read never fans out to terrio's own
+//! parallelism, so the request's thread budget holds). Values equal
 //! to the declared nodata under GDAL's Float32 rule (`ARE_REAL_EQUAL`, as a
 //! masked GDAL read) become NaN; every other value keeps its bits.
 use crate::MapError;
@@ -25,9 +27,10 @@ fn open(path: &Path) -> Result<LazyRaster, MapError> {
     Ok(r)
 }
 
-/// Validated source: stripe height and the f32 nodata used for masking.
+/// Validated source: tile shape and the f32 nodata used for masking.
 pub struct Source {
     stripe_rows: usize,
+    tile_cols: usize,
     nodata: Option<f32>,
 }
 
@@ -48,8 +51,26 @@ pub fn inspect(path: &Path, width: usize, height: usize, gt: [f64; 6]) -> Result
         .block_size()
         .filter(|b| b.0 > 0 && b.1 > 0 && b.1 <= 4096)
         .ok_or_else(|| MapError::Unsupported("terrain_tiff has no usable block layout".into()))?;
+    // A one-pixel read on the calling thread starts terrio's process-wide
+    // thread pool before any parallel read; first use from several request
+    // workers at once would otherwise race to start (and discard) pools.
+    let mut r = r;
+    r.read_window(
+        Window {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        },
+        &WindowOptions {
+            bands: vec![1],
+            overview: None,
+        },
+    )
+    .map_err(|e| MapError::Terrain(format!("terrain_tiff first read: {e}")))?;
     Ok(Source {
         stripe_rows: block.1,
+        tile_cols: block.0,
         nodata: r.nodata().filter(|v| !v.is_nan()).map(|v| v as f32),
     })
 }
@@ -95,35 +116,47 @@ impl Source {
             if reader.is_none() {
                 *reader = Some(open(path)?);
             }
-            let ds = reader
-                .as_mut()
-                .unwrap()
-                .read_window(
-                    Window {
-                        x: col,
-                        y: top,
-                        width,
-                        height: rows,
-                    },
-                    &WindowOptions {
-                        bands: vec![1],
-                        overview: None,
-                    },
-                )
-                .map_err(|e| MapError::Terrain(format!("terrain_tiff rows {top}+{rows}: {e}")))?;
-            let RasterData::F32(values) = ds.raster.data else {
-                return Err(MapError::Unsupported(
-                    "terrio returned non-Float32 terrain".into(),
-                ));
-            };
-            if values.len() != chunk.len() {
-                return Err(MapError::Terrain("terrain stripe size mismatch".into()));
-            }
-            for (dst, v) in chunk.iter_mut().zip(values) {
-                *dst = match nodata {
-                    Some(nd) if crate::final_tiff::masked(v, nd) => f32::NAN,
-                    _ => v,
+            // One source tile per terrio call: a single-chunk read decodes on the
+            // calling thread, so all parallelism stays on the request pool.
+            let reader = reader.as_mut().unwrap();
+            let mut x = col;
+            while x < col + width {
+                let next = ((x / self.tile_cols + 1) * self.tile_cols).min(col + width);
+                let tile_width = next - x;
+                let ds = reader
+                    .read_window(
+                        Window {
+                            x,
+                            y: top,
+                            width: tile_width,
+                            height: rows,
+                        },
+                        &WindowOptions {
+                            bands: vec![1],
+                            overview: None,
+                        },
+                    )
+                    .map_err(|e| {
+                        MapError::Terrain(format!("terrain_tiff tile at {x},{top}: {e}"))
+                    })?;
+                let RasterData::F32(values) = ds.raster.data else {
+                    return Err(MapError::Unsupported(
+                        "terrio returned non-Float32 terrain".into(),
+                    ));
                 };
+                if values.len() != tile_width * rows {
+                    return Err(MapError::Terrain("terrain tile size mismatch".into()));
+                }
+                for (r, source) in values.chunks_exact(tile_width).enumerate() {
+                    let start = r * width + (x - col);
+                    for (dst, &v) in chunk[start..start + tile_width].iter_mut().zip(source) {
+                        *dst = match nodata {
+                            Some(nd) if crate::final_tiff::masked(v, nd) => f32::NAN,
+                            _ => v,
+                        };
+                    }
+                }
+                x = next;
             }
             Ok(())
         };

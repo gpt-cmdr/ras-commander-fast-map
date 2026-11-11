@@ -76,9 +76,47 @@ fn read_diagnostic_wire(
     )?)
 }
 
+/// terrio (>= 0.5) runs its internal parallel work on a process-wide pool that
+/// it starts on first use, sized by `RAYON_NUM_THREADS` (else one thread per
+/// core). Bound it to the request's thread budget (1-64, default 1) so the
+/// engine stays within the threads it was given. Must run while the process is
+/// single-threaded; an explicit caller setting is kept. The engine's own pools
+/// always set their size, so this changes only terrio's pool.
+fn bound_terrio_pool(request: &serde_json::Value) {
+    if std::env::var_os("RAYON_NUM_THREADS").is_some() {
+        return;
+    }
+    let threads = request
+        .get("threads")
+        .or_else(|| request.get("budgets").and_then(|b| b.get("threads")))
+        .and_then(serde_json::Value::as_u64)
+        .filter(|t| (1..=64).contains(t))
+        .unwrap_or(1);
+    // SAFETY: called before this process starts any thread (no concurrent
+    // environment access is possible yet).
+    unsafe { std::env::set_var("RAYON_NUM_THREADS", threads.to_string()) };
+}
+
+/// Request JSON named by a file-based command, if it parses (bounded read).
+fn peek_request(path: &std::path::Path) -> Option<serde_json::Value> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(16 << 20)
+        .read_to_string(&mut text)
+        .ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let cmd = args.first().and_then(|a| a.to_str()).unwrap_or("");
+    if args.len() == 3
+        && let Some(request) = peek_request(std::path::Path::new(&args[1]))
+    {
+        bound_terrio_pool(&request);
+    }
     match (cmd, args.len()) {
         ("storage", 3) => {
             let path = PathBuf::from(&args[1]);
@@ -136,6 +174,8 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
                 let out = PathBuf::from(command["output"].as_str().ok_or("missing output")?);
                 let wire =
                     ras_commander_fast_map::native_output::read_wire(std::fs::File::open(&path)?)?;
+                // The first request bounds terrio's pool for the session process.
+                bound_terrio_pool(&wire);
                 let base = path
                     .canonicalize()?
                     .parent()

@@ -20,7 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Native terrain and polygon rasterization; GDAL remains disabled.
-terrio = { version = "=0.4.2", default-features = false, features = ["geotiff"] }
+terrio = { version = "=0.8.0", default-features = false, features = ["geotiff"] }
 wbvector = "=0.1.6"
 wbraster = "=0.2.1"
 clipper2-rust = "=1.2.0"

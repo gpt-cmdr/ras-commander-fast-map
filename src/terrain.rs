@@ -204,6 +204,24 @@ impl NativeTerrain {
                 ))
             })?;
         let nodata = r.nodata();
+        // terrio >= 0.5 runs parallel work on a process-wide pool it starts on first
+        // use. Start it here, on the opening thread, with a one-pixel read: first
+        // use from several request workers at once races to start (and discard)
+        // pools. Block reads are single chunks, so the pool stays idle.
+        let mut r = r;
+        r.read_window(
+            Window {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            &WindowOptions {
+                bands: vec![1],
+                overview: None,
+            },
+        )
+        .map_err(|e| MapError::Terrain(format!("{path}: first read: {e}")))?;
         Ok(Self {
             path: path.to_string(),
             gt,

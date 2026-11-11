@@ -18,6 +18,21 @@ Measured on the Whisky Chitto p04 staged schema /2 requests (4,483 XS, 12,919 x
 4 CPUs): render 0.99 s at 1 worker, 0.49 s at 4; call total 4.58 s to 4.10 s;
 outputs SHA256-equal to v0.17.0.
 
+### terrio 0.8.0
+
+The engine's terrio dependency moves from 0.4.2 to 0.8.0 (crates.io, still
+`default-features = false` with only `geotiff`). This removes the C `zstd-sys`
+build dependency and with it every C compiler requirement; terrain decode is
+faster (Spring River p02, 4 CPUs, warm medians: `terrain_cache.decode_seconds`
+3.94 to 3.65). terrio 0.8.0 runs internal parallel work on a process-wide pool
+of its own, sized from `RAYON_NUM_THREADS`, so the CLI bounds that pool to the
+request's `threads` (or session `budgets.threads`, default 1) before any thread
+starts, unless the caller set the variable, and terrain readers start it once on
+the opening thread (concurrent first use raced to start and discard pools).
+Terrain reads stay one source tile per terrio call, so decode never fans out
+beyond the request pool. Spring River p02 Depth/WSE (stock and final routes)
+and Whisky Chitto 1D outputs are bit-identical to 0.4.2.
+
 ### 1D terrain read with terrio; parallel inline composition
 
 `one-d-diagnostic` schemas /2-/4 accept `terrain_tiff` (the request grid's

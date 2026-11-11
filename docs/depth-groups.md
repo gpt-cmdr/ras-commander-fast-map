@@ -141,8 +141,8 @@ invocation directory and removes only that directory on normal/error return.
 The scratch ceiling admits logical bytes; disk exhaustion remains an explicit
 I/O failure. Process crashes can leave this private scratch for operator cleanup.
 
-Spill updates and GeoTIFF reads/writes use bounded chunks/rows. terrio 0.4.2's
-`GeoTiffWriter` permits final delivery directly from spilled rows. No complete
+Spill updates and GeoTIFF reads/writes use bounded chunks/rows. terrio's
+`GeoTiffWriter` (0.4.2 when this was qualified) permits final delivery directly from spilled rows. No complete
 group is rehydrated for GeoTIFF output. A conservative largest-group allowance
 also admits a single owned Rust buffer delivery. Downstream consumers must
 budget buffers they retain after delivery separately.
