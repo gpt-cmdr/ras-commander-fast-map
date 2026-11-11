@@ -46,6 +46,7 @@ pub mod coupled_session;
 pub mod depth_groups;
 pub mod effective_terrain;
 mod export_tin;
+pub mod final_tiff;
 mod finalize;
 mod geotiff;
 pub mod horizontal;

@@ -23,6 +23,14 @@ data; their MIT/Apache notices are retained in `licenses/`.
 The engine does not link GDAL. The surrounding Python workflow
 continues to use rasterio and its raster stack for preparation and file output.
 
+The opt-in final delivery GeoTIFF writer is this project's own code. Its tile
+compression uses `flate2` with the pure-Rust `zlib-rs` backend. Its overview
+arithmetic reimplements the masked `AVERAGE` rule of GDAL's
+`GDALResampleChunk_AverageOrRMS`, `ARE_REAL_EQUAL` nodata mask and
+`GDALGetNoDataReplacementValue` (GDAL is MIT licensed), following the
+description of those functions in the `gdal_overview` port of later terrio
+releases (MIT); no GDAL or terrio source is copied and GDAL is not linked.
+
 Deterministic inundation-boundary integer union and AOI clipping use the
 unmodified [`clipper2-rust` 1.2.0](https://github.com/larsbrubaker/clipper2-rust)
 crate under the Boost Software License 1.0 (`BSL-1.0`). Its source-distributed

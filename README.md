@@ -267,6 +267,66 @@ existing `native-geotiff/1` framing. Inspect `native_row_streaming` and the
 before enabling this option. Commander callers must explicitly stage the wire
 option; it is not enabled by the existing `product_writer="native"` default.
 
+#### Final delivery format (`final_format`)
+
+Private opt-in `final_format`, selected together with `"compression": "DEFLATE"`,
+makes the engine write each Depth/WSE product once in its delivery form instead
+of an LZW window that a later pass re-encodes. It is additive: requests without
+it are unchanged, and `DEFLATE` without it (or it without `DEFLATE`) is refused.
+Inspect the `native_final_format` capability before sending it.
+
+```json
+"stream_outputs": true, "geotiff_outputs": true,
+"compression": "DEFLATE",
+"final_format": {
+  "nodata": -9999.0,
+  "block_size": 256,
+  "zlevel": 6,
+  "full_grid": {"width": 26316, "height": 28916,
+                "row_offset": 1018, "col_offset": 7787,
+                "transform": [x0, dx, 0.0, y0, 0.0, dy]},
+  "overview_factors": [2, 4],
+  "overview_resampling": "average"
+}
+```
+
+| Field | Type | Contract |
+|---|---|---|
+| `nodata` | number, required | Written for every invalid (NaN) pixel; finite and exactly Float32 |
+| `block_size` | integer, default 256 | Square tile edge; a multiple of 16 from 16 through 4096; overviews use the same tiles |
+| `zlevel` | integer, default 6 | zlib level 1 through 9; predictor 1 |
+| `full_grid` | object, optional | Delivery grid `width`/`height`, the integer `row_offset`/`col_offset` of the request `window` on it, and the grid's GDAL geotransform. Omitted: the product window is the grid |
+| `overview_factors` | integer array, default `[]` | `[2]`, `[2, 4]`, ...: consecutive powers of two |
+| `overview_resampling` | string, default `"average"` | Only `"average"` |
+
+The file is a single-band Float32 GeoTIFF (BigTIFF when the uncompressed levels
+could pass 4 GB) with the EPSG code, the grid transform, `GDAL_NODATA` and, with
+overviews, the `rio_overview` `resampling=average` item. Window pixels keep the
+product's Float32 bits; only the invalid marker, placement, tiling, compression
+and overviews differ from the LZW route. `full_grid.transform` must equal the
+request window's transform at the given offsets (same pixel size bits, offsets
+within 1e-8 pixel); it is checked from the request alone, with the writer's
+planned buffers admitted before payload reads.
+
+Overviews reproduce GDAL `AVERAGE` overviews of a nodata raster as built by
+`build_overviews([2, 4], average)`: each level is resampled from the level
+before it, a pixel is the binary64 weighted mean of the valid source pixels it
+covers (fractional edge weights where a level's size is odd), rounded once to
+Float32, and a valid mean equal to the nodata value moves one Float32 step.
+Like GDAL's nodata mask, values within about four units in the last place of
+the nodata value read as nodata; a valid product value that would read as
+nodata, or is infinite, is refused instead of losing a valid pixel.
+
+Tiles are compressed on the request's Rayon pool, one row of tiles per level in
+memory, and written in tile order, so file bytes do not depend on `threads` or
+`row_stream_rows`. Tiles holding only nodata share one encoded tile; rows above
+and below the window are never materialized. Completion records keep the
+`native-geotiff/1` framing and add `final_format` and, on the full-array route,
+`depth_final`/`wse_final` counts (`valid_pixels`, `tiles`,
+`shared_nodata_tiles`, `file_bytes`). Rust callers can use `final_tiff::Layout`
+and `final_tiff::Writer` directly. See the
+[evaluation and limits](docs/performance-improvements.md#final-format-single-pass-writer).
+
 Binary32 operation order and method identifiers are preserved. `MIGRATION.json`
 retains the immutable 0.8.0 extraction receipt; `SOURCE_MANIFEST.json` binds this
 version's current sources. `ras2fim-batch method` reports package/build identity

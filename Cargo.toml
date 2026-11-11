@@ -1,6 +1,6 @@
 [package]
 name = "ras-commander-fast-map"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 license = "MIT AND BSD-3-Clause AND BSD-2-Clause AND BSL-1.0"
 description = "Native Rust 2D flood inundation mapping: horizontal and sloping surfaces, bounded timesteps and terrain windows"
@@ -24,6 +24,8 @@ terrio = { version = "=0.4.2", default-features = false, features = ["geotiff"] 
 wbvector = "=0.1.6"
 wbraster = "=0.2.1"
 clipper2-rust = "=1.2.0"
+# Tile DEFLATE for the final delivery writer; the pure-Rust zlib-rs backend.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
 rayon = "1.10"
 rstar = "=0.13.0"
 serde = { version = "1", features = ["derive"] }

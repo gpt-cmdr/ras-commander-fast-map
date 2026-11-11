@@ -652,6 +652,12 @@ pub fn method_record() -> Value {
             "retained_full_window_buffers":["ownership","terrain"]},
         "bounded_profile_concurrency":true,
         "persistent_session":true,"multi_window_cache":true,"hydraulic_cache":true,"native_geotiff_outputs":true,"native_output_products":["depth","wse"],"native_output_compression":["NONE","LZW"],"bounded_pixel_weights":true,
+        "native_final_format":{"control":"final_format","compression":"DEFLATE","layout":"tiled",
+            "block_size":{"default":256,"multiple_of":16,"min":16,"max":4096},
+            "zlevel":{"default":6,"min":1,"max":9},"nodata":"finite Float32","full_grid":true,
+            "overview_resampling":["average"],"overview_factors":"consecutive powers of two from 2",
+            "overview_arithmetic":"gdal-average-cascade/1","shared_nodata_tile":true,
+            "row_stream_rows":true},
         "velocity":crate::velocity::METHOD_ID,
         "velocity_depth":["rendered","horizontal"],
         "velocity_render_modes":["horizontal","sloping","slopingPretty"],
@@ -910,6 +916,38 @@ fn run_internal(
         .checked_mul(height)
         .filter(|&n| n > 0 && n <= model::MAX_PROFILE_PIXELS as usize)
         .ok_or_else(|| MapError::Budget("sloping window empty or too large".into()))?;
+    // Final delivery placement is resolved from the request alone, before any read.
+    let final_layout = selected
+        .final_format
+        .as_ref()
+        .map(|format| {
+            let gt = req.terrain_transform;
+            crate::final_tiff::Layout::new(
+                format,
+                width,
+                height,
+                [
+                    gt[0] + col as f64 * gt[1],
+                    gt[1],
+                    0.,
+                    gt[3] + row as f64 * gt[5],
+                    0.,
+                    gt[5],
+                ],
+            )
+        })
+        .transpose()?;
+    // Final delivery is qualified against terrain-derived framing only.
+    if final_layout.is_some() && (native_grid.is_some() || req.shear_stress.is_some()) {
+        return Err(MapError::Unsupported(
+            "final_format is not qualified with the stored tile grid contract or shear stress"
+                .into(),
+        ));
+    }
+    if final_layout.is_some() {
+        // Same refusal as final_tiff::Writer::create, before any read.
+        crate::final_tiff::check_epsg(req.epsg)?;
+    }
     if !matches!(req.schema.as_str(), SCHEMA | NATIVE_GRID_SCHEMA)
         || !(1..=64).contains(&req.threads)
         || !(1..=64).contains(&req.max_inflight_profiles)
@@ -1034,6 +1072,17 @@ fn run_internal(
             } else {
                 0
             })
+        })
+        // Final delivery writer: one per product while row streaming, else one at a time.
+        .and_then(|v| match &final_layout {
+            None => Some(v),
+            Some(layout) => v.checked_add(layout.planned_bytes(req.threads)?.checked_mul(
+                if row_stream_rows > 0 {
+                    selected.products.len() as u64
+                } else {
+                    1
+                },
+            )?),
         })
         .and_then(|v| v.checked_add(cache))
         .and_then(|v| v.checked_add(persistent_bytes))
@@ -1738,6 +1787,7 @@ fn run_internal(
                                 req.options,
                                 &foreign,
                                 selected,
+                                final_layout.as_ref(),
                                 &dir,
                                 transform,
                                 req.epsg,
@@ -1833,35 +1883,40 @@ fn run_internal(
                             header["products"] = "native-geotiff/1".into();
                             header["depth_finite_pixels"] = finite_pixels.into();
                             header["flooded_pixels"] = flooded_pixels.into();
-                            if selected.products.iter().any(|p| p == "depth") {
-                                pool.install(|| {
-                                    crate::geotiff::write(
-                                        &dir.join("depth.tif"),
-                                        depth,
-                                        width,
-                                        height,
-                                        transform,
-                                        req.epsg,
-                                        selected.compression,
-                                    )
-                                })?;
-                            }
-                            if selected.products.iter().any(|p| p == "wse") {
-                                pool.install(|| {
-                                    crate::geotiff::write(
-                                        &dir.join("wse.tif"),
-                                        wse,
-                                        width,
-                                        height,
-                                        transform,
-                                        req.epsg,
-                                        selected.compression,
-                                    )
-                                })?;
+                            for (name, values) in [("depth", depth), ("wse", wse)] {
+                                if !selected.products.iter().any(|p| p == name) {
+                                    continue;
+                                }
+                                let path = dir.join(format!("{name}.tif"));
+                                match &final_layout {
+                                    Some(layout) => {
+                                        let summary = crate::final_tiff::write(
+                                            &path, &values, layout, req.epsg, &pool,
+                                        )?;
+                                        header[format!("{name}_final")] = json!({
+                                            "valid_pixels":summary.valid_pixels,"tiles":summary.tiles,
+                                            "shared_nodata_tiles":summary.shared_nodata_tiles,
+                                            "file_bytes":summary.file_bytes});
+                                    }
+                                    None => pool.install(|| {
+                                        crate::geotiff::write(
+                                            &path,
+                                            values,
+                                            width,
+                                            height,
+                                            transform,
+                                            req.epsg,
+                                            selected.compression,
+                                        )
+                                    })?,
+                                }
                             }
                             if output.is_some() {
                                 header["selected_products"] = json!(selected.products);
                                 header["compression"] = json!(selected.compression);
+                            }
+                            if let Some(format) = &selected.final_format {
+                                header["final_format"] = json!(format);
                             }
                             header["write_seconds"] = tick.elapsed().as_secs_f64().into();
                             writeln!(stream, "{header}")?;
@@ -2158,6 +2213,7 @@ fn render_native_rows(
     options: sloping::Options,
     foreign: &[usize],
     output: &crate::native_output::OutputOptions,
+    final_layout: Option<&crate::final_tiff::Layout>,
     dir: &Path,
     transform: [f64; 6],
     epsg: u32,
@@ -2174,36 +2230,26 @@ fn render_native_rows(
         prepared[m].is_wet(c)
     })?;
     let hydraulic_seconds = tick.elapsed().as_secs_f64();
-    let mut depth_writer = output
-        .products
-        .iter()
-        .any(|p| p == "depth")
-        .then(|| {
-            crate::geotiff::RowWriter::create(
-                &dir.join("depth.tif"),
-                window.width,
-                window.height,
-                transform,
-                epsg,
-                output.compression,
-            )
-        })
-        .transpose()?;
-    let mut wse_writer = output
-        .products
-        .iter()
-        .any(|p| p == "wse")
-        .then(|| {
-            crate::geotiff::RowWriter::create(
-                &dir.join("wse.tif"),
-                window.width,
-                window.height,
-                transform,
-                epsg,
-                output.compression,
-            )
-        })
-        .transpose()?;
+    let create = |name: &str| {
+        output
+            .products
+            .iter()
+            .any(|p| p == name)
+            .then(|| {
+                crate::geotiff::ProductWriter::create(
+                    &dir.join(format!("{name}.tif")),
+                    window.width,
+                    window.height,
+                    transform,
+                    epsg,
+                    output.compression,
+                    final_layout,
+                )
+            })
+            .transpose()
+    };
+    let mut depth_writer = create("depth")?;
+    let mut wse_writer = create("wse")?;
     let mut render_seconds = 0.0;
     let mut finalize_seconds = 0.0;
     let mut write_seconds = 0.0;
@@ -2222,10 +2268,10 @@ fn render_native_rows(
         finalize_seconds += tick.elapsed().as_secs_f64();
         let tick = Instant::now();
         if let Some(writer) = depth_writer.as_mut() {
-            writer.write_rows(&depth)?;
+            writer.write_rows(&depth, pool)?;
         }
         if let Some(writer) = wse_writer.as_mut() {
-            writer.write_rows(&wse)?;
+            writer.write_rows(&wse, pool)?;
         }
         write_seconds += tick.elapsed().as_secs_f64();
     }
@@ -2237,10 +2283,13 @@ fn render_native_rows(
         writer.finish()?;
     }
     write_seconds += tick.elapsed().as_secs_f64();
-    let header = json!({"id":profile.id,"status":"complete","pixels":window.owner.len(),
+    let mut header = json!({"id":profile.id,"status":"complete","pixels":window.owner.len(),
         "products":"native-geotiff/1","depth_finite_pixels":finite_pixels,"flooded_pixels":flooded_pixels,
         "selected_products":output.products,"compression":output.compression,
         "row_stream_rows":output.row_stream_rows,"write_seconds":write_seconds,"storage_render_seconds":0.0});
+    if let Some(format) = &output.final_format {
+        header["final_format"] = json!(format);
+    }
     let tick = Instant::now();
     let mut stream = std::io::stdout().lock();
     writeln!(stream, "{header}")?;
