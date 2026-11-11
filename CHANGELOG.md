@@ -8,6 +8,24 @@ still advertises `rasmapper-effective-terrain/1` with request schema 1 only;
 schema 2 is accepted and described under `effective_terrain.parked`, and a
 schema 1 receipt still reports method `/1`.
 
+### Effective terrain: RAS Mapper's per-tile export TIN (gap fill)
+
+After sampling, each 256-pixel output tile now triangulates the edges of valid
+render blocks that border off blocks and rasterizes the TIN over the tile, as
+RasMapperLib 7.0.1's export does (interoperability study, prose findings only;
+no vendor code used or copied): segments from every visited source with a
+two-block halo, hash-ordered per source, constrained Delaunay insertion, data
+side and wider-than-2.0001-cells triangles deleted, inclusive edge-function
+rasterization. One-cell gaps and source seams are bridged. The terrain HDF's
+stored stitch TIN is no longer used for values; `stitch_tin` stays accepted and
+validated in the request. On five real HEC-RAS 7.0.1 terrains (modifications
+off, whole terrain vs export a, excluding pixels where two exports differ): B3
+bit-identical; B4 1 mask pixel; B1 and B2 3 mask pixels; 0 values on all B
+terrains; A 0 mask and 300 values (354 vs export a and 406 vs export b
+overall), all inside gap fills where the segment order ties decide. The report
+gains `export_tin` and `sample_seconds`; `stitch_tin` reports
+`{"supplied", "used": false}`. Method IDs and request schemas are unchanged.
+
 ### Effective terrain: RAS Mapper's render-block sampling
 
 The base mosaic now samples each source by render block, as RasMapperLib
@@ -18,9 +36,9 @@ binary64 with the block-centre term in binary32, and the extent-derived cell
 size for the default lattice. On five real multi-source terrains (HEC-RAS
 7.0.1, modifications off) this leaves no value differences and no extra valid
 pixels outside the stitch TIN. B3 drops from 30,628 to 3,227 mask differences
-and B4 from 479 to 1 value difference. The remaining differences are pixels
-RAS Mapper fills with its own per-tile export TIN, which is not reproduced
-yet; the stored stitch TIN is still used. Method IDs are unchanged.
+and B4 from 479 to 1 value difference. The remaining differences were pixels
+RAS Mapper fills with its own per-tile export TIN, now reproduced (see the
+export TIN entry above). Method IDs are unchanged.
 
 ### Terrain modifications on the effective terrain (`rasmapper-effective-terrain/2`)
 

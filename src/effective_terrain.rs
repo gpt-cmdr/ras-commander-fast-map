@@ -3,12 +3,9 @@
 //!
 //! Reproduces the float32 grid that `RasTerrain.export_rasmapper_terrain()`
 //! obtains from RasMapperLib (HEC-RAS 7.0.1) for an unmodified terrain, from
-//! the terrain's own source TIFFs, level-0 tile masks and stitch TIN. The rule
-//! below describes that exported output and is
-//! qualified pixel-for-pixel on BaldEagleCrkMulti2D Terrain50 (two sources,
-//! 197,179,058 valid pixels) and five synthetic terrains built by HEC-RAS
-//! 7.0.1 (one to three sources, coarse-over-fine, fine-over-coarse,
-//! non-commensurate lattices, nodata holes).
+//! the terrain's own source TIFFs and level-0 tile masks. The rule below
+//! describes that exported output; its qualification on real HEC-RAS 7.0.1
+//! exports is recorded in `method_record`.
 //!
 //! The rule follows RasMapperLib's export path as established by an
 //! interoperability study of HEC-RAS 7.0.1 (prose findings only; no vendor
@@ -34,12 +31,15 @@
 //! 4. **Value.** The block is split along both diagonals into four
 //!    triangles. Arithmetic is binary64 on the binary32 corner values and
 //!    fractions, with the block-centre term held in binary32.
-//! 5. **Stitch TIN.** Pixels inside the terrain HDF's stored stitch TIN
-//!    (inclusive barycentric weights `>= -1e-9`, later triangles win) take
-//!    the triangle's linear value. RAS Mapper instead triangulates the
-//!    render-block edges of each output tile during the export; that is not
-//!    reproduced yet, so pixels near nodata edges and source seams can differ
-//!    (see `method_record`).
+//! 5. **Export TIN (gap fill).** After sampling, every 256-pixel output tile
+//!    triangulates the edges of valid render blocks that border off blocks
+//!    (all sources, within a two-block halo), deletes triangles on the data
+//!    side and triangles wider or taller than 2.0001 cells, and rasterizes
+//!    the rest over the tile, overwriting sampled values (`export_tin`).
+//!    One-cell gaps between valid blocks and source seams are bridged. The
+//!    terrain HDF's stored `Stitch TIN` is not used: RAS Mapper's export
+//!    does not use it either. The request's `stitch_tin` is still accepted
+//!    and validated for schema compatibility, and ignored.
 //!
 //! Every value is rounded to binary32 and then to the nearest 1/32 (ties to
 //! even), as RAS Mapper stores terrain values.
@@ -48,6 +48,7 @@
 //! `terrain_mods`; unqualified modification forms are refused.
 use crate::{
     MapError,
+    export_tin::{self, BlockLattice, BlockSource, TileGrid},
     model::{self, CrsIdentity, NodataPolicy, QueryConvention},
     terrain::NativeTerrain,
 };
@@ -69,7 +70,6 @@ pub const SCHEMA_V1: &str = "ras-commander-effective-terrain-request/1";
 /// Nodata of the written terrain, as in RAS Mapper's export.
 pub const NODATA: f32 = -9999.0;
 const TILE: usize = 256;
-const TIN_INCLUSION: f64 = -1e-9;
 
 /// A raw little-endian array file staged by the caller.
 #[derive(Clone, Debug, Deserialize)]
@@ -97,7 +97,8 @@ pub struct Source {
 }
 
 /// `Terrain/Stitch TIN Points` (`<f8` `[n, 4]`: x, y, z, cell size) and
-/// `Terrain/Stitch TIN Triangles` (`<i4` `[m, 3]`).
+/// `Terrain/Stitch TIN Triangles` (`<i4` `[m, 3]`). Accepted for request
+/// compatibility; the rule does not use it (see the module docs, item 5).
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StitchTin {
@@ -172,18 +173,20 @@ pub fn method_record() -> Value {
             "modifications": crate::terrain_mods::method_record()
         },
         "lattice": "finest source by extent-derived cell size (ties: priority), union of source extents snapped outward; or a supplied grid. Pixel centres follow the export's 256-pixel tiles with recomputed tile pitch and pixel size",
-        "order": "stitch TIN first; then sources in priority order, first to answer wins",
+        "order": "sources in priority order, first to answer wins; then the per-tile export TIN overwrites the pixels it covers",
         "source_test": "render block (quad between four source cell centres, 256-block tiles half a cell inside the source extent) located with recomputed tile geometry; the block answers when bit 0 of its level-0 mask byte is set",
         "interpolation": "four triangles on both block diagonals; binary32 fractions and corners, binary64 arithmetic, block-centre term held in binary32",
-        "stitch_tin": "stored terrain-HDF stitch TIN: linear in the containing triangle, weights >= -1e-9, later triangles win (RAS Mapper's per-tile export TIN is not reproduced yet)",
+        "export_tin": "per 256-pixel output tile: edges of valid render blocks with off neighbours (mask bits 1-4) from every source the tile visits (two-block halo), each source's segments stable-sorted by hash of A.X (type id 7) with equal-hash order modelled as 8 range partitions per block tile; constrained Delaunay TIN (merge tolerance min(0.01, 0.1 x smallest cell)); triangles touching the super polygon, wider or taller than 2.0001 x largest cell, or on the data side of a segment are deleted; the rest rasterized over the tile (inclusive edge functions, binary64 stepping, later triangles win), then rounded like every value. One-cell gaps and source seams are bridged",
+        "stitch_tin": "the terrain HDF's stored stitch TIN is accepted in the request for compatibility and not used (RAS Mapper's export does not use it)",
         "rounding": "binary32, then nearest 1/32 with ties to even",
         "nodata": NODATA,
         "qualified": {
-            "synthetic HEC-RAS 7.0.1 terrains (1-3 sources)": "4 of 5 bit-identical; 5 stitch-TIN corner px differ on the fifth (687,908 valid)",
-            "real multi-source terrains (5, 1-5 sources, 1 ft and 3.28 ft, modifications off)": "with the stored stitch TIN disabled: 0 value differences and no pixel valid where the export is nodata; the only differences are pixels the export fills with its per-tile TIN (2,762 to 24,952 per terrain)",
-            "BaldEagleCrkMulti2D Terrain50 (2 sources, 20 ft + 36.5 ft)": "qualified under the previous rule (8 stitch-TIN values differed); not re-run since the render-block rule"
+            "real terrains B1-B4 (HEC-RAS 7.0.1, 1-2 sources, 254.7M valid px each, modifications off, whole terrain vs export a)": "B3 bit-identical; B4 1 pixel nodata where the export is valid; B1 and B2 1 such pixel plus 2 pixels valid where the export is nodata; 0 value differences on all four",
+            "real terrain A (HEC-RAS 7.0.1, 5 sources, 164.3M valid px, modifications off)": "0 mask differences; 354 value differences vs export a and 406 vs export b (the two exports differ on 160 px); all inside export-TIN gap fills",
+            "synthetic HEC-RAS 7.0.1 terrains (1-3 sources)": "not re-run with the export TIN (4 of 5 were bit-identical under the stored stitch TIN)",
+            "BaldEagleCrkMulti2D Terrain50 (2 sources, 20 ft + 36.5 ft)": "not re-run since the render-block rule"
         },
-        "known_differences": "near nodata edges and source seams: RAS Mapper triangulates render-block edges per 256-pixel output tile during the export and fills gaps of one cell; this engine uses the stored stitch TIN instead, which fills a different set of pixels. RAS Mapper's own repeated exports also disagree on some of these pixels",
+        "known_differences": "inside export-TIN gap fills: the order of segments with equal hash comes from RAS Mapper's parallel collection and its hash seed varies by process, which decides cocircular Delaunay ties; this engine fixes one order (type id 7, 8 range partitions). On terrain A another seed order (type id 23) leaves 82 value differences in an independent prototype, consistent with the remaining differences being ordering ties. RAS Mapper's own repeated exports also disagree on some of these pixels",
         "refused": "terrains with modifications (parked; see parked.modifications), non-float32/rotated/non-square sources, sources in different CRSs"
     })
 }
@@ -283,107 +286,10 @@ pub fn snap_grid(extent: [f64; 4], origin_x: f64, origin_y: f64, cell: f64) -> O
     })
 }
 
-fn read_exact_len(path: &Path, expected: u64) -> Result<Vec<u8>, MapError> {
-    let len = std::fs::metadata(path)?.len();
-    if len != expected {
-        return Err(invalid(format!(
-            "{}: {len} bytes, expected {expected}",
-            path.display()
-        )));
-    }
-    let mut buf = Vec::with_capacity(expected as usize);
-    File::open(path)?.read_to_end(&mut buf)?;
-    Ok(buf)
-}
-
-struct Tin {
-    points: Vec<[f64; 4]>,
-    triangles: Vec<[u32; 3]>,
-}
-
-fn load_tin(base: &Path, t: &StitchTin) -> Result<Tin, MapError> {
-    let (n, m) = (t.points.shape[0], t.triangles.shape[0]);
-    let pb = read_exact_len(&model::resolve(base, &t.points.path), (n * 32) as u64)?;
-    let tb = read_exact_len(&model::resolve(base, &t.triangles.path), (m * 12) as u64)?;
-    let points: Vec<[f64; 4]> = pb
-        .as_chunks::<32>()
-        .0
-        .iter()
-        .map(|p| {
-            let (q, _) = p.as_chunks::<8>();
-            [0, 1, 2, 3].map(|k| f64::from_le_bytes(q[k]))
-        })
-        .collect();
-    let mut triangles = Vec::with_capacity(m);
-    for c in tb.as_chunks::<12>().0 {
-        let mut tri = [0_u32; 3];
-        for (v, b) in tri.iter_mut().zip(c.as_chunks::<4>().0) {
-            let i = i32::from_le_bytes(*b);
-            if i < 0 || i as usize >= n {
-                return Err(invalid(format!("stitch TIN index {i} outside {n} points")));
-            }
-            *v = i as u32;
-        }
-        triangles.push(tri);
-    }
-    if points
-        .iter()
-        .any(|p| !(p[0].is_finite() && p[1].is_finite() && p[2].is_finite()))
-    {
-        return Err(invalid("stitch TIN points must be finite"));
-    }
-    Ok(Tin { points, triangles })
-}
-
 /// RAS Mapper's terrain value rounding: binary32, then 1/32 with ties to even.
 #[inline]
 pub fn quantize(v: f64) -> f32 {
     (((v as f32) as f64 * 32.0).round_ties_even() / 32.0) as f32
-}
-
-/// Rasterize the stitch TIN into `out`; returns the per-pixel hit bitmap.
-fn rasterize_tin(tin: &Tin, grid: &Grid, out: &mut [f32]) -> (Vec<u64>, u64) {
-    let (w, h) = (grid.width, grid.height);
-    let (ox, oy, cs) = (grid.origin_x, grid.origin_y, grid.cell_size);
-    let mut hit = vec![0_u64; (w * h).div_ceil(64)];
-    let mut count = 0_u64;
-    for t in &tin.triangles {
-        let [p0, p1, p2] = t.map(|i| tin.points[i as usize]);
-        let (x0, y0, z0) = (p0[0], p0[1], p0[2]);
-        let (x1, y1, z1) = (p1[0], p1[1], p1[2]);
-        let (x2, y2, z2) = (p2[0], p2[1], p2[2]);
-        let det = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
-        if det == 0.0 {
-            continue;
-        }
-        let (xmin, xmax) = (x0.min(x1).min(x2), x0.max(x1).max(x2));
-        let (ymin, ymax) = (y0.min(y1).min(y2), y0.max(y1).max(y2));
-        let c0 = ((xmin - ox) / cs - 0.5).floor().max(0.0);
-        let c1 = ((xmax - ox) / cs - 0.5).ceil().min(w as f64 - 1.0);
-        let r0 = ((oy - ymax) / cs - 0.5).floor().max(0.0);
-        let r1 = ((oy - ymin) / cs - 0.5).ceil().min(h as f64 - 1.0);
-        if c1 < c0 || r1 < r0 {
-            continue;
-        }
-        for r in r0 as usize..=r1 as usize {
-            let py = oy - (r as f64 + 0.5) * cs;
-            for c in c0 as usize..=c1 as usize {
-                let px = ox + (c as f64 + 0.5) * cs;
-                let l0 = ((y1 - y2) * (px - x2) + (x2 - x1) * (py - y2)) / det;
-                let l1 = ((y2 - y0) * (px - x2) + (x0 - x2) * (py - y2)) / det;
-                let l2 = 1.0 - l0 - l1;
-                if l0 >= TIN_INCLUSION && l1 >= TIN_INCLUSION && l2 >= TIN_INCLUSION {
-                    let i = r * w + c;
-                    out[i] = quantize(l0 * z0 + l1 * z1 + l2 * z2);
-                    if hit[i / 64] & (1 << (i % 64)) == 0 {
-                        hit[i / 64] |= 1 << (i % 64);
-                        count += 1;
-                    }
-                }
-            }
-        }
-    }
-    (hit, count)
 }
 
 /// One source with its render-block mask file and lattice.
@@ -392,6 +298,100 @@ struct SourceData {
     mask_path: std::path::PathBuf,
     tiles_x: usize,
     lattice: SourceLattice,
+    /// Per block tile: some valid block has an off neighbour (export TIN).
+    edges: Vec<bool>,
+}
+
+impl SourceData {
+    /// Which block tiles have valid blocks with off neighbours, one block-tile
+    /// row (`tiles_x` x 64 KiB) per task.
+    fn scan_edges(&self) -> Result<Vec<bool>, MapError> {
+        let tiles_y = self.terrain.height.div_ceil(TILE);
+        let rows: Vec<Result<Vec<bool>, MapError>> = (0..tiles_y)
+            .into_par_iter()
+            .map(|ty| {
+                let mut file = File::open(&self.mask_path)?;
+                let mut buf = vec![0_u8; self.tiles_x * TILE * TILE];
+                file.seek(SeekFrom::Start((ty * buf.len()) as u64))?;
+                file.read_exact(&mut buf)?;
+                Ok(buf
+                    .as_chunks::<{ TILE * TILE }>()
+                    .0
+                    .iter()
+                    .map(|t| {
+                        t.iter().any(|b| {
+                            b & export_tin::BLOCK_VALID != 0 && b & export_tin::BLOCK_EDGES != 0
+                        })
+                    })
+                    .collect())
+            })
+            .collect();
+        let mut out = Vec::with_capacity(tiles_y * self.tiles_x);
+        for r in rows {
+            out.extend(r?);
+        }
+        Ok(out)
+    }
+}
+
+impl BlockSource for SourceData {
+    fn extent(&self) -> [f64; 4] {
+        let g = &self.terrain.gt;
+        let (w, h) = (self.terrain.width as f64, self.terrain.height as f64);
+        [g[0], g[0] + w * g[1], g[3] + h * g[5], g[3]]
+    }
+
+    fn lattice(&self) -> BlockLattice {
+        let l = &self.lattice;
+        BlockLattice {
+            min_x: l.min_x,
+            max_y: l.max_y,
+            pitch: l.pitch,
+            tiles_x: l.tiles_x,
+            tiles_y: l.tiles_y,
+        }
+    }
+
+    fn tile_has_edges(&self, tile: usize) -> bool {
+        self.edges.get(tile).copied().unwrap_or(false)
+    }
+
+    fn mask_rows(&self, tile: usize, row0: usize, rows: usize) -> Result<Vec<u8>, MapError> {
+        let mut file = File::open(&self.mask_path)?;
+        file.seek(SeekFrom::Start((tile * TILE * TILE + row0 * TILE) as u64))?;
+        let mut buf = vec![0_u8; rows * TILE];
+        file.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    fn values(
+        &self,
+        row0: usize,
+        rows: usize,
+        col0: usize,
+        cols: usize,
+    ) -> Result<Vec<f32>, MapError> {
+        let t = &self.terrain;
+        let mut out = vec![f32::NAN; rows * cols];
+        let (r1, c1) = ((row0 + rows).min(t.height), (col0 + cols).min(t.width));
+        if row0 >= r1 || col0 >= c1 {
+            return Ok(out);
+        }
+        let (bw, bh) = t.block;
+        for by in row0 / bh..=(r1 - 1) / bh {
+            for bx in col0 / bw..=(c1 - 1) / bw {
+                let win = t.block_window(bx, by);
+                let block = t.get_block(bx, by)?;
+                let (xa, xb) = (col0.max(win.x), c1.min(win.x + win.width));
+                for r in row0.max(win.y)..r1.min(win.y + win.height) {
+                    let src = &block[(r - win.y) * win.width..][..win.width];
+                    out[(r - row0) * cols + xa - col0..][..xb - xa]
+                        .copy_from_slice(&src[xa - win.x..xb - win.x]);
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// A source's render-block lattice. A render block is the quad between four
@@ -529,6 +529,17 @@ impl OutputLattice {
 
     fn y(&self, l: usize, p: f64, j: usize) -> f64 {
         (self.max_y - self.pitch * l as f64) - p * (j as f64 + 0.5)
+    }
+
+    /// Full 256 x 256 geometry of output tile (`l`, `m`).
+    fn tile_grid(&self, l: usize, m: usize) -> TileGrid {
+        let p = self.pitch;
+        TileGrid::new(
+            self.min_x + p * m as f64,
+            self.min_x + p * (m + 1) as f64,
+            self.max_y - p * (l + 1) as f64,
+            self.max_y - p * l as f64,
+        )
     }
 }
 
@@ -693,6 +704,7 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
             mask_path,
             tiles_x,
             lattice,
+            edges: Vec::new(),
         });
     }
     let grid = match req.grid {
@@ -729,11 +741,14 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
                 .ok_or_else(|| invalid("snapped grid is empty or too large"))?
         }
     };
-    // Output values plus the stitch-TIN bitmap; source bands and the block
-    // cache (max_working_bytes / 4 across sources) come on top.
+    // Planned memory: output values, the source block caches
+    // (max_working_bytes / 4 across sources), `batch` export-TIN tile results
+    // held between parallel batches, and one export-TIN share per worker for
+    // its segments, mask rows, value windows and TIN (checked per tile
+    // before each read). Source row bands of the sampler come on top.
     let out_bytes = (grid.width as u64)
         .checked_mul(grid.height as u64)
-        .and_then(|n| n.checked_mul(4).map(|b| b + n / 8 + 8))
+        .and_then(|n| n.checked_mul(4))
         .ok_or_else(|| MapError::Budget("output size overflows".into()))?;
     if out_bytes > req.max_working_bytes {
         return Err(MapError::Budget(format!(
@@ -741,22 +756,28 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
             grid.width, grid.height, req.max_working_bytes
         )));
     }
+    let threads = req.threads as u64;
+    let remaining = req
+        .max_working_bytes
+        .saturating_sub(out_bytes + req.max_working_bytes / 4);
+    let batch = (4 * threads).min(remaining / (2 * export_tin::TILE_RESULT_BYTES));
+    if batch == 0 {
+        return Err(MapError::Budget(format!(
+            "export TIN needs at least {} bytes beyond the output grid; max_working_bytes is {}",
+            2 * export_tin::TILE_RESULT_BYTES + out_bytes,
+            req.max_working_bytes
+        )));
+    }
+    let tin_share = (remaining - batch * export_tin::TILE_RESULT_BYTES) / threads;
     let mut values = vec![NODATA; grid.width * grid.height];
-    let tin_started = Instant::now();
-    let (hit, tin_pixels, tin_triangles) = match &req.stitch_tin {
-        Some(t) => {
-            let tin = load_tin(base, t)?;
-            let (hit, n) = rasterize_tin(&tin, &grid, &mut values);
-            (hit, n, tin.triangles.len())
-        }
-        None => (vec![0_u64; (grid.width * grid.height).div_ceil(64)], 0, 0),
-    };
-    let tin_seconds = tin_started.elapsed().as_secs_f64();
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(req.threads)
         .build()
         .map_err(|e| MapError::Internal(format!("thread pool: {e}")))?;
+    for s in sources.iter_mut() {
+        s.edges = pool.install(|| s.scan_edges())?;
+    }
     // Strips stay inside one 256-row output tile, so each strip has a
     // single output tile row.
     const STRIP: usize = 64;
@@ -798,9 +819,7 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
                             let Some((br, fy)) = *rowf else { continue };
                             for (i, colf) in cols_at[..c1 - c0].iter().enumerate() {
                                 let o = (r0 + j) * width + c0 + i;
-                                if out[o - r0 * width] != NODATA
-                                    || hit[o / 64] & (1 << (o % 64)) != 0
-                                {
+                                if out[o - r0 * width] != NODATA {
                                     continue;
                                 }
                                 let Some((bc, fx)) = *colf else { continue };
@@ -822,6 +841,70 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
             *t += v;
         }
     }
+    let sample_seconds = started.elapsed().as_secs_f64();
+
+    // Export TIN per output tile, in parallel batches; each tile writes only
+    // its own pixels, clipped to the grid.
+    let tin_started = Instant::now();
+    let srcs: Vec<&dyn BlockSource> = sources.iter().map(|s| s as &dyn BlockSource).collect();
+    let (tiles_x, tiles_y) = (width.div_ceil(TILE), grid.height.div_ceil(TILE));
+    let tiles: Vec<(usize, usize)> = (0..tiles_y)
+        .flat_map(|l| (0..tiles_x).map(move |m| (l, m)))
+        .collect();
+    let (mut n_tiles, mut n_segs, mut n_tris, mut n_px, mut n_cross) =
+        (0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
+    let mut failures = Vec::new();
+    for chunk in tiles.chunks(batch as usize) {
+        let results: Vec<Result<export_tin::TileOutcome, MapError>> = pool.install(|| {
+            chunk
+                .par_iter()
+                .map(|&(l, m)| {
+                    let mut plan = export_tin::Plan {
+                        share: tin_share,
+                        used: 0,
+                    };
+                    export_tin::tile(&srcs, &lattice.tile_grid(l, m), &mut plan)
+                })
+                .collect()
+        });
+        for (&(l, m), r) in chunk.iter().zip(results) {
+            let o = r?;
+            if o.segments == 0 {
+                continue;
+            }
+            n_tiles += 1;
+            n_segs += o.segments;
+            n_tris += o.triangles;
+            n_cross += o.crossings;
+            if let Some(e) = o.error {
+                failures.push(json!({"tile": [l, m], "error": e.0}));
+            }
+            let Some(buf) = o.values else { continue };
+            for i in 0..TILE.min(grid.height - l * TILE) {
+                let row = (l * TILE + i) * width + m * TILE;
+                for j in 0..TILE.min(width - m * TILE) {
+                    let z = buf[i * TILE + j];
+                    if !z.is_nan() {
+                        values[row + j] = if z == NODATA {
+                            NODATA
+                        } else {
+                            quantize(z as f64)
+                        };
+                        n_px += 1;
+                    }
+                }
+            }
+        }
+    }
+    let failed_tiles = failures.len();
+    failures.truncate(20);
+    let tin = json!({
+        "tiles": n_tiles, "segments": n_segs, "triangles": n_tris, "pixels": n_px,
+        "constraint_crossings": n_cross, "failed_tiles": failed_tiles, "failures": failures,
+        "hash_type_id": export_tin::HASH_TYPE_ID, "collect_workers": export_tin::COLLECT_WORKERS,
+        "seconds": tin_started.elapsed().as_secs_f64(),
+    });
+
     let mods_started = Instant::now();
     let mods = crate::terrain_mods::apply(&req.modification_layers, &grid, &mut values)?;
     let mods_seconds = mods_started.elapsed().as_secs_f64();
@@ -840,7 +923,9 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
             "width": s.terrain.width, "height": s.terrain.height, "pixels": n,
             "cache": s.terrain.stats().cache,
         })).collect::<Vec<_>>(),
-        "stitch_tin": {"triangles": tin_triangles, "pixels": tin_pixels, "seconds": tin_seconds},
+        "sample_seconds": sample_seconds,
+        "export_tin": tin,
+        "stitch_tin": {"supplied": req.stitch_tin.is_some(), "used": false},
         "modifications": {"layers": mods, "seconds": mods_seconds},
         "valid_pixels": valid,
         "seconds": started.elapsed().as_secs_f64(),

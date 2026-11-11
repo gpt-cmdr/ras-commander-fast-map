@@ -11,12 +11,22 @@ evidence.
 
 ## Work, in order of payoff
 
-1. **Fix the base rule on the corpora** (`base_mosaic_rule.md`). Without this, even
-   unmodified versions of these terrains are not exact.
-   - B-series stitch-TIN pixels (deterministic in RAS Mapper, so derivable).
-   - Near-equal source cell sizes (10th digit) in the lattice/ownership rule: the
-     B3 nodata mask (27,289 px) and B4 1/32 values (478 px).
-   - Re-check corpus A's TIN pixels that match none of 5 RAS Mapper exports.
+1. **Base rule on the corpora: done (2026-11-11)** (`base_mosaic_rule.md`).
+   Render-block sampling plus the per-tile export TIN. Whole terrains with all
+   modification layers, HEC-RAS 7.0.1, two exports each, pixels where the exports
+   disagree excluded:
+
+   | Terrain | Mask diff | Value diff | Where |
+   |---|---:|---:|---|
+   | B4 | 0 | 0 | meets the bar |
+   | B3 | 2 | 0 | on modified pixels |
+   | B1 | 2 | 3 | 1/32 ties on modified pixels (item 4) |
+   | B2 | 2 | 443 | 439 on modified pixels: the channel/levee joint (item 4) |
+   | A | 0 | 322 | 283 off modified pixels: export-TIN cocircular ties whose order RAS Mapper takes from a per-process hash and thread scheduling; 39 on modified pixels |
+
+   Remaining base work: the few B mask pixels, and whether A's tie pixels can be
+   matched (they move with RAS Mapper's hash seed, so a fixed order cannot
+   reproduce every export).
 2. **Control points and polygons with boundary elevations** (corpora C, D, E): the
    largest refused classes by layer count.
 3. **Ground-line `System Name` joins, Set/Add ground lines, Max Reach <= Top Width**
