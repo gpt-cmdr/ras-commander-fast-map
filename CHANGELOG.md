@@ -18,6 +18,20 @@ Measured on the Whisky Chitto p04 staged schema /2 requests (4,483 XS, 12,919 x
 4 CPUs): render 0.99 s at 1 worker, 0.49 s at 4; call total 4.58 s to 4.10 s;
 outputs SHA256-equal to v0.17.0.
 
+### Inline storage composition for 1D requests
+
+`one-d-diagnostic` schemas /2-/3 accept an optional `storage` block (polygon
+file, area count, one level file per profile and the window geotransform). The
+engine rasterizes physical storage labels once, then for every profile applies
+the unchanged level-pool kernel and coverage-first composition with zero 2D
+cells in memory, replacing a `storage` and a `coupled-diagnostic` process and
+their full-grid raw files per profile. Products and composition counts are
+bit-identical to the three-call route; per-profile reports carry the storage
+and composition method records and counts. Method records advertise
+`inline_storage` (not with the stored grid contract). On Whisky Chitto p04
+(full grid, 8 profiles, `final_format`), Commander mapping took 38.4 s against
+124.9 s with separate storage and composition calls.
+
 ### Engine-written 1D and composition delivery GeoTIFFs
 
 `one-d-diagnostic` schemas /2-/4 and coupled composition schemas /1-/2 accept

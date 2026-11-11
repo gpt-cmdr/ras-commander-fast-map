@@ -550,3 +550,125 @@ fn final_format_options_are_refused_before_outputs() {
         );
     }
 }
+
+fn storage_polygon() -> Vec<u8> {
+    // One rectangle over columns 0-3 and rows 0-1 of the populated fixture grid.
+    let mut wkb = vec![1];
+    wkb.extend(3_u32.to_le_bytes());
+    wkb.extend(1_u32.to_le_bytes());
+    wkb.extend(5_u32.to_le_bytes());
+    for [x, y] in [
+        [1000.125_f64, 1997.75_f64],
+        [1005.125, 1997.75],
+        [1005.125, 2000.25],
+        [1000.125, 2000.25],
+        [1000.125, 1997.75],
+    ] {
+        wkb.extend(x.to_le_bytes());
+        wkb.extend(y.to_le_bytes());
+    }
+    let mut out = (wkb.len() as u32).to_le_bytes().to_vec();
+    out.extend(wkb);
+    out
+}
+
+#[test]
+fn inline_storage_matches_storage_then_composition_bits() {
+    let fixture = Fixture::populated();
+    fs::write(fixture.root.join("areas.wkb"), storage_polygon()).unwrap();
+    write_f32(&fixture.root.join("pool-wet.bin"), &[5.0]);
+    write_f32(&fixture.root.join("pool-dry.bin"), &[-1.0]);
+    let gt = json!([1000.125, 1.25, 0., 2000.25, 0., -1.25]);
+    let pools = ["pool-wet.bin", "pool-dry.bin"];
+    // Three-call reference per profile.
+    for (i, pool) in pools.iter().enumerate() {
+        fixture
+            .run(fixture.request.clone(), &format!("xs-{i}"))
+            .unwrap();
+        let storage: ras_commander_fast_map::storage_session::Request = serde_json::from_value(json!({
+            "schema": "fast-map-storage/1", "storage_areas_file": "areas.wkb", "storage_area_count": 1,
+            "levels_file": pool, "terrain_file": "terrain.bin", "width": 6, "height": 5,
+            "geo_transform": gt, "max_working_bytes": 16_777_216, "threads": 2})).unwrap();
+        ras_commander_fast_map::storage_session::run(
+            &storage,
+            &fixture.root,
+            &fixture.root.join(format!("pool-{i}")),
+        )
+        .unwrap();
+        fs::write(fixture.root.join("zero.u32"), [0_u8; 120]).unwrap();
+        write_f32(&fixture.root.join("dry.f32"), &[f32::NAN; 30]);
+        let component = |d: String, w: String| {
+            json!({"profile_id": "p", "crs": "c", "width": 6, "height": 5,
+            "geo_transform": gt, "depth_file": d, "wse_file": w})
+        };
+        let compose: ras_commander_fast_map::coupled_session::Request = serde_json::from_value(json!({
+            "schema": "fast-map-coupled-diagnostic/2",
+            "xs": component(format!("xs-{i}/depth.bin"), format!("xs-{i}/wse.bin")),
+            "two_d": component("dry.f32".into(), "dry.f32".into()),
+            "two_d_owners_file": "zero.u32", "two_d_cell_count": 0,
+            "storage": {"component": component(format!("pool-{i}/depth.bin"), format!("pool-{i}/wse.bin")),
+                "owners_file": format!("pool-{i}/owners.bin"), "area_count": 1},
+            "max_working_bytes": 16_777_216})).unwrap();
+        ras_commander_fast_map::coupled_session::run(
+            &compose,
+            &fixture.root,
+            &fixture.root.join(format!("composed-{i}")),
+        )
+        .unwrap();
+    }
+    for threads in [1, 3] {
+        let mut inline = fixture.request.clone();
+        inline.as_object_mut().unwrap().remove("levels_file");
+        inline["levels_files"] = json!(["levels.bin", "levels.bin"]);
+        inline["threads"] = json!(threads);
+        inline["storage"] = json!({"storage_areas_file": "areas.wkb", "storage_area_count": 1,
+            "levels_files": pools, "geo_transform": gt});
+        inline["max_working_bytes"] = json!(16_777_216);
+        let out = format!("inline-{threads}");
+        fixture.run(inline, &out).unwrap();
+        for i in 0..2 {
+            for product in ["depth", "wse"] {
+                assert_eq!(
+                    fs::read(fixture.root.join(format!("composed-{i}/{product}.bin"))).unwrap(),
+                    fs::read(
+                        fixture
+                            .root
+                            .join(format!("{out}/profile-{i:04}/{product}.bin"))
+                    )
+                    .unwrap(),
+                    "profile {i} {product} threads {threads}"
+                );
+            }
+            let report: Value = serde_json::from_slice(
+                &fs::read(
+                    fixture
+                        .root
+                        .join(format!("{out}/profile-{i:04}/report.json")),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let reference: Value = serde_json::from_slice(
+                &fs::read(fixture.root.join(format!("composed-{i}/report.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(report["composition"]["counts"], reference["counts"]);
+            assert_eq!(report["composition"]["method"], reference["method"]);
+        }
+    }
+    // The wet pool must actually change the composition relative to the dry one.
+    assert_ne!(
+        fs::read(fixture.root.join("composed-0/wse.bin")).unwrap(),
+        fs::read(fixture.root.join("composed-1/wse.bin")).unwrap()
+    );
+    // Refusals before outputs: wrong transform, wrong levels count, stored grid excluded.
+    let mut bad = fixture.request.clone();
+    bad["max_working_bytes"] = json!(16_777_216);
+    bad["storage"] = json!({"storage_areas_file": "areas.wkb", "storage_area_count": 1,
+        "levels_files": ["pool-wet.bin"], "geo_transform": [1000.0, 1.25, 0., 2000.25, 0., -1.25]});
+    assert!(fixture.run(bad.clone(), "bad-gt").is_err());
+    bad["storage"]["geo_transform"] = gt.clone();
+    bad["storage"]["levels_files"] = json!(["pool-wet.bin", "pool-dry.bin"]);
+    assert!(fixture.run(bad, "bad-count").is_err());
+    assert!(!fixture.root.join("bad-gt").exists() && !fixture.root.join("bad-count").exists());
+}

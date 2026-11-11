@@ -89,6 +89,31 @@ pub struct Request {
     pub aoi_mask_file: Option<PathBuf>,
     #[serde(default)]
     pub flooded_depth_range: Option<[f32; 2]>,
+    /// Schemas /2-/3: storage level pools composed in process (see `InlineStorage`).
+    #[serde(default)]
+    pub storage: Option<InlineStorage>,
+}
+
+/// In-process equivalent of `storage` + `coupled-diagnostic` /2 with zero 2D
+/// cells: physical storage labels are rasterized once on the window grid, then
+/// every profile's level pools and composition use the unchanged kernels.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InlineStorage {
+    pub storage_areas_file: PathBuf,
+    pub storage_area_count: usize,
+    /// One finite Float32 WSE file per profile, in profile order.
+    pub levels_files: Vec<PathBuf>,
+    /// Window geotransform; must equal the 1D output window exactly.
+    pub geo_transform: [f64; 6],
+}
+
+pub fn storage_capability() -> Value {
+    json!({"control": "storage", "schemas": [NATIVE_SCHEMA, CLIPPED_SCHEMA],
+        "storage_method_id": crate::storage_area::METHOD_ID,
+        "composition_method_id": crate::coupled::STORAGE_METHOD_ID,
+        "equivalent": "storage /1 then coupled-diagnostic /2 with zero 2D cells; labels rasterized once",
+        "outputs": "composed Depth/WSE bit-identical to the three-call route"})
 }
 
 impl Request {
@@ -182,6 +207,17 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         }
     };
     let multi = req.levels_files.is_some();
+    if let Some(storage) = &req.storage
+        && (stored_grid
+            || !native
+            || storage.storage_area_count == 0
+            || storage.storage_area_count >= u32::MAX as usize
+            || storage.levels_files.len() != level_paths.len())
+    {
+        return Err(MapError::Invalid(
+            "inline storage needs schema /2 or /3, a valid area count and one levels file per profile".into(),
+        ));
+    }
     let threads = req.threads.unwrap_or(1);
     if threads == 0 || threads > 64 || (!native && threads != 1) {
         return Err(MapError::Invalid(
@@ -336,8 +372,35 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         .and_then(|v| v.checked_add(65536 + 8192 + 65536))
         .and_then(|v| v.checked_add(worker_extra))
         .ok_or_else(|| MapError::Budget("1D request allocation overflow".into()))?;
+    // Inline storage: rasterization scratch and labels as in the storage
+    // transport, plus storage products, the dry mesh and composed outputs.
+    let storage_bytes = match &req.storage {
+        Some(storage) => {
+            if storage.geo_transform != output_gt {
+                return Err(MapError::Invalid(
+                    "inline storage geotransform must equal the 1D output window".into(),
+                ));
+            }
+            let polygon_bytes =
+                usize::try_from(fs::metadata(base.join(&storage.storage_areas_file))?.len())
+                    .map_err(|_| MapError::Budget("storage polygon size overflow".into()))?;
+            pixels
+                .checked_mul(128)
+                .and_then(|v| polygon_bytes.checked_mul(32).and_then(|p| v.checked_add(p)))
+                .and_then(|v| {
+                    storage
+                        .storage_area_count
+                        .checked_mul(4096 + 4 * storage.levels_files.len())
+                        .and_then(|p| v.checked_add(p))
+                })
+                .and_then(|v| v.checked_add(1024 * 1024))
+                .ok_or_else(|| MapError::Budget("storage allocation plan overflow".into()))?
+        }
+        None => 0,
+    };
     let planned = planned
-        .checked_add(delivery_bytes)
+        .checked_add(storage_bytes)
+        .and_then(|v| v.checked_add(delivery_bytes))
         .ok_or_else(|| MapError::Budget("1D request allocation overflow".into()))?;
     if planned > req.max_working_bytes {
         return Err(MapError::Budget(format!(
@@ -404,6 +467,14 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
     let mask = match &delivery {
         Some(plan) => plan.read_mask(base)?,
         None => None,
+    };
+    let storage_levels = match &req.storage {
+        Some(storage) => storage
+            .levels_files
+            .iter()
+            .map(|p| crate::storage_area::values(&base.join(p), storage.storage_area_count))
+            .collect::<Result<Vec<_>, _>>()?,
+        None => Vec::new(),
     };
     if terrain.iter().any(|v| v.is_infinite()) {
         return Err(MapError::Invalid("1D terrain must be finite or NaN".into()));
@@ -493,6 +564,53 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
     } else {
         None
     };
+    let mut inline = match &req.storage {
+        Some(storage) => {
+            if terrain.iter().any(|v| v.is_infinite()) {
+                return Err(MapError::Invalid("infinite storage terrain".into()));
+            }
+            let mut labels = vec![0_u32; pixels];
+            let storage_pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads.min(4))
+                .build()
+                .map_err(|e| MapError::Internal(e.to_string()))?;
+            let grid = terrio::ops::rasterize::Grid {
+                geo_transform: storage.geo_transform,
+                cols: window.width,
+                rows: window.height,
+                crs: Default::default(),
+            };
+            let mut prepared = crate::storage_area::prepare(
+                &base.join(&storage.storage_areas_file),
+                storage.storage_area_count,
+                &grid,
+                &labels,
+                None,
+                &storage_pool,
+            )?;
+            for ((&p, &label), ground) in prepared
+                .pixels
+                .iter()
+                .zip(&prepared.labels)
+                .zip(&mut prepared.ground)
+            {
+                labels[p] = label + 1;
+                *ground = terrain[p];
+            }
+            Some(Inline {
+                prepared,
+                labels,
+                area_count: storage.storage_area_count,
+                zero_owners: vec![0_u32; pixels],
+                dry: vec![f32::NAN; pixels],
+                storage_depth: vec![f32::NAN; pixels],
+                storage_wse: vec![f32::NAN; pixels],
+                depth: vec![f32::NAN; pixels],
+                wse: vec![f32::NAN; pixels],
+            })
+        }
+        None => None,
+    };
     let method = if clipped {
         crate::one_d_native::clipped_method_record()
     } else if native {
@@ -569,9 +687,25 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
             }
             Err(e) => return Err(e),
         };
+        let storage_fields = match inline.as_mut() {
+            Some(inline) => match inline.compose(&storage_levels[index], &mut depth, &mut wse) {
+                Ok(fields) => Some(fields),
+                Err(e) if multi => {
+                    failure = Some((index, e));
+                    break;
+                }
+                Err(e) => return Err(e),
+            },
+            None => None,
+        };
         let render_seconds = tick.elapsed().as_secs_f64();
         let tick = Instant::now();
         let mut report = profile_report(valid);
+        if let Some(fields) = storage_fields {
+            for (key, value) in fields.as_object().into_iter().flatten() {
+                report[key] = value.clone();
+            }
+        }
         if !created {
             fs::create_dir(output)?;
             created = true;
@@ -674,4 +808,69 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         return Err(e);
     }
     Ok(report)
+}
+
+/// Per-request inline storage state; buffers are reused for every profile.
+struct Inline {
+    prepared: crate::storage_area::StorageAreaPixels,
+    labels: Vec<u32>,
+    area_count: usize,
+    zero_owners: Vec<u32>,
+    dry: Vec<f32>,
+    storage_depth: Vec<f32>,
+    storage_wse: Vec<f32>,
+    depth: Vec<f32>,
+    wse: Vec<f32>,
+}
+
+impl Inline {
+    /// Level pools then coverage-first composition; the composed products are
+    /// swapped into `depth`/`wse` (the XS buffers are re-filled by the next render).
+    fn compose(
+        &mut self,
+        levels: &[f32],
+        depth: &mut Vec<f32>,
+        wse: &mut Vec<f32>,
+    ) -> Result<Value, MapError> {
+        for &p in &self.prepared.pixels {
+            self.storage_depth[p] = f32::NAN;
+            self.storage_wse[p] = f32::NAN;
+        }
+        let storage_valid = crate::storage_area::apply(
+            &self.prepared,
+            levels,
+            0.,
+            &mut self.storage_depth,
+            &mut self.storage_wse,
+        )?;
+        self.depth.fill(f32::NAN);
+        self.wse.fill(f32::NAN);
+        let counts = crate::coupled::compose_with_storage_into(
+            &self.zero_owners,
+            0,
+            crate::coupled::Products { depth, wse },
+            crate::coupled::Products {
+                depth: &self.dry,
+                wse: &self.dry,
+            },
+            crate::coupled::Storage {
+                owners: &self.labels,
+                area_count: self.area_count,
+                products: crate::coupled::Products {
+                    depth: &self.storage_depth,
+                    wse: &self.storage_wse,
+                },
+            },
+            &mut self.depth,
+            &mut self.wse,
+        )?;
+        std::mem::swap(depth, &mut self.depth);
+        std::mem::swap(wse, &mut self.wse);
+        Ok(json!({
+            "storage": {"method": crate::storage_session::method_record(),
+                "storage_owned_pixels": self.prepared.pixels.len(), "valid_pixels": storage_valid},
+            "composition": {"method": crate::coupled::storage_method_record(),
+                "counts": serde_json::to_value(counts).map_err(|e| MapError::Internal(e.to_string()))?},
+        }))
+    }
 }

@@ -155,6 +155,10 @@ pub fn engine_method_record() -> serde_json::Value {
 fn stored_xs_record() -> serde_json::Value {
     let mut record = crate::one_d_native::clipped_method_record();
     record["grid_contracts"] = serde_json::json!([crate::stored_grid::ID]);
+    // Inline storage composition is not offered with the stored grid contract.
+    if let Some(map) = record.as_object_mut() {
+        map.remove("inline_storage");
+    }
     record
 }
 
