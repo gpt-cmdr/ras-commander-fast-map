@@ -10,6 +10,7 @@ use std::{
     fs::{self, File},
     io::{BufReader, Read},
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 pub const SCHEMA: &str = "fast-map-one-d-diagnostic/1";
@@ -68,6 +69,10 @@ pub struct Request {
     /// Explicitly excludes unsupported encroachment and blocked-polygon mapping.
     #[serde(default)]
     pub clipping_scope: Option<String>,
+    /// Optional render workers for schemas /2-/4 (default 1). Source tile rows
+    /// render independently, so outputs are identical for every worker count.
+    #[serde(default)]
+    pub threads: Option<usize>,
 }
 
 pub(crate) fn read_records<const N: usize, T>(
@@ -106,6 +111,7 @@ fn nonnegative(value: i32) -> Result<usize, MapError> {
 }
 
 pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError> {
+    let started = Instant::now();
     let stored_grid = req.schema == STORED_GRID_SCHEMA;
     let clipped = req.schema == CLIPPED_SCHEMA || stored_grid;
     let native = req.schema == NATIVE_SCHEMA || clipped;
@@ -136,6 +142,12 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
                 || req.clipping_scope.is_some()))
     {
         return Err(MapError::Invalid("1D schema /3 requires normalized M, XS clips and explicit clipping scope; older schemas exclude clipping".into()));
+    }
+    let threads = req.threads.unwrap_or(1);
+    if threads == 0 || threads > 64 || (!native && threads != 1) {
+        return Err(MapError::Invalid(
+            "1D threads must be 1-64, and 1 for schema /1".into(),
+        ));
     }
     let gt = req.geo_transform;
     let window = req.window.unwrap_or(Window {
@@ -230,6 +242,21 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
     } else {
         PreparedSurface::planned_bytes(req.point_count, req.triangle_count, req.segment_count)?
     };
+    // Each extra render worker: tile claim bytes plus triangle candidate references.
+    let worker_extra = req
+        .tile_size
+        .unwrap_or(0)
+        .checked_mul(req.tile_size.unwrap_or(0))
+        .and_then(|n| {
+            req.triangle_count
+                .checked_mul(std::mem::size_of::<usize>())
+                .and_then(|m| n.checked_add(m))
+        })
+        .and_then(|n| n.checked_mul(threads - 1))
+        .ok_or_else(|| MapError::Budget("1D worker scratch overflow".into()))?;
+    let surface_budget = geometry
+        .checked_add(worker_extra)
+        .ok_or_else(|| MapError::Budget("1D worker scratch overflow".into()))?;
     let planned = pixels
         .checked_mul(12)
         .and_then(|v| {
@@ -245,6 +272,7 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         .and_then(|v| v.checked_add(geometry))
         // Float32 conversion scratch, BufWriter, and bounded report overhead.
         .and_then(|v| v.checked_add(65536 + 8192 + 65536))
+        .and_then(|v| v.checked_add(worker_extra))
         .ok_or_else(|| MapError::Budget("1D request allocation overflow".into()))?;
     if planned > req.max_working_bytes {
         return Err(MapError::Budget(format!(
@@ -253,6 +281,7 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         )));
     }
     // No payload reads precede admission. Numeric records are little-endian.
+    let tick = Instant::now();
     let points = read_records(
         &base.join(&req.points_file),
         req.point_count,
@@ -304,6 +333,9 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
     if terrain.iter().any(|v| v.is_infinite()) {
         return Err(MapError::Invalid("1D terrain must be finite or NaN".into()));
     }
+    let read_seconds = tick.elapsed().as_secs_f64();
+    let mut prepare_seconds = 0.0;
+    let tick = Instant::now();
     let mut depth = Vec::new();
     let mut wse = Vec::new();
     depth
@@ -313,6 +345,8 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         .map_err(|e| MapError::Budget(e.to_string()))?;
     depth.resize(pixels, f32::NAN);
     wse.resize(pixels, f32::NAN);
+    let alloc_seconds = tick.elapsed().as_secs_f64();
+    let tick = Instant::now();
     let valid = if native {
         let ranks = read_records(
             &base.join(req.render_order_file.as_ref().unwrap()),
@@ -347,7 +381,7 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
                 &ranks,
                 &normalized_m,
                 &clips,
-                geometry,
+                surface_budget,
             )?
         } else {
             crate::one_d_native::PreparedSurface::new(
@@ -356,10 +390,21 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
                 &segments,
                 req.cross_section_count,
                 &ranks,
-                geometry,
+                surface_budget,
             )?
         };
-        surface.render_into(
+        prepare_seconds = tick.elapsed().as_secs_f64();
+        let pool = if threads > 1 {
+            Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .map_err(|e| MapError::Internal(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        surface.render_into_with(
             &levels,
             &terrain,
             crate::one_d_native::Grid {
@@ -376,6 +421,7 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
             },
             &mut depth,
             &mut wse,
+            pool.as_ref(),
         )?
     } else {
         let surface = PreparedSurface::new(
@@ -401,6 +447,7 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         }
         valid
     };
+    let render_seconds = tick.elapsed().as_secs_f64() - prepare_seconds;
     let output_gt = layout
         .map(|l| l.window_transform([window.col, window.row, window.width, window.height]))
         .unwrap_or([
@@ -421,11 +468,22 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         report["grid_contract"] = json!(req.grid_contract);
         report["output_geo_transform"] = json!(layout.output);
     }
+    let tick = Instant::now();
     let result = (|| {
         crate::horizontal::write_values(&output.join("depth.bin"), &depth)?;
         crate::horizontal::write_values(&output.join("wse.bin"), &wse)?;
         Ok::<_, MapError>(())
     })();
+    // Additive report fields; wall seconds on the calling thread.
+    report["threads"] = json!(threads);
+    report["timing"] = json!({
+        "read_seconds": read_seconds,
+        "allocate_seconds": alloc_seconds,
+        "surface_prepare_seconds": prepare_seconds,
+        "render_seconds": render_seconds,
+        "write_seconds": tick.elapsed().as_secs_f64(),
+        "total_seconds": started.elapsed().as_secs_f64(),
+    });
     if let Err(e) = &result {
         report["status"] = json!("aborted");
         report["error"] = json!(e.to_string());

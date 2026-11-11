@@ -30,7 +30,10 @@ pub fn method_record() -> serde_json::Value {
         "terrain_layout": "original full square north-up raster and terrain tile size; AOI uses global tile history",
         "visibility": "finite WSE >= f32(terrain + 0.001); depth = f32(WSE - terrain)",
         "scope": "prepared XS surfaces only; storage composition and obstruction clipping are external",
-        "profile_missing": "either missing endpoint retains ownership but yields nodata"
+        "profile_missing": "either missing endpoint retains ownership but yields nodata",
+        "render_workers": {"control": "threads", "default": 1, "min": 1, "max": 64,
+            "split": "whole source tile rows; per-tile claims, candidate order and scanline increments unchanged",
+            "outputs": "bit-identical for every worker count", "report_timing": true}
     })
 }
 
@@ -601,6 +604,34 @@ impl PreparedSurface {
         depth: &mut [f32],
         wse: &mut [f32],
     ) -> Result<usize, MapError> {
+        self.render_into_with(levels, terrain, grid, window, depth, wse, None)
+    }
+
+    /// Bytes of per-worker render scratch: one claim byte per tile pixel plus
+    /// candidate references for every stored triangle.
+    pub fn worker_scratch_bytes(&self, tile_size: usize) -> Option<usize> {
+        tile_size.checked_mul(tile_size).and_then(|n| {
+            self.tree
+                .size()
+                .checked_mul(std::mem::size_of::<&Triangle>())
+                .and_then(|m| n.checked_add(m))
+        })
+    }
+
+    /// Renders whole source-tile rows independently. Every tile keeps its own
+    /// claim scratch, candidate order and per-scanline incremental arithmetic, so
+    /// the result is identical for any worker count; only tile rows are split.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_into_with(
+        &self,
+        levels: &[f32],
+        terrain: &[f32],
+        grid: Grid,
+        window: Window,
+        depth: &mut [f32],
+        wse: &mut [f32],
+        pool: Option<&rayon::ThreadPool>,
+    ) -> Result<usize, MapError> {
         let layout = Layout::new(grid, window)?;
         let pixels = window
             .width
@@ -621,20 +652,23 @@ impl PreparedSurface {
             .tile_size
             .checked_mul(grid.tile_size)
             .ok_or_else(|| MapError::Budget("native XS tile overflow".into()))?;
+        // Worker 0 is covered by the admitted geometry; each extra worker adds
+        // its own claim and candidate scratch.
+        let workers = pool.map_or(1, |p| p.current_num_threads().max(1));
+        let extra = self
+            .worker_scratch_bytes(grid.tile_size)
+            .and_then(|n| n.checked_mul(workers - 1))
+            .ok_or_else(|| MapError::Budget("native XS worker scratch overflow".into()))?;
         if self
             .geometry_bytes
             .checked_add(tile_pixels)
+            .and_then(|n| n.checked_add(extra))
             .is_none_or(|n| n > self.max_bytes)
         {
             return Err(MapError::Budget(
                 "native XS tile exceeds admitted geometry and scratch bytes".into(),
             ));
         }
-        let mut claimed = Vec::<u8>::new();
-        reserve(&mut claimed, tile_pixels)?;
-        claimed.resize(tile_pixels, 0);
-        let mut candidates = Vec::<&Triangle>::new();
-        reserve(&mut candidates, self.tree.size())?;
         let start_row = window.row / grid.tile_size;
         let end_row = (window.row + window.height - 1) / grid.tile_size;
         let start_col = window.col / grid.tile_size;
@@ -647,62 +681,124 @@ impl PreparedSurface {
         }
         depth.fill(f32::NAN);
         wse.fill(f32::NAN);
-        let mut valid = 0;
+        // One output band per source tile row, clipped to the window.
+        let mut bands = Vec::new();
+        reserve(&mut bands, end_row - start_row + 1)?;
+        let (mut depth_rest, mut wse_rest) = (depth, wse);
         for tr in start_row..=end_row {
+            let top = (tr * grid.tile_size).max(window.row);
+            let bottom = ((tr + 1) * grid.tile_size).min(window.row + window.height);
+            let len = (bottom - top) * window.width;
+            let (d, dr) = std::mem::take(&mut depth_rest).split_at_mut(len);
+            let (w, wr) = std::mem::take(&mut wse_rest).split_at_mut(len);
+            depth_rest = dr;
+            wse_rest = wr;
+            bands.push((tr, top, d, w));
+        }
+        let band = |(tr, top, d, w): (usize, usize, &mut [f32], &mut [f32])| {
+            let mut claimed = Vec::<u8>::new();
+            reserve(&mut claimed, tile_pixels)?;
+            claimed.resize(tile_pixels, 0);
+            let mut candidates = Vec::<&Triangle>::new();
+            reserve(&mut candidates, self.tree.size())?;
+            let mut valid = 0;
             for tc in start_col..=end_col {
-                let tile = layout.tile(tr, tc)?;
-                claimed.fill(0);
-                candidates.clear();
-                candidates.extend(self.tree.locate_in_envelope_intersecting(tile.bounds()));
-                candidates.sort_unstable_by_key(|t| (t.rank, t.id));
-                for t in &candidates {
-                    let m_plane = self.clipping.as_ref().map(|data| data.planes[t.id]);
-                    t.scan(&tile, m_plane, |r, c, z, m| {
-                        let local = r * grid.tile_size + c;
-                        if claimed[local] != 0 {
-                            return;
-                        }
-                        claimed[local] = 1;
-                        let row = tr * grid.tile_size + r;
-                        let col = tc * grid.tile_size + c;
-                        if row < window.row
-                            || row >= window.row + window.height
-                            || col < window.col
-                            || col >= window.col + window.width
-                        {
-                            return;
-                        }
-                        let out = (row - window.row) * window.width + col - window.col;
-                        let ground = terrain[out];
-                        let us = levels[t.upstream];
-                        let ds = levels[t.downstream];
-                        if !ground.is_finite() || !us.is_finite() || !ds.is_finite() {
-                            return;
-                        }
-                        let weight = z as f32;
-                        let water = weight * us + (1.0_f32 - weight) * ds;
-                        if let Some(data) = &self.clipping
-                            && !crate::one_d_clip::visible(
-                                data.clips[t.upstream],
-                                data.clips[t.downstream],
-                                us,
-                                ds,
-                                weight,
-                                m as f32,
-                                water,
-                            )
-                        {
-                            return;
-                        }
-                        let d = water - ground;
-                        if water.is_finite() && d.is_finite() && water >= ground + 0.001_f32 {
-                            depth[out] = d;
-                            wse[out] = water;
-                            valid += 1;
-                        }
-                    });
-                }
+                valid += self.render_tile(
+                    &layout,
+                    levels,
+                    &terrain[(top - window.row) * window.width..][..d.len()],
+                    grid,
+                    window,
+                    (tr, tc, top),
+                    &mut claimed,
+                    &mut candidates,
+                    d,
+                    w,
+                )?;
             }
+            Ok::<usize, MapError>(valid)
+        };
+        match pool {
+            Some(pool) if workers > 1 => {
+                use rayon::prelude::*;
+                pool.install(|| {
+                    bands
+                        .into_par_iter()
+                        .map(band)
+                        .sum::<Result<usize, MapError>>()
+                })
+            }
+            _ => bands.into_iter().map(band).sum(),
+        }
+    }
+
+    /// One source tile; `band` outputs start at global row `top`.
+    #[allow(clippy::too_many_arguments)]
+    fn render_tile<'a>(
+        &'a self,
+        layout: &Layout,
+        levels: &[f32],
+        terrain: &[f32],
+        grid: Grid,
+        window: Window,
+        (tr, tc, top): (usize, usize, usize),
+        claimed: &mut [u8],
+        candidates: &mut Vec<&'a Triangle>,
+        depth: &mut [f32],
+        wse: &mut [f32],
+    ) -> Result<usize, MapError> {
+        let tile = layout.tile(tr, tc)?;
+        claimed.fill(0);
+        candidates.clear();
+        candidates.extend(self.tree.locate_in_envelope_intersecting(tile.bounds()));
+        candidates.sort_unstable_by_key(|t| (t.rank, t.id));
+        let mut valid = 0;
+        for t in candidates.iter() {
+            let m_plane = self.clipping.as_ref().map(|data| data.planes[t.id]);
+            t.scan(&tile, m_plane, |r, c, z, m| {
+                let local = r * grid.tile_size + c;
+                if claimed[local] != 0 {
+                    return;
+                }
+                claimed[local] = 1;
+                let row = tr * grid.tile_size + r;
+                let col = tc * grid.tile_size + c;
+                if row < window.row
+                    || row >= window.row + window.height
+                    || col < window.col
+                    || col >= window.col + window.width
+                {
+                    return;
+                }
+                let out = (row - top) * window.width + col - window.col;
+                let ground = terrain[out];
+                let us = levels[t.upstream];
+                let ds = levels[t.downstream];
+                if !ground.is_finite() || !us.is_finite() || !ds.is_finite() {
+                    return;
+                }
+                let weight = z as f32;
+                let water = weight * us + (1.0_f32 - weight) * ds;
+                if let Some(data) = &self.clipping
+                    && !crate::one_d_clip::visible(
+                        data.clips[t.upstream],
+                        data.clips[t.downstream],
+                        us,
+                        ds,
+                        weight,
+                        m as f32,
+                        water,
+                    )
+                {
+                    return;
+                }
+                let d = water - ground;
+                if water.is_finite() && d.is_finite() && water >= ground + 0.001_f32 {
+                    depth[out] = d;
+                    wse[out] = water;
+                    valid += 1;
+                }
+            });
         }
         Ok(valid)
     }
@@ -1018,6 +1114,116 @@ mod tests {
             .render_into(&[12., 8.], &[0.; 4], grid(), crop, &mut cd, &mut cw)
             .unwrap();
         assert_eq!(cw, [wse[5], wse[6], wse[9], wse[10]]);
+    }
+    #[test]
+    fn tile_row_workers_match_serial_bits_for_every_window() {
+        // Overlapping random segments, NaN levels/terrain, odd grid and crops.
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let g = Grid {
+            width: 37,
+            height: 29,
+            geo_transform: [100., 0.5, 0., 50., 0., -0.5],
+            tile_size: 4,
+        };
+        let (mut points, mut triangles, mut segments) = (vec![], vec![], vec![]);
+        for i in 0..14 {
+            let start = points.len();
+            for _ in 0..6 {
+                points.push([97. + next() * 24., 33. + next() * 20., next(), 0.]);
+            }
+            let first = triangles.len();
+            triangles.extend([[0, 1, 2], [1, 2, 3], [2, 3, 4], [3, 4, 5]]);
+            segments.push(Segment {
+                point_start: start,
+                point_count: 6,
+                triangle_start: first,
+                triangle_count: 4,
+                upstream: i,
+                downstream: i + 1,
+            });
+        }
+        let ranks: Vec<u32> = (0..14).rev().collect();
+        let surface =
+            PreparedSurface::new(&points, &triangles, &segments, 15, &ranks, 1 << 30).unwrap();
+        let mut levels: Vec<f32> = (0..15).map(|i| 3. + i as f32 * 0.37).collect();
+        levels[6] = f32::NAN;
+        let windows = [
+            window_of(0, 0, 37, 29),
+            window_of(3, 5, 30, 21),
+            window_of(9, 1, 1, 27),
+            window_of(0, 27, 37, 2),
+        ];
+        for w in windows {
+            let terrain: Vec<f32> = (0..w.width * w.height)
+                .map(|i| {
+                    if i % 17 == 3 {
+                        f32::NAN
+                    } else {
+                        next() as f32 * 6.
+                    }
+                })
+                .collect();
+            let n = w.width * w.height;
+            let (mut d0, mut w0) = (vec![0.; n], vec![0.; n]);
+            let serial = surface
+                .render_into(&levels, &terrain, g, w, &mut d0, &mut w0)
+                .unwrap();
+            assert!(serial > 0);
+            for threads in 1..=5 {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let (mut d1, mut w1) = (vec![1.; n], vec![1.; n]);
+                let valid = surface
+                    .render_into_with(&levels, &terrain, g, w, &mut d1, &mut w1, Some(&pool))
+                    .unwrap();
+                assert_eq!(valid, serial);
+                assert!(d0.iter().zip(&d1).all(|(a, b)| a.to_bits() == b.to_bits()));
+                assert!(w0.iter().zip(&w1).all(|(a, b)| a.to_bits() == b.to_bits()));
+            }
+        }
+    }
+    fn window_of(col: usize, row: usize, width: usize, height: usize) -> Window {
+        Window {
+            col,
+            row,
+            width,
+            height,
+        }
+    }
+    #[test]
+    fn worker_scratch_is_admitted_before_output_mutation() {
+        let (p, t, s) = square();
+        let surface =
+            PreparedSurface::new(&p, &t, &[s], 2, &[0], 4 * 32 + 2 * 1024 + 64 + 4).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap();
+        let (mut d, mut w) = (vec![7.; 16], vec![7.; 16]);
+        assert!(matches!(
+            surface.render_into_with(
+                &[12., 8.],
+                &[0.; 16],
+                grid(),
+                window(),
+                &mut d,
+                &mut w,
+                Some(&pool)
+            ),
+            Err(MapError::Budget(_))
+        ));
+        assert!(d.iter().chain(&w).all(|v| *v == 7.));
+        surface
+            .render_into(&[12., 8.], &[0.; 16], grid(), window(), &mut d, &mut w)
+            .unwrap();
     }
     #[test]
     fn rank_claims_before_dry_and_missing_and_validates_permutation() {

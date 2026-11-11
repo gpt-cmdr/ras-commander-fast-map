@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Parallel native 1D render and 1D phase timers
+
+`one-d-diagnostic` schemas /2, /3 and /4 accept an optional `threads` field
+(1-64, default 1; schema /1 accepts only 1). Whole source-terrain tile rows are
+rendered on one request pool; every tile keeps its own claim scratch, candidate
+order and per-scanline incremental arithmetic, so Depth/WSE are bit-identical
+for every worker count. Extra-worker scratch is admitted before any read. The
+native and clipped 1D method records advertise `render_workers`; method IDs
+and arithmetic are unchanged. Reports add `threads` and a `timing` object
+(read, allocate, surface prepare, render, write, total seconds).
+
+Measured on the Whisky Chitto p04 staged schema /2 requests (4,483 XS, 12,919 x
+17,409 grid, 3 profiles, warm medians of 3, Linux i9-11900 container pinned to
+4 CPUs): render 0.99 s at 1 worker, 0.49 s at 4; call total 4.58 s to 4.10 s;
+outputs SHA256-equal to v0.17.0.
+
 ## 0.17.0 - 2026-11-10
 
 ### Final-format native delivery
