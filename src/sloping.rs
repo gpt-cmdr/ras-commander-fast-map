@@ -753,44 +753,74 @@ pub fn prepare_stencils(
             if mesh.cells[cell].virtual_cell {
                 return Ok(None);
             }
-            let mut points = Vec::with_capacity(faces.len());
-            let mut corners = Vec::with_capacity(faces.len());
-            for &id in faces {
-                let face = mesh
-                    .faces
-                    .get(id)
-                    .ok_or_else(|| MapError::Invalid("cell face out of range".into()))?;
-                let vertex = if face.cells[0] == cell {
-                    face.vertices[0]
-                } else if face.cells[1] == cell {
-                    face.vertices[1]
-                } else {
-                    return Err(MapError::Invalid("cell not incident to face".into()));
-                };
-                let corner = &mesh.corners[vertex];
-                let slot =
-                    corner.faces.iter().position(|&f| f == id).ok_or_else(|| {
-                        MapError::Invalid("cell face not incident to corner".into())
-                    })?;
-                points.push(corner.point);
-                corners.push([vertex, slot]);
-            }
-            let polygon = PolygonStencil::new(points)?;
-            let square = polygon.square_bounds();
-            Ok(Some(CellStencil {
-                square_center: None,
-                physical_ring: Vec::new(),
-                polygon,
-                square,
-                corners,
-                faces: faces
-                    .iter()
-                    .map(|&id| [id, usize::from(mesh.faces[id].cells[0] != cell)])
-                    .collect(),
-                elevations: None,
-            }))
+            prepare_stencil(mesh, cell, faces).map(Some)
         })
         .collect()
+}
+
+/// One physical cell's stencil from its ordered faces, on an already validated mesh.
+/// Shared by complete and staged-subset geometry so ring ordering cannot diverge.
+pub(crate) fn prepare_stencil(
+    mesh: &Mesh,
+    cell: usize,
+    faces: &[usize],
+) -> Result<CellStencil, MapError> {
+    let mut points = Vec::with_capacity(faces.len());
+    let mut corners = Vec::with_capacity(faces.len());
+    for &id in faces {
+        let face = mesh
+            .faces
+            .get(id)
+            .ok_or_else(|| MapError::Invalid("cell face out of range".into()))?;
+        let vertex = if face.cells[0] == cell {
+            face.vertices[0]
+        } else if face.cells[1] == cell {
+            face.vertices[1]
+        } else {
+            return Err(MapError::Invalid("cell not incident to face".into()));
+        };
+        let corner = &mesh.corners[vertex];
+        let slot = corner
+            .faces
+            .iter()
+            .position(|&f| f == id)
+            .ok_or_else(|| MapError::Invalid("cell face not incident to corner".into()))?;
+        points.push(corner.point);
+        corners.push([vertex, slot]);
+    }
+    let polygon = PolygonStencil::new(points)?;
+    let square = polygon.square_bounds();
+    Ok(CellStencil {
+        square_center: None,
+        physical_ring: Vec::new(),
+        polygon,
+        square,
+        corners,
+        faces: faces
+            .iter()
+            .map(|&id| [id, usize::from(mesh.faces[id].cells[0] != cell)])
+            .collect(),
+        elevations: None,
+    })
+}
+
+/// Native square centre and oriented physical perimeter of one cell's stencil.
+/// `faces` are the cell's faces in ring order as (face cells, full polyline).
+pub(crate) fn set_physical_ring<'a>(
+    stencil: &mut CellStencil,
+    cell: usize,
+    center: [f64; 2],
+    faces: impl IntoIterator<Item = ([usize; 2], &'a [[f64; 2]])>,
+) {
+    stencil.square_center = Some(center);
+    for (cells, polyline) in faces {
+        if cells[0] == cell {
+            stencil.physical_ring.extend(polyline.iter().copied());
+        } else {
+            stencil.physical_ring.extend(polyline.iter().rev().copied());
+        }
+    }
+    stencil.physical_ring.dedup();
 }
 
 impl CellStencil {
@@ -928,6 +958,17 @@ impl PreparedProfile {
             + nested(&self.depth_weights)
             + self.horizontal.capacity() * std::mem::size_of::<Option<f32>>()
             + self.wet.capacity()) as u64
+    }
+    /// A staged mesh without owner cells: rendering reads none of its cells.
+    pub(crate) fn unread(options: Options) -> Self {
+        Self {
+            local_values: Vec::new(),
+            face_values: Vec::new(),
+            depth_weights: Vec::new(),
+            horizontal: Vec::new(),
+            wet: Vec::new(),
+            options,
+        }
     }
     /// Native wet gate of a cell: WSE above its minimum plus the plot tolerance.
     pub fn is_wet(&self, cell: usize) -> bool {

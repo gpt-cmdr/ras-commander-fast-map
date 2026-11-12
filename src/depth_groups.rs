@@ -98,6 +98,7 @@ pub fn method_record() -> Value {
         "products":["depth_max"],"render_modes":["sloping"],"saved_timesteps_only":true,
         "aoi_mask":crate::aoi::METHOD,"local_spill":true,"max_inflight_profiles":1,
         "buffer_protocol":"ras-commander-depth-group-buffer/1",
+        "staged_cells":crate::sloping_binary::STAGED_METHOD,
         "hydraulic_qualification":"native-per-time-depth-reduction/prepared-2d-component/1",
         "qualification_scope":"3 saved private mixed-fixture profiles, physical 2D component, inclusive 0.5 ft cutoff, full/cropped windows, ordered/reverse/single groups, resident NONE and local-spill LZW; not native Max-WSE rendering"})
 }
@@ -455,6 +456,17 @@ pub fn run_with_session(
     }
     let mut model = req.model.clone();
     model.max_working_bytes -= reserved;
+    // Planning loads a staged compact geometry; admit its transient first.
+    if model.staged_cells_files.is_some() {
+        let transient = sloping_session::staged_transient_bytes(&model, base)?;
+        if transient > model.max_working_bytes {
+            return Err(budget(
+                "staged geometry load plus group plan",
+                add(reserved, transient)?,
+                req.model.max_working_bytes,
+            ));
+        }
+    }
     let mut peak_mapping = 0;
     // All windows are admitted before terrain payload reads or accumulator allocation.
     // Header/descriptors are inspected by the existing sloping planner.

@@ -108,6 +108,34 @@ differs from a group's list. `Max` selectors, velocity, derived products and
 slopingPretty are refused by this initial grouped contract. Storage-area inputs
 remain subject to ordinary sloping validation and terrain-scope restrictions.
 
+### Staged cell subsets
+
+`staged_cells_files` (optional, in the model; capability `staged_cells:
+"ras-commander-staged-cells/1"` in both `sloping` and `depth_groups`) lets a
+caller stage only the cells a reach can see. It lists one file per mesh, each a
+little-endian `u32` array of strictly ascending global cell ids, and every
+profile values file then holds exactly those cells' WSE in that order.
+`owner_cells` stay global ids.
+
+The engine loads the compact stencil closure of the owner cells: every face
+endpoint of an owner cell (its vertices), the complete face ring of each such
+vertex, and both cells of every face in those rings, ghost cells included.
+Corner and face values depend only on those inputs, are computed per element in
+the same ring order, and the stencils, physical perimeter rings and pixel
+ownership are unchanged, so rendered Depth/WSE are bit-identical to the
+complete mesh. A subset that lacks an owner cell or any closure cell is
+refused; extra cells are admitted. A mesh without owner cells needs any
+nonempty subset and is not read.
+
+The load holds one complete mesh array at a time; that transient (largest
+array plus the staged list) is admitted against the working budget before any
+payload read, and the geometry allowance of the array plan uses the compact
+rows' binary size in place of the complete mesh's. The report carries
+`staged_cells` (staged, owner and closure counts, parent counts, equivalent
+bytes and load transient). Velocity, shear, storage areas, terrain scope, the
+stored tile grid, `reduce_max`/derived products and ownership export are
+refused with a subset. Without the field the request is unchanged.
+
 `depth_units` explicitly means the mapped depths' vertical units; it must be
 `feet` or `metres`. It is not inferred from horizontal CRS units. The feet cutoff
 defaults to 0.5 and is converted with the exact implementation expression

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Staged cell subsets** (opt-in, capability `staged_cells`,
+  `ras-commander-staged-cells/1`): sloping and `depth-groups` requests may name
+  `staged_cells_files`, one ascending `u32` cell list per mesh. Profiles then
+  carry only those cells' WSE, and the engine loads only the owner cells'
+  stencil closure (owner vertices, their complete face rings, both cells of each
+  face) instead of the complete mesh. Depth/WSE are bit-identical; subsets
+  missing a closure cell are refused. The array plan's geometry term and every
+  per-profile hydraulic reconstruction scale with the closure instead of the
+  model. Requests without the field are unchanged.
+
 ## 0.18.0 - 2026-11-12
 
 Release summary. Read these before upgrading:
