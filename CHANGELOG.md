@@ -5,6 +5,15 @@
 - Shape-Z polygons without boundary elevations (elevations from vertex Z) are
   now refused, as `method_record` and Commander's `read_layers` already state;
   the engine previously applied them although the form is not qualified.
+- Multi-part polygons (an interior ring or several parts) are now refused
+  before any read or write. HEC-RAS 6.6 and 7.0.1 exports do not keep holes.
+  They join a feature's parts into one perimeter-TIN ring, which fills holes
+  in every winding and leaves triangulation artefacts for disjoint parts or a
+  leading hole ring. The engine previously left holes empty (even-odd), 70-467
+  px per case away from the exports. Ellipse rotation was checked against 6.6
+  and 7.0.1 exports at eight rotations: a positive rotation turns the ellipse
+  clockwise, as the engine already did (0 differences). A regression test
+  now pins the direction.
 
 Terrain modifications are no longer parked: `ras2fim-batch method` advertises
 `effective_terrain` as `rasmapper-effective-terrain/2` (request schemas 1 and
