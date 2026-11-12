@@ -648,7 +648,7 @@ absent; giving both is refused):
 
 ```json
 "crs_geokeys": {"directory": [1, 1, 0, 18, 1024, 0, 1, 1, "..."],
-  "doubles": [30.0, -87.5, "..."],
+  "doubles": ["30.0", "-87.5", "..."],
   "ascii": "NAD_1983_StatePlane_Alabama_West_FIPS_0102_Feet|NAD83|"},
 "crs_identity": {"kind": "geokeys"}
 ```
@@ -656,6 +656,10 @@ absent; giving both is refused):
 The three members are the GeoKeyDirectoryTag, GeoDoubleParamsTag and
 GeoAsciiParamsTag values of a GeoTIFF in that CRS (`ascii` without its NUL),
 as `ras2fim-batch terrain-info` prints them (`geokeys`, `geokeys_fnv1a64`).
+`doubles` are decimal strings (the shortest form that reads back as the same
+binary64), which the engine parses exactly. JSON numbers are refused there:
+serde_json's default number parser can be one unit in the last place off for
+17-digit decimals, so they would not be verbatim. Copy the object unchanged.
 Every engine-written GeoTIFF (effective terrain, LZW/NONE products and
 `final_format`) stores these three tags unchanged, so GDAL, rasterio and terrio
 decode the same CRS from the output as from the source. Nothing is converted
@@ -676,8 +680,9 @@ The terrain identity is checked before any read:
 The keys are checked only as a georeferencing model. They must be a
 well-formed directory with a projected, geographic or user-defined
 `GTModelTypeGeoKey`, PixelIsArea (or no raster type), and values stored in the
-double and ASCII tags. Reports give `output_crs: {"kind": "geokeys",
-"fnv1a64": ...}`. An effective-terrain request with `epsg: 0` and no keys is now
+double and ASCII tags. Reports (effective terrain, sloping, its
+`physical_ownership`, horizontal, 1D/coupled delivery) give `output_crs:
+{"kind": "geokeys", "fnv1a64": ...}`; depth groups refuse `crs_geokeys`. An effective-terrain request with `epsg: 0` and no keys is now
 refused: older engines wrote `ProjectedCSTypeGeoKey 0`, which GDAL reads as a
 local CRS in metres.
 

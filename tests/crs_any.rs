@@ -41,7 +41,8 @@ fn alabama_west() -> GeoKeys {
             2059, 34736, 1, 5, 3059, 0, 1, 1, 3072, 0, 1, 32767, 3074, 0, 1, 32767,
             3075, 0, 1, 1, 3076, 0, 1, 9003, 3080, 34736, 1, 1, 3081, 34736, 1, 0,
             3082, 34736, 1, 3, 3083, 34736, 1, 4, 3092, 34736, 1, 2],
-        "doubles": [30.0, -87.5, 0.999933333333333, 1968500.0, 0.0, 298.257222101, 6378137.0],
+        "doubles": ["30.0", "-87.5", "0.999933333333333", "1968500.0", "0.0", "298.257222101",
+            "6378137.0"],
         "ascii": "NAD_1983_StatePlane_Alabama_West_FIPS_0102_Feet|NAD83|"
     }))
     .unwrap()
@@ -456,8 +457,9 @@ fn sloping_depth_and_wse_carry_the_terrain_keys_in_every_writer() {
             )
             .unwrap()
         };
-        run(&k.0, true);
-        run(&e.0, false);
+        let report = run(&k.0, true);
+        assert_eq!(report["output_crs"]["fnv1a64"], alabama_west().fnv1a64());
+        assert!(run(&e.0, false).get("output_crs").is_none());
         for profile in ["a", "b"] {
             for product in ["depth", "wse"] {
                 let name = format!("{product}.tif");
@@ -481,17 +483,85 @@ fn sloping_depth_and_wse_carry_the_terrain_keys_in_every_writer() {
 fn sloping_refuses_a_label_other_than_the_terrain_keys() {
     let dir = scratch();
     let mut model = sloping_model(&dir.0, true);
-    model["crs_geokeys"]["doubles"][2] = json!(0.9999);
+    model["crs_geokeys"]["doubles"][2] = json!("0.9999");
     let req: sloping_session::Request = serde_json::from_value(model).unwrap();
     let error = sloping_session::run(&req, &dir.0, &dir.0.join("out")).unwrap_err();
     assert!(
         error.to_string().contains("differ from crs_geokeys"),
         "{error}"
     );
+    // Doubles as JSON numbers are refused: they would not parse exactly.
+    let mut model = sloping_model(&dir.0, true);
+    model["crs_geokeys"]["doubles"][2] = json!(0.999933333333333);
+    let error = serde_json::from_value::<sloping_session::Request>(model)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("must be decimal strings"), "{error}");
+    // Depth groups (EPSG only) refuse the keys before any output.
+    let mut plain = sloping_model(&dir.0, true);
+    for flag in ["stream_outputs", "geotiff_outputs"] {
+        plain.as_object_mut().unwrap().remove(flag);
+    }
+    let mut groups: ras_commander_fast_map::depth_groups::Request = serde_json::from_value(
+        json!({"schema": ras_commander_fast_map::depth_groups::SCHEMA,
+            "model": plain, "source_indices": [0, 1],
+            "depth_units": "feet", "depth_cutoff_ft": 0.0, "max_accumulator_bytes": 0,
+            "compression": "NONE", "scratch": {"path": dir.0.to_str().unwrap(),
+                "node_local": true, "max_bytes": 1024},
+            "jobs": [{"job_id": "j", "reach_id": "r", "window": [0, 0, 4, 4],
+                "groups": [{"group_id": "g", "timesteps": [0]}]}]}),
+    )
+    .unwrap();
+    assert!(
+        groups
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("EPSG code")
+    );
+    groups.model.crs_geokeys = None;
+    groups.model.epsg = 2277;
+    let other = groups
+        .validate()
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(!other.contains("crs_geokeys"), "{other}");
     let mut model = sloping_model(&dir.0, true);
     model["crs_identity"] = json!({"kind": "epsg"});
     let req: sloping_session::Request = serde_json::from_value(model).unwrap();
     assert!(sloping_session::run(&req, &dir.0, &dir.0.join("out2")).is_err());
+}
+
+#[test]
+fn doubles_round_trip_exactly_as_strings() {
+    // serde_json's default number parser reads each of these one unit in the
+    // last place off; the string form is exact.
+    let values = [
+        0.30480060960121924,
+        1.0715660391465826e-75,
+        298.2572221008827,
+        0.1 + 1_234_567.0 * 1.234_567_890_123e-7,
+    ];
+    let mut keys = alabama_west();
+    keys.directory[31] = 0;
+    keys.doubles = values.to_vec();
+    keys.directory.splice(32..36, [2059, 34736, 1, 3]);
+    let text = serde_json::to_string(&keys).unwrap();
+    let back: GeoKeys = serde_json::from_str(&text).unwrap();
+    let value: GeoKeys =
+        serde_json::from_value(serde_json::from_str::<Value>(&text).unwrap()).unwrap();
+    for parsed in [back, value] {
+        assert_eq!(
+            parsed
+                .doubles
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            values.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
 }
 
 #[test]

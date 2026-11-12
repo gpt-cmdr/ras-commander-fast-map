@@ -26,7 +26,9 @@
   kinds: `geokeys` (the terrain's own tags must equal them) and `untagged`
   (RAS Mapper terrain sources that carry no CRS). These methods advertise
   `crs_any: true`, `crs_identity_kinds` and `output_crs_kinds`.
-  `terrain-info` prints `geokeys` and `geokeys_fnv1a64`. Request schemas and
+  `terrain-info` prints `geokeys` and `geokeys_fnv1a64`; `doubles` are
+  exact decimal strings (JSON numbers are refused, as serde_json's default
+  parser can be one unit in the last place off). Request schemas and
   method IDs are unchanged; EPSG requests write the same bytes. New library
   API: `crs` module, `NativeTerrain::open_crs`,
   `effective_terrain::write_geotiff_crs`, `final_tiff::{write_crs, check_crs,

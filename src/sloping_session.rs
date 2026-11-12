@@ -1541,6 +1541,9 @@ fn run_internal(
         "threads":req.threads,"window":req.window,"planned_bytes":admitted,
         "requested_inflight_profiles":req.max_inflight_profiles,"effective_inflight_profiles":effective,
         "additional_profile_planned_bytes":additional,"profiles":[]});
+    if crs.geokeys().is_some() {
+        report["output_crs"] = crs.echo();
+    }
     if let Some(layout) = native_grid {
         report["grid_contract"] = json!(req.grid_contract);
         report["source_geo_transform"] = json!(terrain.gt);
@@ -1897,6 +1900,9 @@ fn run_internal(
                     "owner_cell_count":req.owner_cells.len(),
                     "owned_pixels":data.owner.iter().filter(|&&label| label != 0).count(),
                 });
+                if crs.geokeys().is_some() {
+                    report["physical_ownership"]["output_crs"] = crs.echo();
+                }
             }
             let window_base_bytes = count as u64 * (8 + u64::from(req.terrain_scope.is_some()))
                 + (2 * std::mem::size_of::<(WindowKey, Arc<WindowData>, u64)>()

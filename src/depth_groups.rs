@@ -125,6 +125,11 @@ fn pixels(job: &Job) -> Result<usize, MapError> {
 
 impl Request {
     pub fn validate(&self) -> Result<f32, MapError> {
+        if self.model.crs_geokeys.is_some() {
+            return Err(MapError::Unsupported(
+                "depth groups need an EPSG code; crs_geokeys is not supported here".into(),
+            ));
+        }
         if self.schema != SCHEMA
             || self.jobs.is_empty()
             || self.source_indices.is_empty()

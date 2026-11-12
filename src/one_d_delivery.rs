@@ -186,7 +186,7 @@ pub fn capability() -> Value {
         "overview_resampling":["average"],"overview_factors":"consecutive powers of two from 2",
         "overview_arithmetic":"gdal-average-cascade/1","shared_nodata_tile":true,
         "aoi_mask_file":"u8 per window pixel; 0 is nodata","flooded_count":"depth in (min, max]",
-        "requires":["epsg","flooded_depth_range"],
+        "requires":["flooded_depth_range"],"requires_one_of":[["epsg","crs_geokeys"]],
         "crs_any":true,"output_crs_kinds":crate::crs::OUTPUT_CRS_KINDS,
         "crs_geokeys":crate::crs::capability()})
 }

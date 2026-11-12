@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wbraster::{DataType, Raster, crs_info::CrsInfo, raster::RasterData};
 
-/// Bounded row writer. The header contains no pixel allocation.
+/// Bounded row writer. The header contains no pixel allocation. EPSG only:
+/// GeoKeys are added after terrio closes the file, which [`RowWriter`] and
+/// [`finish_crs`] do.
 pub(crate) fn create(
     path: &Path,
     width: usize,
@@ -14,6 +16,11 @@ pub(crate) fn create(
     crs: &OutputCrs,
     compression: crate::native_output::Compression,
 ) -> Result<terrio::GeoTiffWriter, MapError> {
+    if crs.geokeys().is_some() {
+        return Err(MapError::Internal(
+            "geotiff::create writes EPSG CRSs only; use RowWriter for GeoKeys".into(),
+        ));
+    }
     create_with_strip_rows(
         path,
         width,
@@ -124,7 +131,15 @@ impl RowWriter {
         compression: crate::native_output::Compression,
     ) -> Result<Self, MapError> {
         Ok(Self {
-            writer: create(path, width, height, transform, crs, compression)?,
+            writer: create_with_strip_rows(
+                path,
+                width,
+                height,
+                transform,
+                crs,
+                compression,
+                strip_rows(width),
+            )?,
             width,
             height,
             written: 0,

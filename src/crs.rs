@@ -47,12 +47,49 @@ pub struct GeoKeys {
     /// GeoKeyDirectoryTag SHORT values: the header `[1, 1, minor, n]` and `n`
     /// entries `[key, location, count, value or offset]`.
     pub directory: Vec<u16>,
-    /// GeoDoubleParamsTag values (empty: no tag).
-    #[serde(default)]
+    /// GeoDoubleParamsTag values (empty: no tag). In JSON each value is a
+    /// decimal **string** (Rust's shortest round-trip form, such as
+    /// `"0.999933333333333"`), parsed with the correctly rounded `str::parse`:
+    /// serde_json's default number parser can be one unit in the last place
+    /// off for 17-digit decimals, which would not be verbatim. JSON numbers
+    /// are refused.
+    #[serde(default, with = "exact_doubles")]
     pub doubles: Vec<f64>,
     /// GeoAsciiParamsTag text without the TIFF terminating NUL (empty: no tag).
     #[serde(default)]
     pub ascii: String,
+}
+
+/// `GeoKeys::doubles` as exact decimal strings.
+mod exact_doubles {
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(values: &[f64], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(values.iter().map(|v| format!("{v:?}")))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<f64>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Item {
+            Text(String),
+            Number(serde_json::Number),
+        }
+        Vec::<Item>::deserialize(d)?
+            .into_iter()
+            .map(|item| match item {
+                Item::Text(text) => text
+                    .trim()
+                    .parse::<f64>()
+                    .map_err(|e| D::Error::custom(format!("crs_geokeys.doubles: {text:?}: {e}"))),
+                Item::Number(n) => Err(D::Error::custom(format!(
+                    "crs_geokeys.doubles must be decimal strings (got the JSON number {n}); \
+                     copy them from `terrain-info`"
+                ))),
+            })
+            .collect()
+    }
 }
 
 impl GeoKeys {
@@ -242,7 +279,7 @@ pub fn advertise(record: &mut Value) {
 /// The `crs_geokeys` contract.
 pub fn capability() -> Value {
     json!({
-        "request_field": "crs_geokeys {directory, doubles, ascii}, with epsg 0 or absent",
+        "request_field": "crs_geokeys {directory, doubles, ascii}, with epsg 0 or absent; doubles are decimal strings, parsed exactly",
         "source": "the GeoKey tags of a GeoTIFF in the CRS, as `terrain-info` prints them (`geokeys`)",
         "written": "GeoKeyDirectoryTag, GeoDoubleParamsTag and GeoAsciiParamsTag copied verbatim; no WKT or PROJ conversion",
         "terrain_identity": "crs_identity geokeys: the terrain's own GeoKey tags equal crs_geokeys exactly; untagged: the terrain carries no CRS at all (RAS Mapper terrain sources in a CRS without an EPSG code) and crs_geokeys declares it; caller_verified_wkt: the pinned WKT hash as before; epsg: refused with crs_geokeys",

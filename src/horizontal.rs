@@ -400,6 +400,10 @@ pub(crate) fn run_with(
     let mut report = json!({"schema":"ras2fim-horizontal-report/1", "status":"in_progress",
         "method":method_record(), "window":req.window, "planned_bytes":admitted,
         "threads":req.threads, "profiles":[]});
+    if crs.geokeys().is_some() {
+        // Raw Float32 outputs carry no CRS; the report names it.
+        report["output_crs"] = crs.echo();
+    }
     sink::write_json(&out.join("report.json"), &report)?;
     let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || -> Result<(), MapError> {
