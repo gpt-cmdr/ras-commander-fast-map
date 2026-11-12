@@ -127,12 +127,20 @@ complete mesh. A subset that lacks an owner cell or any closure cell is
 refused; extra cells are admitted. A mesh without owner cells needs any
 nonempty subset and is not read.
 
-The load holds one complete mesh array at a time; that transient (largest
-array plus the staged list) is admitted against the working budget before any
-payload read, and the geometry allowance of the array plan uses the compact
-rows' binary size in place of the complete mesh's. The report carries
+The load reads one complete mesh array at a time and charges every
+allocation before it is made (complete arrays while held; index vectors,
+closure intermediates and the compact mesh and stencils as retained) against
+the working budget less what stays resident meanwhile: the 64 MiB terrain
+block cache, the retained window and hydraulic budgets, and any session
+geometry it would replace. Grouped requests charge it against the budget left
+after the group reserve. A load that would exceed it is refused before the
+allocation. The geometry allowance of the array plan then uses the compact
+rows' binary size in place of the complete mesh's, and the compact geometry
+joins a persistent session only after the request is admitted, so a refused
+request leaves the session unchanged. The cache key includes the owner set.
+Sloping reports, and grouped reports from their first mapped frame, carry
 `staged_cells` (staged, owner and closure counts, parent counts, equivalent
-bytes and load transient). Velocity, shear, storage areas, terrain scope, the
+bytes, load budget, charged peak and resident bytes). Velocity, shear, storage areas, terrain scope, the
 stored tile grid, `reduce_max`/derived products and ownership export are
 refused with a subset. Without the field the request is unchanged.
 

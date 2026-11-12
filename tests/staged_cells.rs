@@ -225,6 +225,12 @@ struct Model {
 }
 
 fn model(owner_box: [usize; 4]) -> Model {
+    model_with(owner_box, true, false)
+}
+
+/// `elevations`: stored corner elevations (depth weighting); `full_minima`: a
+/// cell-minimum row for every cell including ghosts (the other admitted layout).
+fn model_with(owner_box: [usize; 4], elevations: bool, full_minima: bool) -> Model {
     let dir = std::env::temp_dir().join(format!(
         "fast-map-staged-{}-{}",
         std::process::id(),
@@ -270,11 +276,15 @@ fn model(owner_box: [usize; 4]) -> Model {
         face_info.push([interior.len() as i32, points.len() as i32]);
         interior.extend(points.iter().copied());
     }
-    let arrays = json!({
+    let mut stored_minima = minima.clone();
+    if full_minima {
+        stored_minima.extend((physical..m.centers.len()).map(|g| 1000.0 + g as f32));
+    }
+    let mut arrays = json!({
         "centers":{"path":write(&dir,"centers.bin",le_pairs_f64(&m.centers)),"rows":m.centers.len()},
         "cell_info":{"path":write(&dir,"cell_info.bin",le_pairs_i32(&cell_info)),"rows":cell_info.len()},
         "cell_faces":{"path":write(&dir,"cell_faces.bin",le_pairs_i32(&cell_faces)),"rows":cell_faces.len()},
-        "cell_minimum":{"path":write(&dir,"cell_minimum.bin",le_f32(&minima)),"rows":minima.len()},
+        "cell_minimum":{"path":write(&dir,"cell_minimum.bin",le_f32(&stored_minima)),"rows":stored_minima.len()},
         "face_vertices":{"path":write(&dir,"face_vertices.bin",le_pairs_i32(&m.face_vertices.iter().map(|e| [e[0] as i32,e[1] as i32]).collect::<Vec<_>>())),"rows":m.face_vertices.len()},
         "face_cells":{"path":write(&dir,"face_cells.bin",le_pairs_i32(&m.face_cells.iter().map(|e| [e[0] as i32,e[1] as i32]).collect::<Vec<_>>())),"rows":m.face_cells.len()},
         "face_info":{"path":write(&dir,"face_info.bin",le_pairs_i32(&face_info)),"rows":face_info.len()},
@@ -284,6 +294,15 @@ fn model(owner_box: [usize; 4]) -> Model {
         "vertex_info":{"path":write(&dir,"vertex_info.bin",le_pairs_i32(&vertex_info)),"rows":vertex_info.len()},
         "vertex_faces":{"path":write(&dir,"vertex_faces.bin",le_pairs_i32(&vertex_faces)),"rows":vertex_faces.len()},
     });
+    if elevations {
+        let z: Vec<f32> = m
+            .vertices
+            .iter()
+            .map(|p| terrain_at(p[0], p[1]) - 0.3)
+            .collect();
+        arrays["vertex_elevations"] =
+            json!({"path":write(&dir,"vertex_elevations.bin",le_f32(&z)),"rows":z.len()});
+    }
     fs::write(
         dir.join("mesh.json"),
         json!({"schema":"ras-commander-sloping-mesh/1","arrays":arrays}).to_string(),
@@ -392,10 +411,33 @@ impl Model {
         }
         request
     }
+    /// The same request for another owner set (its own ownership polygons).
+    fn with_owners(&self, mut request: Value, owners: &[usize]) -> Value {
+        let tag = NEXT.fetch_add(1, Ordering::Relaxed);
+        let mut geometry = Vec::new();
+        for &k in owners {
+            let (i, j) = (k % NX, k / NX);
+            let ring =
+                [v(i, j), v(i + 1, j), v(i + 1, j + 1), v(i, j + 1)].map(|q| self.mesh.vertices[q]);
+            geometry.extend(framed_polygon(&ring));
+        }
+        request["geometry_file"] = write(self.dir(), &format!("owners-{tag}.wkb"), geometry).into();
+        request["owner_cells"] = json!(owners.iter().map(|&c| [0, c]).collect::<Vec<_>>());
+        request
+    }
     fn run(&self, request: &Value, name: &str) -> Result<(Value, Vec<Vec<u8>>), String> {
+        self.run_in(request, name, None)
+    }
+    fn run_in(
+        &self,
+        request: &Value,
+        name: &str,
+        session: Option<&mut sloping_session::PreparedSession>,
+    ) -> Result<(Value, Vec<Vec<u8>>), String> {
         let req: Request = serde_json::from_value(request.clone()).unwrap();
         let out = self.dir().join(name);
-        let report = sloping_session::run(&req, self.dir(), &out).map_err(|e| e.to_string())?;
+        let report = sloping_session::run_with_session(&req, self.dir(), &out, session)
+            .map_err(|e| e.to_string())?;
         let mut bytes = Vec::new();
         for p in 0..2 {
             for product in ["depth.bin", "wse.bin"] {
@@ -417,8 +459,17 @@ fn staged_closure_renders_complete_mesh_bits_plain_and_faces() {
         ("plain", json!({})),
         ("faces", json!({"render_mode":"slopingPretty"})),
         (
-            "weighted-shallow",
+            "shallow",
             json!({"render_mode":"slopingPretty","reduce_shallow_to_horizontal":true}),
+        ),
+        (
+            "depth-weighted",
+            json!({"render_mode":"slopingPretty","use_depth_weighted_faces":true}),
+        ),
+        (
+            "depth-weighted-shallow",
+            json!({"render_mode":"slopingPretty","use_depth_weighted_faces":true,
+                "reduce_shallow_to_horizontal":true}),
         ),
     ] {
         let (full_report, full) = m
@@ -565,4 +616,209 @@ fn grouped_maxima_with_staged_cells_match_complete_mesh() {
     assert_eq!(outputs[0].1, outputs[1].1);
     assert!(outputs[0].1[0].iter().any(|b| f32::from_bits(*b) > 0.0));
     assert!(outputs[1].2 < outputs[0].2);
+}
+
+fn boxed(b: [usize; 4]) -> Vec<usize> {
+    (b[2]..b[3])
+        .flat_map(|j| (b[0]..b[1]).map(move |i| c(i, j)))
+        .collect()
+}
+fn no_aoi(mut r: Value) -> Value {
+    r.as_object_mut().unwrap().remove("aoi_file");
+    r
+}
+
+#[test]
+fn perimeter_ghost_closures_and_stored_elevations_keep_bits() {
+    // Whole mesh, west edge, north-east corner block and the single corner cell:
+    // every closure holds ghost cells and perimeter faces.
+    for (name, owner_box, elevations, full_minima) in [
+        ("all", [0, NX, 0, NY], true, false),
+        ("west", [0, 3, 0, NY], true, true),
+        ("ne", [7, NX, 5, NY], true, false),
+        ("corner", [0, 1, 0, 1], false, true),
+    ] {
+        let m = model_with(owner_box, elevations, full_minima);
+        let staged = closure(&m.mesh, &m.owners);
+        assert!(
+            staged.iter().any(|&c| c >= NX * NY),
+            "{name}: no ghost cell"
+        );
+        let mut modes = vec![
+            ("plain", json!({})),
+            ("faces", json!({"render_mode":"slopingPretty"})),
+        ];
+        if elevations {
+            modes.push((
+                "dw",
+                json!({"render_mode":"slopingPretty","use_depth_weighted_faces":true}),
+            ));
+            modes.push((
+                "dw-shallow",
+                json!({"render_mode":"slopingPretty","use_depth_weighted_faces":true,
+                    "reduce_shallow_to_horizontal":true}),
+            ));
+        }
+        for (mode, options) in modes {
+            let (_, full) = m
+                .run(
+                    &no_aoi(m.request(None, options.clone())),
+                    &format!("{name}-{mode}-full"),
+                )
+                .unwrap();
+            let (_, subset) = m
+                .run(
+                    &no_aoi(m.request(Some(&staged), options)),
+                    &format!("{name}-{mode}-staged"),
+                )
+                .unwrap();
+            let depth: Vec<f32> = full[0]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect();
+            assert!(
+                depth.iter().any(|d| *d > 0.0 && *d < 1e4),
+                "{name}/{mode} vacuous"
+            );
+            assert_eq!(full, subset, "{name}/{mode}: staged bits differ");
+        }
+    }
+}
+
+fn two_meshes(m: &Model, request: Value, staged: bool) -> Value {
+    // The same mesh twice; owners only in mesh 0; staged, mesh 1 holds cell 0 only.
+    let mut req = request;
+    req["mesh_files"] = json!(["mesh.json", "mesh.json"]);
+    let (extra, values): (&str, Vec<f32>) = if staged {
+        fs::write(m.dir().join("one.bin"), 0u32.to_le_bytes()).unwrap();
+        ("one-v.bin", vec![m.profiles[0][0]])
+    } else {
+        ("all-v.bin", m.profiles[0].clone())
+    };
+    write(m.dir(), extra, le_f32(&values));
+    if staged {
+        req["staged_cells_files"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("one.bin"));
+    }
+    for p in req["profiles"].as_array_mut().unwrap() {
+        p["values_files"].as_array_mut().unwrap().push(json!(extra));
+    }
+    req
+}
+
+#[test]
+fn mesh_without_owners_renders_plain_and_row_streamed() {
+    let m = model([2, 8, 1, 6]);
+    let staged = closure(&m.mesh, &m.owners);
+    let full = two_meshes(&m, no_aoi(m.request(None, json!({}))), false);
+    let subset = two_meshes(&m, no_aoi(m.request(Some(&staged), json!({}))), true);
+    assert_eq!(
+        m.run(&full, "two-full").unwrap().1,
+        m.run(&subset, "two-staged").unwrap().1
+    );
+    let rows: ras_commander_fast_map::native_output::OutputOptions =
+        serde_json::from_value(json!({"row_stream_rows":8})).unwrap();
+    let mut tiffs = Vec::new();
+    for (name, mut req) in [("rows-full", full), ("rows-staged", subset)] {
+        req["geotiff_outputs"] = json!(true);
+        req["stream_outputs"] = json!(true);
+        let r: Request = serde_json::from_value(req).unwrap();
+        let out = m.dir().join(name);
+        let report =
+            sloping_session::run_with_output_options(&r, m.dir(), &out, None, Some(&rows)).unwrap();
+        assert_eq!(report["status"], "complete", "{report}");
+        tiffs.push(
+            (0..2)
+                .map(|p| fs::read(out.join(format!("p{p}/depth.tif"))).unwrap())
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(tiffs[0], tiffs[1]);
+}
+
+#[test]
+fn one_session_switches_owner_sets_and_refusal_keeps_its_geometry() {
+    let m = model([0, 1, 0, 1]);
+    let (a, b) = (boxed([1, 4, 1, 4]), boxed([5, 9, 3, 7]));
+    let mut both = a.clone();
+    both.extend(&b);
+    let staged = closure(&m.mesh, &both);
+    // One staged file and values for both owner sets.
+    let base = no_aoi(m.request(Some(&staged), json!({})));
+    let full = no_aoi(m.request(None, json!({})));
+    let mut session = sloping_session::PreparedSession::default();
+    for (step, owners) in [("a", &a), ("b", &b), ("a2", &a)] {
+        let expected = m
+            .run(
+                &m.with_owners(full.clone(), owners),
+                &format!("full-{step}"),
+            )
+            .unwrap()
+            .1;
+        let (report, got) = m
+            .run_in(
+                &m.with_owners(base.clone(), owners),
+                &format!("s-{step}"),
+                Some(&mut session),
+            )
+            .unwrap();
+        assert_eq!(expected, got, "{step}: staged bits differ");
+        // An owner-set change is a different compact geometry.
+        assert_eq!(report["session"]["geometry_reused"], false, "{step}");
+    }
+    // Full geometry in the same session, then back to the subset.
+    let (_, got) = m
+        .run_in(
+            &m.with_owners(full.clone(), &a),
+            "s-full",
+            Some(&mut session),
+        )
+        .unwrap();
+    assert_eq!(
+        got,
+        m.run(&m.with_owners(full.clone(), &a), "full-a3")
+            .unwrap()
+            .1
+    );
+    let request = m.with_owners(base.clone(), &a);
+    m.run_in(&request, "s-a3", Some(&mut session)).unwrap();
+    // A refused request for another owner set leaves the admitted geometry in place.
+    let mut refused = m.with_owners(base.clone(), &b);
+    refused["max_working_bytes"] = json!((64u64 << 20) + 1);
+    let error = m
+        .run_in(&refused, "s-refused", Some(&mut session))
+        .unwrap_err();
+    assert!(error.contains("staged geometry load"), "{error}");
+    let (report, _) = m.run_in(&request, "s-a4", Some(&mut session)).unwrap();
+    assert_eq!(report["session"]["geometry_reused"], true, "{report}");
+}
+
+#[test]
+fn malformed_compact_dimensions_are_errors_not_panics() {
+    for (key, rows_delta, width) in [
+        ("face_minimum", -1_i64, 4),
+        ("face_info", -1, 8),
+        ("vertex_elevations", 1, 4),
+    ] {
+        let m = model([2, 8, 1, 6]);
+        let staged = closure(&m.mesh, &m.owners);
+        let path = m.dir().join("mesh.json");
+        let mut header: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let array = &mut header["arrays"][key];
+        let rows = array["rows"].as_i64().unwrap() + rows_delta;
+        let file = m.dir().join(array["path"].as_str().unwrap());
+        let mut bytes = fs::read(&file).unwrap();
+        bytes.resize((rows * width) as usize, 0);
+        fs::write(&file, bytes).unwrap();
+        array["rows"] = rows.into();
+        fs::write(&path, header.to_string()).unwrap();
+        let error = m
+            .run(&m.request(Some(&staged), json!({})), "bad")
+            .unwrap_err();
+        assert!(error.contains("dimension"), "{key}: {error}");
+    }
 }

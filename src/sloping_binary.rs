@@ -273,11 +273,78 @@ pub(crate) struct Compact {
     pub parent: [usize; 3],
 }
 
-pub(crate) fn read_staged(path: &Path) -> Result<Vec<u32>, MapError> {
+/// Admission for a staged load. Every allocation is charged before it is
+/// made, from sizes known from the info rows; complete mesh arrays are
+/// released when dropped, everything else stays charged (intermediates are
+/// counted as if retained, so the charge bounds the load's heap). One budget
+/// spans every mesh of a request.
+pub(crate) struct LoadBudget {
+    limit: u64,
+    used: std::cell::Cell<u64>,
+    peak: std::cell::Cell<u64>,
+}
+
+impl LoadBudget {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            used: 0.into(),
+            peak: 0.into(),
+        }
+    }
+    fn charge(&self, bytes: u64, what: &str) -> Result<(), MapError> {
+        let used = self
+            .used
+            .get()
+            .checked_add(bytes)
+            .ok_or_else(|| MapError::Budget("staged geometry load overflow".into()))?;
+        if used > self.limit {
+            return Err(MapError::Budget(format!(
+                "staged geometry load ({what}): required {used} bytes, allowed {} bytes",
+                self.limit
+            )));
+        }
+        self.used.set(used);
+        self.peak.set(self.peak.get().max(used));
+        Ok(())
+    }
+    fn release(&self, bytes: u64) {
+        self.used.set(self.used.get().saturating_sub(bytes));
+    }
+    /// Bytes still charged: the loaded compact geometry plus intermediates.
+    pub(crate) fn used(&self) -> u64 {
+        self.used.get()
+    }
+    /// Largest charge reached while loading.
+    pub(crate) fn peak(&self) -> u64 {
+        self.peak.get()
+    }
+}
+
+/// One complete mesh array, charged while it is held.
+struct Charged<'a> {
+    bytes: Vec<u8>,
+    budget: &'a LoadBudget,
+}
+impl Drop for Charged<'_> {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes.len() as u64);
+    }
+}
+impl std::ops::Deref for Charged<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+pub(crate) fn read_staged(path: &Path, budget: &LoadBudget) -> Result<Vec<u32>, MapError> {
     let length = fs::metadata(path)?.len();
     if length == 0 || length % 4 != 0 || length > 16 << 30 {
         return Err(invalid("staged cell file must hold a nonempty <u4 array"));
     }
+    // The raw bytes and the decoded list are held together briefly.
+    budget.charge(length * 2, "staged cell list")?;
     let raw = fs::read(path)?;
     if raw.len() as u64 != length {
         return Err(invalid("staged cell file changed size"));
@@ -288,30 +355,12 @@ pub(crate) fn read_staged(path: &Path) -> Result<Vec<u32>, MapError> {
         .iter()
         .map(|v| u32::from_le_bytes(*v))
         .collect();
+    drop(raw);
+    budget.release(length);
     if cells.windows(2).any(|w| w[0] >= w[1]) {
         return Err(invalid("staged cells must be strictly ascending"));
     }
     Ok(cells)
-}
-
-/// Largest single binary array of a mesh: the transient of [`load_compact`],
-/// which holds one complete array at a time beside the compact rows.
-pub(crate) fn compact_transient_bytes(path: &Path) -> Result<u64, MapError> {
-    let h = header(path)?;
-    let base = path
-        .parent()
-        .ok_or_else(|| invalid("sloping mesh has no parent"))?;
-    check(&h, base)?;
-    let mut largest = 0_u64;
-    for (key, array) in &h.arrays {
-        let width = if key == "vertex_elevations" {
-            4
-        } else {
-            FIELDS.iter().find(|(name, _)| name == key).unwrap().1
-        };
-        largest = largest.max((array.rows * width) as u64);
-    }
-    Ok(largest)
 }
 
 fn i32_pair(raw: &[u8], row: usize) -> [usize; 2] {
@@ -351,47 +400,93 @@ fn position(sorted: &[usize], value: usize) -> Result<usize, MapError> {
         .binary_search(&value)
         .map_err(|_| invalid("staged sloping closure index missing"))
 }
+fn bytes<T>(count: usize) -> u64 {
+    (count as u64).saturating_mul(std::mem::size_of::<T>() as u64)
+}
 
 /// Load the stencil closure of `owners` (sorted unique global cells of this
-/// mesh) from a complete binary mesh. Refuses unless `staged` contains every
-/// cell of every face incident to an owner vertex.
+/// mesh) from a complete binary mesh under `budget`. Refuses unless `staged`
+/// contains every cell of every face incident to an owner vertex. Applies the
+/// complete loader's dimension checks, so malformed input is an error, never
+/// a panic.
 pub(crate) fn load_compact(
     path: &Path,
     staged: Vec<u32>,
     owners: &[usize],
+    budget: &LoadBudget,
 ) -> Result<Compact, MapError> {
-    use crate::sloping::{self, Cell, Corner, Face, Mesh};
+    use crate::sloping::{self, Cell, CellStencil, Corner, Face, Mesh};
     let h = header(path)?;
     let base = path
         .parent()
         .ok_or_else(|| invalid("sloping mesh has no parent"))?;
     check(&h, base)?;
     let rows = |key: &str| h.arrays[key].rows;
-    let raw = |key: &str| -> Result<Vec<u8>, MapError> {
-        let value = fs::read(base.join(&h.arrays[key].path))?;
+    let raw = |key: &str| -> Result<Charged<'_>, MapError> {
         let width = if key == "vertex_elevations" {
             4
         } else {
             FIELDS.iter().find(|(name, _)| *name == key).unwrap().1
         };
-        if value.len() != h.arrays[key].rows * width {
-            return Err(invalid("sloping binary array changed size"));
-        }
-        Ok(value)
+        let expected = h.arrays[key].rows * width;
+        budget.charge(expected as u64, key)?;
+        let value = match fs::read(base.join(&h.arrays[key].path)) {
+            Ok(value) if value.len() == expected => value,
+            Ok(_) => {
+                budget.release(expected as u64);
+                return Err(invalid("sloping binary array changed size"));
+            }
+            Err(e) => {
+                budget.release(expected as u64);
+                return Err(e.into());
+            }
+        };
+        Ok(Charged {
+            bytes: value,
+            budget,
+        })
     };
     let n_cells = rows("centers");
     let n_faces = rows("face_cells");
     let n_vertices = rows("vertices");
+    // The complete loader's dimension rules, before any indexed read.
     if rows("cell_info") != n_cells || rows("vertex_info") != n_vertices {
         return Err(invalid("sloping binary cell dimensions mismatch"));
+    }
+    if [
+        rows("face_vertices"),
+        rows("face_info"),
+        rows("face_minimum"),
+    ]
+    .iter()
+    .any(|&n| n != n_faces)
+    {
+        return Err(invalid("sloping face dimensions mismatch"));
+    }
+    if h.arrays
+        .get("vertex_elevations")
+        .is_some_and(|a| a.rows != n_vertices)
+    {
+        return Err(MapError::Invalid(
+            "sloping corner elevation dimensions or values invalid".into(),
+        ));
     }
     if staged.last().is_some_and(|&c| c as usize >= n_cells) {
         return Err(invalid("staged cell out of range"));
     }
-    let staged_usize: Vec<usize> = staged.iter().map(|&c| c as usize).collect();
     if owners.windows(2).any(|w| w[0] >= w[1]) {
         return Err(invalid("owner cells must be sorted and unique per mesh"));
     }
+    let s = staged.len();
+    // staged_usize, counts, ranks, cell_points and cells, plus owner positions.
+    budget.charge(
+        bytes::<usize>(s) * 3
+            + bytes::<[f64; 2]>(s)
+            + bytes::<Cell>(s)
+            + bytes::<usize>(owners.len()) * 3,
+        "staged cell rows",
+    )?;
+    let staged_usize: Vec<usize> = staged.iter().map(|&c| c as usize).collect();
     let owner_local = owners
         .iter()
         .map(|&c| {
@@ -404,13 +499,13 @@ pub(crate) fn load_compact(
     // Cells: face counts (virtual flag), physical rank (minimum row) and owner rows.
     let info = raw("cell_info")?;
     check_incidence(&info, rows("cell_faces"))?;
-    let mut counts = Vec::with_capacity(staged.len());
-    let mut ranks = Vec::with_capacity(staged.len());
+    let mut counts = Vec::with_capacity(s);
+    let mut ranks = Vec::with_capacity(s);
     let mut physical = 0_usize;
     let mut next = 0;
     for cell in 0..n_cells {
         let [_, count] = i32_pair(&info, cell);
-        if next < staged_usize.len() && staged_usize[next] == cell {
+        if next < s && staged_usize[next] == cell {
             counts.push(count);
             ranks.push(physical);
             next += 1;
@@ -424,6 +519,12 @@ pub(crate) fn load_compact(
     if ![n_cells, physical].contains(&rows("cell_minimum")) {
         return Err(invalid("sloping binary cell dimensions mismatch"));
     }
+    let owner_entries: usize = owner_rows.iter().map(|r| r[1]).sum();
+    // owner_faces (Vec<Vec>) and the ring-vertex list (two per entry).
+    budget.charge(
+        bytes::<Vec<usize>>(owners.len()) + bytes::<usize>(owner_entries) * 3,
+        "owner faces",
+    )?;
     let cell_faces = raw("cell_faces")?;
     let owner_faces: Vec<Vec<usize>> = owner_rows
         .iter()
@@ -435,7 +536,7 @@ pub(crate) fn load_compact(
         .collect();
     drop(cell_faces);
     let face_vertices = raw("face_vertices")?;
-    let mut ring_vertices = Vec::new();
+    let mut ring_vertices = Vec::with_capacity(owner_entries * 2);
     for &face in owner_faces.iter().flatten() {
         if face >= n_faces {
             return Err(invalid("cell face out of range"));
@@ -456,6 +557,19 @@ pub(crate) fn load_compact(
     check_incidence(&info, rows("vertex_faces"))?;
     let ring_rows: Vec<[usize; 2]> = ring_vertices.iter().map(|&v| i32_pair(&info, v)).collect();
     drop(info);
+    let ring_entries: usize = ring_rows.iter().map(|r| r[1]).sum();
+    let face_bound = ring_entries + owner_entries;
+    // ring_rows, rings (Vec<Vec>), the face list, and per face: ends, pairs,
+    // local pairs, spans, minima, corner ids (2 per face) and the final Face.
+    budget.charge(
+        bytes::<[usize; 2]>(ring_vertices.len())
+            + bytes::<Vec<usize>>(ring_vertices.len())
+            + bytes::<usize>(ring_entries)
+            + bytes::<usize>(face_bound)
+            + face_bound as u64
+                * (bytes::<[usize; 2]>(1) * 4 + 4 + bytes::<usize>(2) + bytes::<Face>(1)),
+        "closure faces",
+    )?;
     let vertex_faces = raw("vertex_faces")?;
     let rings: Vec<Vec<usize>> = ring_rows
         .iter()
@@ -466,13 +580,15 @@ pub(crate) fn load_compact(
         })
         .collect();
     drop(vertex_faces);
-    let mut faces: Vec<usize> = rings.iter().flatten().copied().collect();
+    let mut faces: Vec<usize> = Vec::with_capacity(face_bound);
+    faces.extend(rings.iter().flatten().copied());
     faces.extend(owner_faces.iter().flatten().copied());
     faces.sort_unstable();
     faces.dedup();
     if faces.last().is_some_and(|&f| f >= n_faces) {
         return Err(invalid("sloping corner face out of range"));
     }
+    let f = faces.len();
     let face_vertices = raw("face_vertices")?;
     let ends: Vec<[usize; 2]> = faces.iter().map(|&f| i32_pair(&face_vertices, f)).collect();
     drop(face_vertices);
@@ -484,6 +600,7 @@ pub(crate) fn load_compact(
             "sloping face index or polyline range out of bounds",
         ));
     }
+    let w = corners.len();
     let face_cells = raw("face_cells")?;
     let pairs: Vec<[usize; 2]> = faces.iter().map(|&f| i32_pair(&face_cells, f)).collect();
     drop(face_cells);
@@ -507,26 +624,40 @@ pub(crate) fn load_compact(
     let face_info = raw("face_info")?;
     let spans: Vec<[usize; 2]> = faces.iter().map(|&f| i32_pair(&face_info, f)).collect();
     drop(face_info);
+    let interior_rows = rows("face_points");
+    let mut interior = 0_usize;
+    for &[start, length] in &spans {
+        if start.checked_add(length).is_none_or(|v| v > interior_rows) {
+            return Err(invalid(
+                "sloping face index or polyline range out of bounds",
+            ));
+        }
+        interior += length;
+    }
     let face_minimum = raw("face_minimum")?;
     let face_minima: Vec<f32> = faces.iter().map(|&f| f32_at(&face_minimum, f)).collect();
     drop(face_minimum);
+    // Corners (points, elevations and Corner rows with their rings) and
+    // polylines (headers and points, endpoints included).
+    let elevations = h.arrays.contains_key("vertex_elevations");
+    budget.charge(
+        bytes::<[f64; 2]>(w)
+            + if elevations { bytes::<f32>(w) } else { 0 }
+            + bytes::<Corner>(w)
+            + bytes::<usize>(ring_entries) * 3
+            + bytes::<Vec<[f64; 2]>>(f)
+            + bytes::<[f64; 2]>(interior + 2 * f),
+        "closure corners and polylines",
+    )?;
     let vertices = raw("vertices")?;
     let points: Vec<[f64; 2]> = corners.iter().map(|&v| f64_pair(&vertices, v)).collect();
     drop(vertices);
-    let interior_rows = rows("face_points");
     let face_points = raw("face_points")?;
-    let mut interior = 0_usize;
     let polylines = ends
         .iter()
         .zip(&spans)
         .map(
             |(ends, &[start, length])| -> Result<Vec<[f64; 2]>, MapError> {
-                if start.checked_add(length).is_none_or(|v| v > interior_rows) {
-                    return Err(invalid(
-                        "sloping face index or polyline range out of bounds",
-                    ));
-                }
-                interior += length;
                 let mut polyline = Vec::with_capacity(length + 2);
                 polyline.push(points[position(&corners, ends[0])?]);
                 polyline.extend((start..start + length).map(|row| f64_pair(&face_points, row)));
@@ -558,7 +689,7 @@ pub(crate) fn load_compact(
         })
         .collect();
     drop(cell_minimum);
-    let vertex_elevations = if h.arrays.contains_key("vertex_elevations") {
+    let vertex_elevations = if elevations {
         let all = raw("vertex_elevations")?;
         Some(corners.iter().map(|&v| f32_at(&all, v)).collect::<Vec<_>>())
     } else {
@@ -592,10 +723,8 @@ pub(crate) fn load_compact(
             cw: Vec::new(),
         })
         .collect();
-    let mut ring_entries = 0;
     for (&vertex, ring) in ring_vertices.iter().zip(&rings) {
         let n = ring.len();
-        ring_entries += n;
         let corner = &mut compact_corners[position(&corners, vertex)?];
         corner.faces = ring
             .iter()
@@ -613,10 +742,23 @@ pub(crate) fn load_compact(
     if !owners.is_empty() {
         mesh.validate()?;
     }
-    let mut stencils: Vec<Option<sloping::CellStencil>> = (0..staged.len()).map(|_| None).collect();
-    let mut owner_entries = 0;
+    // Stencils: one slot per staged cell; per owner its polygon, corner
+    // products, corner/face slots, elevations and a physical ring that may
+    // grow to twice its points while extending.
+    let ring_points: usize = owner_faces
+        .iter()
+        .flatten()
+        .map(|&g| faces.binary_search(&g).map_or(0, |i| polylines[i].len()))
+        .sum();
+    budget.charge(
+        bytes::<Option<CellStencil>>(s)
+            + owner_entries as u64
+                * (bytes::<[f64; 2]>(1) + 8 + bytes::<[usize; 2]>(2) + 4 + bytes::<usize>(1))
+            + bytes::<[f64; 2]>(ring_points) * 2,
+        "owner stencils",
+    )?;
+    let mut stencils: Vec<Option<CellStencil>> = (0..s).map(|_| None).collect();
     for (&local, global_faces) in owner_local.iter().zip(&owner_faces) {
-        owner_entries += global_faces.len();
         if mesh.cells[local].virtual_cell {
             continue;
         }
@@ -637,9 +779,7 @@ pub(crate) fn load_compact(
     if let Some(elevations) = &vertex_elevations {
         sloping::set_vertex_elevations(&mut stencils, elevations, mesh.corners.len())?;
     }
-    let s = staged.len() as u64;
-    let f = faces.len() as u64;
-    let w = corners.len() as u64;
+    let (s, f, w) = (s as u64, f as u64, w as u64);
     let equivalent_bytes = s * (16 + 8 + 4)
         + owner_entries as u64 * 8
         + f * (8 + 8 + 8 + 4)
