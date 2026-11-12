@@ -435,7 +435,7 @@
     "tests/storage_session.rs": "e82d53384580c033cf09c4c23fb041bb5144aaaa2a3046b8c071c05e21eda273",
     "tests/stored_grid_golden.rs": "081d68387c6acc813ffe480e45c4594144b20da65dd3e0cfced45b8f9908de46",
     "tests/terrain_scope.rs": "449da22ff0dcf231f62a4cbd7275c6450d2325e085aef6d49d78bc6f5b1ed0c0",
-    "tests/thread_budget.rs": "6342f59c2fbb7068530c548f997c39d4d876bd67be05eaec5fd778a77b271a3c",
+    "tests/thread_budget.rs": "95287fe68729a5503d217607cea28b0a1347f8fc7fefdfb79e8d5998f09f94f5",
     "tests/velocity.rs": "f2b94315082128f9a4f880f302988c41cce2bdb1d2eba74ac0213fd8bceb7ed6",
     "tests/velocity_native.rs": "b7403134c84832ee4b7c0821d470bcb5b7db7eb782ed65af0843b8e5db4512bb",
     "tests/whole_simulation.rs": "fc9fd8a8ab4e4587dd64744640385222fcbe5f2a85abd286d74872cf652bffa8",

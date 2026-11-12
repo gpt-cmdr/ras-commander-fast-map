@@ -816,6 +816,14 @@ fn terrio_calls_from_busy_request_workers_stay_within_budget() {
         return;
     }
     assert!(control.terrio_threads == 3, "{control:?}");
+    // Over-subscription can only show as CPU when the host gives this process
+    // more CPUs than the budget (up to 6 threads run here).
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    eprintln!("CPUs available to this process: {cpus}");
+    if cpus < 6 {
+        eprintln!("control not asserted: {cpus} CPUs available");
+        return;
+    }
     assert!(
         cfg!(debug_assertions) || control.max_busy > 3.0 + TOLERANCE,
         "the sampler must see terrio's extra threads busy: {control:?}"
