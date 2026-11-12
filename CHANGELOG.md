@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.19.0 - 2026-11-12
 
 - **Staged cell subsets** (opt-in, capability `staged_cells`,
   `ras-commander-staged-cells/1`): sloping and `depth-groups` requests may name
