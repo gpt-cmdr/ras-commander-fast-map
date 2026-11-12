@@ -44,6 +44,22 @@
   bytes as 0.19.0, labelled `ProjectedCSTypeGeoKey 0`, which GDAL reads as a
   local CRS in metres); its report now carries `crs_warning`. Give
   `crs_geokeys` for a correct label.
+- **Effective terrain on the stored-map basis** (opt-in request field
+  `basis: "stored_map"`, advertised as `effective_terrain.bases` and
+  `effective_terrain.stored_map`, rule `rasmapper-stored-map-terrain/1`). RAS
+  Mapper's terrain export and its stored maps read different terrains: the
+  export samples render blocks between cell centres, so a source's last cell
+  row and column are never answered, and it rounds to 1/32; stored maps are
+  written per source on the source's own grid from its own cells, with the
+  modifications unrounded. For a single-source terrain the stored-map basis
+  writes the source's cells on its own GeoTIFF grid, then the modifications as
+  for the export, without rounding (unmodified: the source TIFF bit for bit).
+  On modified Helena (HEC-RAS 7.0.1 and 6.6) mapping on it matches RAS
+  Mapper's stored maps in every wet pixel, where the export basis left 2,341
+  wet pixels nodata and 1,460 depths up to 1/64 ft off. Multi-source terrains,
+  an explicit `grid` or `extent` are refused on this basis. The default
+  (`export`, or no field) is unchanged, bit for bit; its report now also names
+  `basis`. Method ID and request schemas are unchanged.
 
 ## 0.19.0 - 2026-11-12
 

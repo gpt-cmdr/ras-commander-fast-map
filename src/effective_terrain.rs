@@ -47,6 +47,27 @@
 //!
 //! Terrain modifications (schema 2) are applied after the mosaic by
 //! `terrain_mods`; unqualified modification forms are refused.
+//!
+//! **Stored-map basis** (opt-in `basis: "stored_map"`). RAS Mapper's export
+//! and RAS Mapper's stored maps do not read the same terrain. The export
+//! rule above samples render blocks, so a source's last cell row and column
+//! (their centres are the far edges of the last blocks) are never answered,
+//! and it rounds to 1/32. RAS Mapper writes stored maps per terrain source on
+//! that source's own grid, from the source's own cell values, with the
+//! modifications applied unrounded. With `basis: "stored_map"` the engine
+//! writes that terrain for a single-source terrain:
+//!
+//! 1. the source TIFF's cells, on its own GeoTIFF grid (no render blocks, no
+//!    export TIN; a source nodata or NaN cell is nodata);
+//! 2. the modifications, rasterized exactly as for the export (same lattice,
+//!    same rules, binary32 combination);
+//! 3. no 1/32 rounding.
+//!
+//! Without modifications this is the source TIFF bit for bit, i.e. the
+//! terrain that the qualified source-TIFF mapping route already uses.
+//! Multi-source terrains, an explicit `grid` or `extent`, and a lattice that
+//! does not cover the source cell for cell are refused: per-source stored
+//! maps of overlapping sources are not qualified.
 use crate::{
     MapError,
     export_tin::{self, BlockLattice, BlockSource, TileGrid},
@@ -167,8 +188,46 @@ pub struct Request {
     /// before any read.
     #[serde(default)]
     pub hecras_version: Option<String>,
+    /// Which RAS Mapper terrain to write: `"export"` (default; the terrain
+    /// export) or `"stored_map"` (the terrain RAS Mapper's stored maps use;
+    /// see the module docs). Older engines refuse the field.
+    #[serde(default)]
+    pub basis: Option<String>,
     pub threads: usize,
     pub max_working_bytes: u64,
+}
+
+/// The terrain a request asks for (`Request::basis`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Basis {
+    /// RAS Mapper's terrain export (the default).
+    Export,
+    /// The terrain of RAS Mapper's stored maps.
+    StoredMap,
+}
+
+pub const BASIS_EXPORT: &str = "export";
+pub const BASIS_STORED_MAP: &str = "stored_map";
+/// Rule identifier of the stored-map basis, reported beside the method ID.
+pub const STORED_MAP_RULE_ID: &str = "rasmapper-stored-map-terrain/1";
+
+impl Basis {
+    pub fn parse(v: Option<&str>) -> Result<Self, MapError> {
+        match v {
+            None | Some(BASIS_EXPORT) => Ok(Basis::Export),
+            Some(BASIS_STORED_MAP) => Ok(Basis::StoredMap),
+            Some(o) => Err(invalid(format!(
+                "basis must be {BASIS_EXPORT:?} or {BASIS_STORED_MAP:?}, not {o:?}"
+            ))),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Basis::Export => BASIS_EXPORT,
+            Basis::StoredMap => BASIS_STORED_MAP,
+        }
+    }
 }
 
 pub fn method_record() -> Value {
@@ -195,7 +254,21 @@ pub fn method_record() -> Value {
             "BaldEagleCrkMulti2D Terrain50 (2 sources, 20 ft + 36.5 ft)": "not re-run since the render-block rule"
         },
         "known_differences": "inside export-TIN gap fills: the order of segments with equal hash comes from RAS Mapper's parallel collection and its hash seed varies by process, which decides cocircular Delaunay ties; this engine fixes one order (type id 7, 8 range partitions). On terrain A another seed order (type id 23) leaves 82 value differences in an independent prototype, consistent with the remaining differences being ordering ties. RAS Mapper's own repeated exports also disagree on some of these pixels",
-        "refused": "modification forms listed in modifications.refused, non-float32/rotated/non-square sources, sources in different CRSs"
+        "refused": "modification forms listed in modifications.refused, non-float32/rotated/non-square sources, sources in different CRSs",
+        "bases": [BASIS_EXPORT, BASIS_STORED_MAP],
+        "default_basis": BASIS_EXPORT,
+        "stored_map": {
+            "rule_id": STORED_MAP_RULE_ID,
+            "request_field": "basis = stored_map (request schema 1 or 2)",
+            "reference": "RAS Mapper's stored maps (Depth/WSE written per terrain source on that source's grid), HEC-RAS 7.0.1",
+            "rule": "the single source's own cells on its GeoTIFF grid (source nodata or NaN is nodata; no render blocks, no export TIN); then the modifications rasterized and combined exactly as for the export, on the export lattice, which covers the source cell for cell; no 1/32 rounding",
+            "why": "the export never answers a source's last cell row and column (no render block lies below or right of their centres) and rounds every value to 1/32; RAS Mapper's stored maps use those cells and the unrounded modification values",
+            "unmodified": "bit-identical to the source TIFF (the source-TIFF mapping route's terrain)",
+            "refused": "more than one source, an explicit grid or extent, a lattice that does not match the source's cell count and origin",
+            "qualified": {
+                "Helena (1 source, 4877 x 4877 at 3.28 ft, ESRI:102630; Middle Cahaba p01 Max, sloping; RAS Mapper stored maps)": "HEC-RAS 7.0.1 and 6.6, two channel ground lines (SetIfLower): stored-map Depth equals float32(WSE - terrain) on all 7,506,407 wet pixels (the export basis: 2,341 wet pixels nodata, all in the source's last row and column, and 1,460 Depth mismatches up to 1/64 ft, all modified pixels); unmodified: bit-identical to the source TIFF; fast-map Depth/WSE mapped on it: 0 mask differences, 1 WSE/Depth value at 3.05e-5 ft (as on the source-TIFF route)"
+            }
+        }
     });
     crate::crs::advertise(&mut record);
     record
@@ -244,6 +317,7 @@ impl Request {
         if self.threads == 0 || self.max_working_bytes == 0 {
             return Err(invalid("threads and max_working_bytes must be positive"));
         }
+        Basis::parse(self.basis.as_deref())?;
         for s in &self.sources {
             if s.mask.dtype != "|u1" || s.mask.shape.len() != 2 || s.mask.shape[1] != TILE * TILE {
                 return Err(invalid("source masks must be |u1 [tiles, 65536]"));
@@ -765,6 +839,10 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
                 .ok_or_else(|| invalid("snapped grid is empty or too large"))?
         }
     };
+    let basis = Basis::parse(req.basis.as_deref())?;
+    if basis == Basis::StoredMap {
+        stored_map_lattice(req, &sources, &grid)?;
+    }
     // Planned memory: output values, the source block caches
     // (max_working_bytes / 4 across sources), `batch` export-TIN tile results
     // held between parallel batches, and one export-TIN share per worker for
@@ -813,6 +891,9 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
         .num_threads(req.threads)
         .build()
         .map_err(|e| MapError::Internal(format!("thread pool: {e}")))?;
+    if basis == Basis::StoredMap {
+        return stored_map(req, &sources, grid, values, &pool, started);
+    }
     for s in sources.iter_mut() {
         s.edges = pool.install(|| s.scan_edges())?;
     }
@@ -958,6 +1039,7 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
     let method_id = METHOD_ID;
     let report = json!({
         "method_id": method_id,
+        "basis": BASIS_EXPORT,
         "grid": {"origin_x": grid.origin_x, "origin_y": grid.origin_y, "cell_size": grid.cell_size,
                   "width": grid.width, "height": grid.height},
         "sources": sources.iter().zip(&per_source).map(|(s, n)| json!({
@@ -982,6 +1064,137 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
 
 /// Report note for `epsg: 0` without `crs_geokeys` (accepted as in 0.19.0).
 pub const EPSG_ZERO_WARNING: &str = "epsg 0 without crs_geokeys: the output is labelled ProjectedCSTypeGeoKey 0, which GDAL reads as a local CRS in metres; give crs_geokeys (any CRS) or a real EPSG code for a correct label";
+
+/// Refuse a stored-map request whose terrain is not one source covered cell
+/// for cell by the export lattice.
+fn stored_map_lattice(req: &Request, sources: &[SourceData], grid: &Grid) -> Result<(), MapError> {
+    let refuse = |why: String| {
+        Err(MapError::Unsupported(format!(
+            "basis {BASIS_STORED_MAP:?}: {why}"
+        )))
+    };
+    if sources.len() != 1 {
+        return refuse(format!(
+            "qualified for single-source terrains only; this terrain has {} sources (RAS Mapper's per-source stored maps of overlapping sources are not qualified)",
+            sources.len()
+        ));
+    }
+    if req.grid.is_some() || req.extent.is_some() {
+        return refuse(
+            "stored maps are written on the source's own grid; omit grid and extent".into(),
+        );
+    }
+    let t = &sources[0].terrain;
+    if grid.width != t.width
+        || grid.height != t.height
+        || grid.origin_x != t.gt[0]
+        || grid.origin_y != t.gt[3]
+    {
+        return refuse(format!(
+            "the export lattice ({}x{} at {}, {}) does not cover the source ({}x{} at {}, {}) cell for cell",
+            grid.width,
+            grid.height,
+            grid.origin_x,
+            grid.origin_y,
+            t.width,
+            t.height,
+            t.gt[0],
+            t.gt[3]
+        ));
+    }
+    Ok(())
+}
+
+/// The stored-map basis (module docs): the source's cells, the modifications
+/// on the export lattice, no rounding; written on the source's GeoTIFF grid.
+fn stored_map(
+    req: &Request,
+    sources: &[SourceData],
+    lattice: Grid,
+    mut values: Vec<f32>,
+    pool: &rayon::ThreadPool,
+    started: Instant,
+) -> Result<Effective, MapError> {
+    let t = &sources[0].terrain;
+    let width = t.width;
+    let (bw, bh) = t.block;
+    let blocks_x = t.width.div_ceil(bw);
+    // One source block row per task, each writing only its own rows.
+    let rows: Vec<Result<u64, MapError>> = pool.install(|| {
+        values
+            .par_chunks_mut(bh * width)
+            .enumerate()
+            .map(|(by, out)| {
+                let mut n = 0_u64;
+                for bx in 0..blocks_x {
+                    let win = t.block_window(bx, by);
+                    let block = t.get_block(bx, by)?;
+                    for r in 0..win.height {
+                        let src = &block[r * win.width..][..win.width];
+                        let dst = &mut out[r * width + win.x..][..win.width];
+                        for (d, s) in dst.iter_mut().zip(src) {
+                            if let Some(v) = t.classify(*s)
+                                && v.is_finite()
+                            {
+                                *d = *s;
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+                Ok(n)
+            })
+            .collect()
+    });
+    let mut source_pixels = 0_u64;
+    for r in rows {
+        source_pixels += r?;
+    }
+    let sample_seconds = started.elapsed().as_secs_f64();
+    let mods_started = Instant::now();
+    let version = crate::terrain_mods::RasVersion::parse(req.hecras_version.as_deref())?;
+    let mods = crate::terrain_mods::apply_version(
+        &req.modification_layers,
+        &lattice,
+        &mut values,
+        version,
+    )?;
+    let mods_seconds = mods_started.elapsed().as_secs_f64();
+    let valid = values.iter().filter(|v| **v != NODATA).count() as u64;
+    let grid = Grid {
+        origin_x: t.gt[0],
+        origin_y: t.gt[3],
+        cell_size: t.gt[1],
+        width: t.width,
+        height: t.height,
+    };
+    let report = json!({
+        "method_id": METHOD_ID,
+        "basis": BASIS_STORED_MAP,
+        "basis_rule_id": STORED_MAP_RULE_ID,
+        "grid": {"origin_x": grid.origin_x, "origin_y": grid.origin_y, "cell_size": grid.cell_size,
+                  "width": grid.width, "height": grid.height},
+        "modification_lattice": {"origin_x": lattice.origin_x, "origin_y": lattice.origin_y,
+                  "cell_size": lattice.cell_size, "width": lattice.width, "height": lattice.height},
+        "sources": [{
+            "path": t.path, "geo_transform": t.gt, "width": t.width, "height": t.height,
+            "pixels": source_pixels, "cache": t.stats().cache,
+        }],
+        "sample_seconds": sample_seconds,
+        "export_tin": null,
+        "stitch_tin": {"supplied": req.stitch_tin.is_some(), "used": false},
+        "modifications": {"layers": mods, "seconds": mods_seconds,
+                          "hecras_version": req.hecras_version, "hecras_rule": version.rule()},
+        "rounding": "none",
+        "valid_pixels": valid,
+        "seconds": started.elapsed().as_secs_f64(),
+    });
+    Ok(Effective {
+        grid,
+        values,
+        report,
+    })
+}
 
 /// Write `effective` as a tiled float32 GeoTIFF with nodata -9999.
 pub fn write_geotiff(path: &Path, effective: Effective, epsg: u32) -> Result<(), MapError> {

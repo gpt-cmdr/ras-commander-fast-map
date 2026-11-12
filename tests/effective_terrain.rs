@@ -603,3 +603,149 @@ fn modification_count_must_match_and_v1_refuses_layers() {
         "unsupported"
     );
 }
+
+/// Stored-map basis: the source's own cells, its last row and column
+/// included (the export leaves them nodata), source nodata kept, no rounding.
+#[test]
+fn stored_map_basis_is_the_source_cells() {
+    let dir = scratch();
+    let g = grid(1000.0, 2000.0, 10.0, 20, 12);
+    // Off the 1/32 grid, so rounding would show.
+    let mut values: Vec<f32> = (0..20 * 12).map(|i| 100.0 + i as f32 * 0.01).collect();
+    values[3 * 20 + 4] = NODATA;
+    values[7 * 20 + 9] = f32::NAN;
+    write_source(&dir, "a.tif", g, values.clone());
+    write_mask(&dir, "a.u1", 20, 12, |_, _| true);
+    let srcs = json!([{"path": "a.tif", "mask": mask("a.u1", 20, 12)}]);
+    let export = effective_terrain::compute(&request(srcs.clone(), json!({})), &dir).unwrap();
+    assert_eq!(export.report["basis"], "export");
+    let out =
+        effective_terrain::compute(&request(srcs, json!({"basis": "stored_map"})), &dir).unwrap();
+    assert_eq!(out.grid, g);
+    assert_eq!(out.report["basis"], "stored_map");
+    assert_eq!(
+        out.report["basis_rule_id"],
+        "rasmapper-stored-map-terrain/1"
+    );
+    assert_eq!(out.report["method_id"], METHOD_ID);
+    for (i, (&v, &s)) in out.values.iter().zip(&values).enumerate() {
+        let want = if s.is_nan() { NODATA } else { s };
+        assert_eq!(v.to_bits(), want.to_bits(), "pixel {i}");
+    }
+    assert_eq!(out.report["valid_pixels"], 20 * 12 - 2);
+    // The export answers neither the last row nor the last column.
+    assert_eq!(export.values[11 * 20 + 3], NODATA);
+    assert_eq!(export.values[2 * 20 + 19], NODATA);
+    assert_eq!(out.values[11 * 20 + 3], values[11 * 20 + 3]);
+    assert_eq!(out.values[2 * 20 + 19], values[2 * 20 + 19]);
+}
+
+/// Stored-map basis with modifications: the same footprint as the export,
+/// but binary32 values without the 1/32 rounding.
+#[test]
+fn stored_map_basis_keeps_modifications_unrounded() {
+    let dir = scratch();
+    let g = grid(1000.0, 2000.0, 10.0, 20, 12);
+    write_source(&dir, "a.tif", g, vec![50.0; 20 * 12]);
+    write_mask(&dir, "a.u1", 20, 12, |_, _| true);
+    // Touches the last row and column.
+    let ring = json!([[
+        [1040.0, 1875.0],
+        [1205.0, 1875.0],
+        [1205.0, 1980.0],
+        [1040.0, 1980.0]
+    ]]);
+    let extra = |basis: Option<&str>| {
+        let mut v = json!({
+            "schema": "ras-commander-effective-terrain-request/2",
+            "modifications": 2,
+            "modification_layers": [
+                {"kind": "polygon", "name": "cut", "priority": 0,
+                 "features": [{"elevation_type": "SetIfLower", "elevation": 40.01, "rings": ring}]},
+                {"kind": "polygon", "name": "pad", "priority": 1,
+                 "features": [{"elevation_type": "SetValue", "elevation": 60.0, "rings": ring}]}
+            ]
+        });
+        if let Some(b) = basis {
+            v["basis"] = b.into();
+        }
+        v
+    };
+    let srcs = json!([{"path": "a.tif", "mask": mask("a.u1", 20, 12)}]);
+    let export = effective_terrain::compute(&request(srcs.clone(), extra(None)), &dir).unwrap();
+    let stored =
+        effective_terrain::compute(&request(srcs, extra(Some("stored_map"))), &dir).unwrap();
+    assert_eq!(stored.values[5 * 20 + 6], 40.01_f32);
+    assert_eq!(export.values[5 * 20 + 6], quantize(40.01));
+    let mut modified = 0;
+    for r in 0..12 {
+        for c in 0..20 {
+            let (e, s) = (export.values[r * 20 + c], stored.values[r * 20 + c]);
+            if r == 11 || c == 19 {
+                // The export leaves these nodata; the modification still sets
+                // them (a nodata pixel takes the modification value).
+                assert!(s == 50.0 || s == 40.01_f32, "({r},{c}) {s}");
+                if s != 50.0 {
+                    modified += 1;
+                }
+                continue;
+            }
+            if e == 50.0 {
+                assert_eq!(s, 50.0, "({r},{c})");
+            } else {
+                assert_eq!(e, quantize(40.01), "({r},{c})");
+                assert_eq!(s, 40.01_f32, "({r},{c})");
+            }
+        }
+    }
+    assert!(modified > 0, "the ring covers last-row/column pixels");
+    assert_eq!(
+        stored.report["modifications"]["layers"],
+        export.report["modifications"]["layers"]
+    );
+}
+
+#[test]
+fn stored_map_basis_refusals() {
+    let dir = scratch();
+    let g = grid(1000.0, 2000.0, 10.0, 20, 12);
+    write_source(&dir, "a.tif", g, plane(&g));
+    write_source(&dir, "b.tif", g, plane(&g));
+    write_mask(&dir, "a.u1", 20, 12, |_, _| true);
+    let one = json!([{"path": "a.tif", "mask": mask("a.u1", 20, 12)}]);
+    let two = json!([{"path": "a.tif", "mask": mask("a.u1", 20, 12)},
+                     {"path": "b.tif", "mask": mask("a.u1", 20, 12)}]);
+    let kind = |srcs: &Value, extra: Value| {
+        effective_terrain::compute(&request(srcs.clone(), extra), &dir)
+            .err()
+            .map(|e| (e.kind(), format!("{e:?}")))
+    };
+    let (k, msg) = kind(&two, json!({"basis": "stored_map"})).unwrap();
+    assert_eq!(k, "unsupported");
+    assert!(msg.contains("single-source"), "{msg}");
+    let (k, _) = kind(
+        &one,
+        json!({"basis": "stored_map", "grid": {"origin_x": 1000.0, "origin_y": 2000.0,
+               "cell_size": 10.0, "width": 20, "height": 12}}),
+    )
+    .unwrap();
+    assert_eq!(k, "unsupported");
+    let (k, _) = kind(
+        &one,
+        json!({"basis": "stored_map", "extent": [1000.0, 1880.0, 1200.0, 2000.0]}),
+    )
+    .unwrap();
+    assert_eq!(k, "unsupported");
+    let (k, _) = kind(&one, json!({"basis": "renderer"})).unwrap();
+    assert_eq!(k, "invalid");
+    // Two sources stay valid on the export basis, named or by default.
+    assert!(kind(&two, json!({"basis": "export"})).is_none());
+}
+
+#[test]
+fn method_record_advertises_the_bases() {
+    let r = effective_terrain::method_record();
+    assert_eq!(r["bases"], json!(["export", "stored_map"]));
+    assert_eq!(r["default_basis"], "export");
+    assert_eq!(r["stored_map"]["rule_id"], "rasmapper-stored-map-terrain/1");
+}
