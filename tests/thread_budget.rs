@@ -52,6 +52,10 @@ const STARTUP: Duration = Duration::from_millis(30);
 const WINDOW: Duration = Duration::from_millis(10);
 /// Busy threads tolerated above the budget: per-thread reads are not one instant.
 const TOLERANCE: f64 = 0.2;
+/// A new thread starts with its creator's name and renames itself once it runs,
+/// which on a loaded host can be milliseconds later. Names are re-read for this
+/// long after a thread is first seen, so an inherited name is never kept.
+const NAME_SETTLE: f64 = 0.25;
 
 // ---------------------------------------------------------------- sampling
 
@@ -315,7 +319,8 @@ fn trace(child: &mut Child) -> Trace {
     let started = Instant::now();
     let mut sampler = Sampler::new();
     let mut t = Trace::default();
-    let mut names: HashMap<u64, String> = HashMap::new();
+    // Thread id -> (latest name, seconds when the thread was first seen).
+    let mut names: HashMap<u64, (String, f64)> = HashMap::new();
     let mut last: HashMap<u64, f64> = HashMap::new();
     // (seconds, cumulative CPU nanoseconds of threads seen in consecutive samples).
     let mut history: Vec<(f64, f64)> = Vec::new();
@@ -338,10 +343,10 @@ fn trace(child: &mut Child) -> Trace {
             let mut terrio_running = 0;
             let mut next = HashMap::new();
             for th in &threads {
-                // A new thread names itself shortly after it starts: look again
-                // while its name is still empty.
-                let name = names.entry(th.tid).or_default();
-                if name.is_empty() {
+                // A new thread names itself shortly after it starts (until then
+                // it carries its creator's name): look again while it is new.
+                let (name, seen) = names.entry(th.tid).or_insert_with(|| (String::new(), now));
+                if name.is_empty() || now - *seen < NAME_SETTLE {
                     *name = sampler.name(pid, th.tid);
                 }
                 running += th.running as usize;
@@ -380,7 +385,10 @@ fn trace(child: &mut Child) -> Trace {
                     .filter_map(|(tid, c)| {
                         let b = snapshots[j].get(tid)?;
                         Some((
-                            format!("{tid}:{}", names.get(tid).cloned().unwrap_or_default()),
+                            format!(
+                                "{tid}:{}",
+                                names.get(tid).map(|n| n.0.clone()).unwrap_or_default()
+                            ),
                             (c - b) / (span * 1e9),
                         ))
                     })
@@ -399,7 +407,7 @@ fn trace(child: &mut Child) -> Trace {
     }
     t.terrio_threads = names
         .values()
-        .filter(|n| n.starts_with("terrio-par"))
+        .filter(|n| n.0.starts_with("terrio-par"))
         .count();
     t.seconds = started.elapsed().as_secs_f64();
     t
@@ -804,9 +812,14 @@ fn burn_child(threads: usize, terrio_threads: usize) -> Trace {
 
 /// Request workers that call terrio while the others compute stay within the
 /// request's threads when terrio's pool has one thread (the executable's setting).
-/// Two control runs give terrio's pool more threads than the request has: one
-/// worker with a pool of two (asserted on hosts with 2 or more CPUs, so on every
-/// CI runner) and three workers with a pool of three (asserted with 6 or more).
+/// Two control runs give terrio's pool more threads than the one-thread request:
+/// pools of two and of three. Each must exceed that budget, which shows the checks
+/// above can fail. The excess can only show when the host has CPUs for the child's
+/// busy threads and for this sampler, which polls /proc beside it: the controls are
+/// asserted with 3 and 4 or more CPUs (the Windows CI runner has 6); on the 2-CPU
+/// Linux runner they are reported, and the budget checks above are asserted.
+/// (Earlier, three workers with a pool of three had to exceed 3.2 busy threads,
+/// which needs three burns to overlap by chance: 3.1-3.8 on an 8-CPU host.)
 #[test]
 fn terrio_calls_from_busy_request_workers_stay_within_budget() {
     let _serial = serial();
@@ -823,27 +836,35 @@ fn terrio_calls_from_busy_request_workers_stay_within_budget() {
     // host gives this process more CPUs than the budget.
     let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
     eprintln!("CPUs available to this process: {cpus}");
-    // One worker, terrio's pool of two: fits a 2-CPU runner.
+    // One worker, terrio's pool of two: two busy child threads plus the sampler.
     let small = burn_child(1, 2);
     if small.samples == 0 {
         return;
     }
     assert!(small.terrio_threads == 2, "{small:?}");
-    if cpus >= 2 && !cfg!(debug_assertions) {
+    if cpus >= 3 && !cfg!(debug_assertions) {
         assert!(
             small.max_busy > 1.0 + TOLERANCE,
             "the sampler must see terrio's second thread busy: {small:?}"
         );
+    } else {
+        eprintln!(
+            "two-thread control not asserted: {cpus} CPUs for 2 busy threads and the sampler"
+        );
     }
-    // Three workers, terrio's pool of three: up to six busy threads.
-    let large = burn_child(3, 3);
+    // One worker, terrio's pool of three: up to three busy child threads beside
+    // the sampler. Like the first control, its excess is measured against the
+    // request's own budget of one thread, which it exceeds whenever a burn runs.
+    let large = burn_child(1, 3);
     assert!(large.terrio_threads == 3, "{large:?}");
-    if cpus >= 6 && !cfg!(debug_assertions) {
+    if cpus >= 4 && !cfg!(debug_assertions) {
         assert!(
-            large.max_busy > 3.0 + TOLERANCE,
+            large.max_busy > 1.0 + TOLERANCE,
             "the sampler must see terrio's extra threads busy: {large:?}"
         );
     } else {
-        eprintln!("three-thread control not asserted: {cpus} CPUs available");
+        eprintln!(
+            "three-thread control not asserted: {cpus} CPUs for 3 busy threads and the sampler"
+        );
     }
 }
