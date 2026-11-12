@@ -10,7 +10,8 @@ pub fn engine_method_record() -> serde_json::Value {
         "engine": {
             "package": "ras-commander-fast-map",
             "version": crate::ENGINE_VERSION,
-            "source_commit": crate::ENGINE_COMMIT
+            "source_commit": crate::ENGINE_COMMIT,
+            "thread_budget": crate::terrio_pool::contract()
         },
         "storage": crate::storage_session::method_record(),
         "coupled_diagnostic": crate::coupled::method_record(),
@@ -155,6 +156,10 @@ pub fn engine_method_record() -> serde_json::Value {
 fn stored_xs_record() -> serde_json::Value {
     let mut record = crate::one_d_native::clipped_method_record();
     record["grid_contracts"] = serde_json::json!([crate::stored_grid::ID]);
+    // Inline storage composition is not offered with the stored grid contract.
+    if let Some(map) = record.as_object_mut() {
+        map.remove("inline_storage");
+    }
     record
 }
 

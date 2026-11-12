@@ -7,11 +7,42 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_ras2fim-batch");
 
-fn scratch(name: &str) -> PathBuf {
+/// A scratch directory removed when the test ends, including on panic.
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(name: &str) -> Scratch {
     let d = std::env::temp_dir().join(format!("ras2fim-hardening-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&d);
     fs::create_dir_all(&d).unwrap();
-    d
+    Scratch(d)
+}
+
+/// A file of `len` bytes whose payload is never written. NTFS allocates every byte that
+/// `set_len` adds unless the file is sparse, so mark it sparse there first (best effort);
+/// ext4 and similar file systems leave the extension unallocated already.
+fn sparse_file(path: &Path, len: u64) {
+    let f = fs::File::create(path).unwrap();
+    #[cfg(windows)]
+    {
+        let _ = Command::new("fsutil")
+            .args(["sparse", "setflag"])
+            .arg(path)
+            .output();
+    }
+    f.set_len(len).unwrap();
 }
 
 fn lattice_profile(id: &str, w: usize, h: usize) -> Value {
@@ -210,8 +241,7 @@ fn inflight_one_is_serial_and_identical() {
 #[test]
 fn oversized_binary_profile_rejected_before_read() {
     let d = scratch("r4");
-    let f = fs::File::create(d.join("s.f64")).unwrap();
-    f.set_len(100_000_000 * 24).unwrap();
+    sparse_file(&d.join("s.f64"), 100_000_000 * 24);
     fs::write(d.join("t.u32"), vec![0u8; 12]).unwrap();
     let prof = json!({"id": "big", "source": {"kind": "binary", "samples_f64": "s.f64", "simplices_u32": "t.u32",
         "grid": {"kind": "explicit", "width": 1, "height": 1, "x0": 0, "y0": 0, "dx": 1, "dy": 1}, "mask_all_wet": true}});

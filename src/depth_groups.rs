@@ -730,6 +730,9 @@ pub fn run_with_session(
                                     hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
                                 }
                             }
+                            // `rows` yields one `geotiff::strip_rows` chunk per call, one
+                            // TIFF block row of this writer: terrio encodes it on this worker
+                            // without its pool (as in `geotiff::RowWriter::write_rows`).
                             if let Some(writer) = writer.as_mut() {
                                 writer
                                     .write_rows(
@@ -747,11 +750,9 @@ pub fn run_with_session(
                         })
                     })?;
                     if let Some(writer) = writer {
-                        session.install(|| {
-                            writer
-                                .finish()
-                                .map_err(|e| MapError::Io(format!("group GeoTIFF finish: {e}")))
-                        })?;
+                        // Finalization can reach terrio's pool: off the worker.
+                        crate::terrio_pool::call(|| writer.finish())?
+                            .map_err(|e| MapError::Io(format!("group GeoTIFF finish: {e}")))?;
                         let final_path = out
                             .join(&job.job_id)
                             .join(format!("{}.tif", group.group_id));

@@ -26,6 +26,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings -A clippy::chunks_exact_to_as_chunks
       - run: cargo test --locked --all-targets
+      # Thread budget measured on the optimized executable, as shipped.
+      - run: cargo test --release --locked --test thread_budget -- --nocapture
       - run: cargo publish --locked --dry-run
   wheels:
     strategy:
@@ -72,6 +74,12 @@ jobs:
         run: |
           python -m pip install maturin==1.15.0
           python -m maturin build --release --locked --out dist-unsanitized --target "${{ matrix.target }}"
+      # The rust job measures the optimized executable's thread budget on Linux;
+      # this measures it on Windows.
+      - name: Thread budget tests (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cargo test --release --locked --test thread_budget --target "${{ matrix.target }}" -- --nocapture
       - uses: PyO3/maturin-action@v1
         if: runner.os != 'Windows'
         with:

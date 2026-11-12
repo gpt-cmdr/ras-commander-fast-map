@@ -46,6 +46,19 @@ pub struct Request {
     #[serde(default)]
     pub storage: Option<StorageComponent>,
     pub max_working_bytes: usize,
+    /// Opt-in engine-written delivery GeoTIFFs (schemas /1-/2); see `one_d_delivery`.
+    #[serde(default)]
+    pub final_format: Option<crate::native_output::FinalFormat>,
+    #[serde(default)]
+    pub epsg: Option<u32>,
+    #[serde(default)]
+    pub aoi_mask_file: Option<PathBuf>,
+    #[serde(default)]
+    pub flooded_depth_range: Option<[f32; 2]>,
+    /// DEFLATE workers for `final_format` (1-64, default 1); file bytes do not
+    /// depend on it.
+    #[serde(default)]
+    pub threads: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -133,6 +146,29 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         .and_then(|v| v.checked_add(65536 + 8192 + 65536))
         .and_then(|v| v.checked_add(32 * (xs.profile_id.len() + xs.crs.len())))
         .ok_or_else(|| MapError::Budget("coupled buffer size overflow".into()))?;
+    let threads = req.threads.unwrap_or(1);
+    let options = crate::one_d_delivery::Options {
+        final_format: req.final_format.clone(),
+        epsg: req.epsg,
+        aoi_mask_file: req.aoi_mask_file.clone(),
+        flooded_depth_range: req.flooded_depth_range,
+    };
+    if threads == 0 || threads > 64 || (req.threads.is_some() && !options.requested()) {
+        return Err(MapError::Invalid(
+            "coupled threads must be 1-64 and only accompany final_format".into(),
+        ));
+    }
+    if layout.is_some() && options.requested() {
+        return Err(MapError::Unsupported(
+            "coupled final_format excludes the stored grid schema".into(),
+        ));
+    }
+    let delivery = options.plan(xs.width, xs.height, gt)?;
+    let planned = match &delivery {
+        Some(plan) => planned.checked_add(plan.planned_bytes(threads)?),
+        None => Some(planned),
+    }
+    .ok_or_else(|| MapError::Budget("coupled buffer size overflow".into()))?;
     if planned > req.max_working_bytes {
         return Err(MapError::Budget(format!(
             "coupled planned {planned} bytes exceeds budget"
@@ -169,6 +205,19 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
             ))
         })
         .transpose()?;
+    let mask = match &delivery {
+        Some(plan) => plan.read_mask(base)?,
+        None => None,
+    };
+    let pool = match &delivery {
+        Some(_) => Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|e| MapError::Internal(e.to_string()))?,
+        ),
+        None => None,
+    };
     let mut depth = Vec::new();
     let mut wse = Vec::new();
     depth
@@ -230,13 +279,27 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         report["output_geo_transform"] = json!(layout.output);
     }
     let result = (|| {
+        if let (Some(plan), Some(pool)) = (&delivery, &pool) {
+            return plan
+                .deliver(output, mask.as_deref(), &mut depth, &mut wse, pool)
+                .map(Some);
+        }
         crate::horizontal::write_values(&output.join("depth.bin"), &depth)?;
         crate::horizontal::write_values(&output.join("wse.bin"), &wse)?;
-        Ok::<_, MapError>(())
+        Ok::<_, MapError>(None)
     })();
-    if let Err(e) = &result {
-        report["status"] = json!("aborted");
-        report["error"] = json!(e.to_string());
+    match &result {
+        Ok(Some(fields)) => {
+            report["threads"] = json!(threads);
+            for (key, value) in fields.as_object().into_iter().flatten() {
+                report[key] = value.clone();
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            report["status"] = json!("aborted");
+            report["error"] = json!(e.to_string());
+        }
     }
     fs::write(
         output.join("report.json"),
@@ -250,5 +313,10 @@ pub fn stored_grid_method_record() -> Value {
     let mut record = crate::coupled::method_record();
     record["method_id"] = json!("one-d-two-d-native-grid-coverage-first-diagnostic/1");
     record["grid_contracts"] = json!([crate::stored_grid::ID]);
+    // Engine-written delivery is not offered with the stored grid contract.
+    if let Some(map) = record.as_object_mut() {
+        map.remove("native_geotiff_outputs");
+        map.remove("native_final_format");
+    }
     record
 }

@@ -169,6 +169,147 @@ stitch TIN, at the time of parking): terrain A 0 differences; B1 3 px off by
 1/32 ft at exact ties; B2 432 px (96 above 1/32, max 0.84 ft) on one
 levee/channel pair with short segments. Superseded by the entries above.
 
+### Parallel native 1D render and 1D phase timers
+
+`one-d-diagnostic` schemas /2, /3 and /4 accept an optional `threads` field
+(1-64, default 1; schema /1 accepts only 1). Whole source-terrain tile rows are
+rendered on one request pool; every tile keeps its own claim scratch, candidate
+order and per-scanline incremental arithmetic, so Depth/WSE are bit-identical
+for every worker count. Extra-worker scratch is admitted before any read. The
+native and clipped 1D method records advertise `render_workers`; method IDs
+and arithmetic are unchanged. Reports add `threads` and a `timing` object
+(read, allocate, surface prepare, render, write, total seconds).
+
+Measured on the Whisky Chitto p04 staged schema /2 requests (4,483 XS, 12,919 x
+17,409 grid, 3 profiles, warm medians of 3, Linux i9-11900 container pinned to
+4 CPUs): render 0.99 s at 1 worker, 0.49 s at 4; call total 4.58 s to 4.10 s;
+outputs SHA256-equal to v0.17.0.
+
+### terrio 0.8.0
+
+The engine's terrio dependency moves from 0.4.2 to 0.8.0 (crates.io, still
+`default-features = false` with only `geotiff`). This removes the C `zstd-sys`
+build dependency and with it every C compiler requirement; terrain decode is
+faster (Spring River p02, 4 CPUs, warm medians: `terrain_cache.decode_seconds`
+3.94 to 3.65). Spring River p02 Depth/WSE (stock and final routes) and Whisky
+Chitto 1D outputs are bit-identical to 0.4.2.
+
+Thread budget. terrio 0.4.2 ran its parallel work on the caller's rayon pool;
+0.8.0 runs it on a process-wide pool of its own (`terrio-par-*`), started on
+first use with `RAYON_NUM_THREADS` threads (else one per core), and offers no
+native API to size, replace or bypass it. A request worker waiting on that pool
+keeps running its own pool's jobs, so terrio's threads added to the request's:
+with a pool as large as the request, `threads = 3` was measured with 7 threads
+busy at once. The engine now keeps the budget structurally (`terrio_pool`):
+
+- `ras2fim-batch` sets `RAYON_NUM_THREADS=1` before any thread starts, replacing
+  any inherited value, so terrio's pool has one thread for every command and
+  for every request of a persistent `sloping-server` session. The request JSON
+  is no longer read before dispatch to size it. The engine's own pools always
+  set their size.
+- Every engine call into terrio that can reach that pool (ownership and storage
+  burns, step05 warps, effective-terrain writes, GeoTIFF finalization) runs on a
+  short-lived helper thread while the caller blocks in an OS wait; so whenever
+  terrio's thread works, the worker that asked for it does not. With one terrio
+  thread, burns run as one stripe on the helper. Terrain reads stay one source
+  block per call and legacy GeoTIFF strips one block row per call, which terrio
+  decodes or encodes on the calling thread without its pool.
+- terrio's process-wide decoded-block cache is turned off (0 bytes) whenever the
+  engine opens terrain: the engine caches decoded blocks itself under its own
+  budgets, and an inherited `TERRIO_CACHEMAX`/`GDAL_CACHEMAX` no longer adds
+  unplanned memory.
+- terrio's pool is started without reading any payload (an empty in-memory
+  rasterize) instead of by a one-pixel terrain read.
+- `ras2fim-batch method` reports `engine.thread_budget`. Library callers that do
+  not run the executable must set `RAYON_NUM_THREADS=1` before terrio is first
+  used (crate docs); otherwise terrio's pool has one thread per core. The
+  `one_d_session`, `storage_session` and `effective_terrain` reports add
+  `terrio_pool` (`terrio_pool::status()`): the pool size configured when the
+  engine first used terrio, `bounded` (false above one thread) and the block
+  cache size.
+- A terrio call fails with a budget error when its helper thread cannot be
+  started, instead of running on the request worker.
+- `run` and `step05` report `os_threads.max_running_observed` (Linux) and an
+  `expected_max` of `2 * threads + 3` OS threads (request pool, helpers of its
+  blocked workers, main, monitor, terrio's thread). New tests sample the
+  executable's threads on Linux and Windows and check that busy threads stay
+  within `threads`.
+
+Cost: terrio's internal parallelism is gone. Burns, warps and multi-block
+writes inside terrio run on one thread. On a 6,144 x 6,144 storage request
+with 10,000 areas (4 threads, Windows, 2 runs each) the CLI took 2.76-3.33 s
+against 2.34-2.43 s with terrio's pool at 4 threads (which exceeded the
+budget). Outputs are unchanged.
+
+### 1D terrain read with terrio; parallel inline composition
+
+`one-d-diagnostic` schemas /2-/4 accept `terrain_tiff` (the request grid's
+single-band Float32 GeoTIFF) as an alternative to a caller-staged
+`terrain_file`. Admission reads the TIFF header only (no pixel block is decoded
+before the budget check), refuses blocks (tiles or strips) over 16 MiB and
+plans three block-sized buffers per worker, since terrio decodes whole blocks:
+`(tile_cols * block_rows * 12 + 1 MiB) * threads` bytes. Rust API:
+`one_d_terrain::Source::planned_bytes(window_width, threads)` became
+`planned_bytes(threads)`, and `one_d_terrain::inspect` no longer refuses blocks
+taller than 4,096 rows; the 16 MiB block bound replaces that limit.
+The engine checks size and geotransform, decodes block-row
+stripes with terrio on the request pool and maps GDAL Float32 nodata
+(`ARE_REAL_EQUAL`) to NaN, exactly as a masked GDAL read; method records
+advertise `terrain_tiff` and reports add `terrain_read_seconds`. Inline storage
+composition runs in independent pixel chunks on the request pool with the
+unchanged kernel. On Whisky Chitto p04 (full grid, 8 profiles) Commander
+mapping took 22.1 s against 38.4 s, with identical products.
+
+### Inline storage composition for 1D requests
+
+`one-d-diagnostic` schemas /2-/3 accept an optional `storage` block (polygon
+file, area count, one level file per profile and the window geotransform). The
+engine rasterizes physical storage labels once, then for every profile applies
+the unchanged level-pool kernel and coverage-first composition with zero 2D
+cells in memory, replacing a `storage` and a `coupled-diagnostic` process and
+their full-grid raw files per profile. Products and composition counts are
+bit-identical to the three-call route; per-profile reports carry the storage
+and composition method records and counts. Method records advertise
+`inline_storage` (not with the stored grid contract). On Whisky Chitto p04
+(full grid, 8 profiles, `final_format`), Commander mapping took 38.4 s against
+124.9 s with separate storage and composition calls.
+
+### Engine-written 1D and composition delivery GeoTIFFs
+
+`one-d-diagnostic` schemas /2-/4 and coupled composition schemas /1-/2 accept
+the opt-in sloping `final_format` block with `epsg`, `flooded_depth_range` and
+an optional `aoi_mask_file` (one byte per window pixel). The engine applies the
+mask, reports `depth_finite_pixels` and `flooded_pixels`, and writes
+`depth.tif`/`wse.tif` once through `final_tiff` (tiled DEFLATE, numeric nodata,
+optional full-grid placement and GDAL-average overviews) instead of raw `.bin`.
+Product values are unchanged; NaN and masked pixels become nodata. Every option
+and the mask are validated and the writer admitted before outputs exist.
+Composition accepts `threads` (DEFLATE workers) with `final_format`. The 1D
+native/clipped and non-stored-grid coupled method records advertise
+`native_geotiff_outputs` and `native_final_format`. On Whisky Chitto p04 (full
+12,919 x 17,409 grid, 8 profiles, storage composition) Commander mapping took
+124.9 s against 166.5 s with Python-written GeoTIFFs; files were 249 MB
+against 541 MB, with identical valid bits and nodata masks.
+
+### Multi-profile 1D requests
+
+`one-d-diagnostic` schemas /2-/4 accept `levels_files` (1-256 profiles) as an
+alternative to `levels_file`; exactly one is required. Rust API: `one_d_session::Request`
+fields `levels_file` and `terrain_file` are now `Option<PathBuf>` (with new
+`levels_files`, `terrain_tiff`, `threads`, `final_format`, `epsg`,
+`aoi_mask_file`, `flooded_depth_range` and `storage` fields), a breaking change
+for struct-literal callers; JSON requests are unchanged. A multi-profile run
+that delivered earlier profiles before one failed writes an aborted report and
+the CLI exits 2 (partial run), not 1. Inputs, terrain and the
+prepared surface are read and built once; profile `i` is rendered into reused
+buffers and written to `profile-{i:04}/` with its own report in the
+single-profile shape. The top-level report lists every profile and carries the
+shared timing. All levels are read and admitted before any output is created.
+Outputs are bit-identical to one request per profile; method records advertise
+`multi_profile`. Single-profile requests and their output layout are unchanged.
+On Whisky Chitto p04 (3 profiles, 4 workers, warm medians of 3), one request
+took 5.88 s against 12.50 s for three single requests.
+
 ## 0.17.0 - 2026-11-10
 
 ### Final-format native delivery

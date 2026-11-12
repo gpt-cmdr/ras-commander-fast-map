@@ -318,3 +318,556 @@ fn cli_advertises_both_legacy_and_native_methods_and_maps_schema_two() {
         30 * 4
     );
 }
+
+#[test]
+fn multi_profile_requests_match_single_requests_bit_for_bit() {
+    let fixture = Fixture::populated();
+    let profiles: [[f32; 4]; 3] = [
+        [20., 18., 12., 8.],
+        [9., f32::NAN, 7., 6.],
+        [3., 2., 25., 24.],
+    ];
+    let mut names = vec![];
+    for (i, levels) in profiles.iter().enumerate() {
+        let name = format!("levels-{i}.bin");
+        write_f32(&fixture.root.join(&name), levels);
+        let mut single = fixture.request.clone();
+        single["levels_file"] = json!(name);
+        fixture.run(single, &format!("single-{i}")).unwrap();
+        names.push(name);
+    }
+    for threads in [1, 3] {
+        let mut multi = fixture.request.clone();
+        multi.as_object_mut().unwrap().remove("levels_file");
+        multi["levels_files"] = json!(names);
+        multi["threads"] = json!(threads);
+        let out = format!("multi-{threads}");
+        let report = fixture.run(multi, &out).unwrap();
+        assert_eq!(report["status"], "complete");
+        assert_eq!(report["profile_count"], 3);
+        assert!(report.get("depth_file").is_none());
+        for i in 0..3 {
+            let single: Value = serde_json::from_slice(
+                &fs::read(fixture.root.join(format!("single-{i}/report.json"))).unwrap(),
+            )
+            .unwrap();
+            let sub: Value = serde_json::from_slice(
+                &fs::read(
+                    fixture
+                        .root
+                        .join(format!("{out}/profile-{i:04}/report.json")),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(sub["valid_pixels"], single["valid_pixels"]);
+            assert_eq!(
+                report["profiles"][i]["valid_pixels"],
+                single["valid_pixels"]
+            );
+            assert_eq!(sub["method"], single["method"]);
+            for product in ["depth", "wse"] {
+                let a = fs::read(fixture.root.join(format!("single-{i}/{product}.bin"))).unwrap();
+                let b = fs::read(
+                    fixture
+                        .root
+                        .join(format!("{out}/profile-{i:04}/{product}.bin")),
+                )
+                .unwrap();
+                assert_eq!(a, b, "profile {i} {product} threads {threads}");
+            }
+        }
+    }
+}
+
+#[test]
+fn multi_profile_selection_is_refused_before_outputs() {
+    let fixture = Fixture::populated();
+    write_f32(&fixture.root.join("levels-b.bin"), &[1., 2., 3., 4.]);
+    write_f32(&fixture.root.join("short.bin"), &[1., 2., 3.]);
+    let mut both = fixture.request.clone();
+    both["levels_files"] = json!(["levels.bin"]);
+    let mut neither = fixture.request.clone();
+    neither.as_object_mut().unwrap().remove("levels_file");
+    let mut empty = neither.clone();
+    empty["levels_files"] = json!([]);
+    let mut too_many = neither.clone();
+    too_many["levels_files"] = json!(vec!["levels.bin"; one_d_session::MAX_PROFILES + 1]);
+    let mut legacy = neither.clone();
+    legacy["schema"] = json!("fast-map-one-d-diagnostic/1");
+    for key in ["render_order_file", "tile_size"] {
+        legacy.as_object_mut().unwrap().remove(key);
+    }
+    legacy["levels_files"] = json!(["levels.bin"]);
+    let mut short = neither.clone();
+    short["levels_files"] = json!(["levels.bin", "short.bin"]);
+    let mut missing = neither.clone();
+    missing["levels_files"] = json!(["levels-b.bin", "absent.bin"]);
+    for (i, request) in [both, neither, empty, too_many, legacy, short, missing]
+        .into_iter()
+        .enumerate()
+    {
+        let name = format!("refused-{i}");
+        assert!(fixture.run(request, &name).is_err(), "case {i}");
+        assert!(
+            !fixture.root.join(&name).exists(),
+            "case {i} created output"
+        );
+    }
+}
+
+fn read_tif(path: &Path) -> (Vec<f32>, Option<f64>, usize, usize) {
+    let mut raster = terrio::LazyRaster::open_tiff(path.to_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let (w, h) = (raster.width(), raster.height());
+    let ds = raster
+        .read_window(
+            terrio::Window {
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+            },
+            &terrio::WindowOptions {
+                bands: vec![1],
+                overview: None,
+            },
+        )
+        .unwrap();
+    let terrio::raster::RasterData::F32(values) = ds.raster.data else {
+        panic!("not Float32")
+    };
+    (values, raster.nodata(), w, h)
+}
+
+#[test]
+fn final_format_writes_raw_bits_with_mask_and_nodata_for_single_and_multi() {
+    let fixture = Fixture::populated();
+    fixture.run(fixture.request.clone(), "raw").unwrap();
+    // Mask out the first row and one interior pixel.
+    let mut mask = vec![1_u8; 30];
+    mask[..6].fill(0);
+    mask[13] = 0;
+    fs::write(fixture.root.join("mask.u8"), &mask).unwrap();
+    let mut request = fixture.request.clone();
+    request["final_format"] = json!({"nodata": -9999.0, "block_size": 16, "overview_factors": [2]});
+    request["epsg"] = json!(26915);
+    request["aoi_mask_file"] = json!("mask.u8");
+    request["flooded_depth_range"] = json!([0.0, 10000.0]);
+    let report = fixture.run(request.clone(), "final").unwrap();
+    assert_eq!(report["depth_file"], "depth.tif");
+    assert_eq!(report["compression"], "DEFLATE");
+    assert!(!fixture.root.join("final/depth.bin").exists());
+    let raw_depth = read_f32(&fixture.root.join("raw/depth.bin"));
+    let mut finite = 0;
+    let mut flooded = 0;
+    for product in ["depth", "wse"] {
+        let raw = read_f32(&fixture.root.join(format!("raw/{product}.bin")));
+        let (values, nodata, w, h) = read_tif(&fixture.root.join(format!("final/{product}.tif")));
+        assert_eq!((w, h, nodata), (6, 5, Some(-9999.0)));
+        for (i, (r, v)) in raw.iter().zip(&values).enumerate() {
+            if mask[i] == 0 || r.is_nan() {
+                assert_eq!(*v, -9999.0, "{product} {i}");
+            } else {
+                assert_eq!(r.to_bits(), v.to_bits(), "{product} {i}");
+            }
+        }
+    }
+    for (i, d) in raw_depth.iter().enumerate() {
+        if mask[i] == 1 && d.is_finite() {
+            finite += 1;
+            flooded += usize::from(*d > 0.0 && *d <= 10000.0);
+        }
+    }
+    assert!(finite > 0);
+    assert_eq!(report["depth_finite_pixels"], finite);
+    assert_eq!(report["flooded_pixels"], flooded);
+    assert_eq!(report["depth_final"]["valid_pixels"], finite);
+    // Multi-profile delivery writes the same files per profile.
+    let mut multi = request;
+    multi.as_object_mut().unwrap().remove("levels_file");
+    multi["levels_files"] = json!(["levels.bin", "levels.bin"]);
+    multi["threads"] = json!(2);
+    fixture.run(multi, "multi").unwrap();
+    for i in 0..2 {
+        for product in ["depth", "wse"] {
+            assert_eq!(
+                fs::read(fixture.root.join(format!("final/{product}.tif"))).unwrap(),
+                fs::read(
+                    fixture
+                        .root
+                        .join(format!("multi/profile-{i:04}/{product}.tif"))
+                )
+                .unwrap(),
+                "file bytes are independent of workers and batching"
+            );
+        }
+    }
+}
+
+#[test]
+fn final_format_options_are_refused_before_outputs() {
+    let fixture = Fixture::populated();
+    fs::write(fixture.root.join("bad-mask.u8"), [2_u8; 30]).unwrap();
+    fs::write(fixture.root.join("short-mask.u8"), [1_u8; 29]).unwrap();
+    let base = {
+        let mut r = fixture.request.clone();
+        r["final_format"] = json!({"nodata": -9999.0});
+        r["epsg"] = json!(26915);
+        r["flooded_depth_range"] = json!([0.0, 10000.0]);
+        r
+    };
+    let mut cases = vec![];
+    for key in ["epsg", "flooded_depth_range"] {
+        let mut r = base.clone();
+        r.as_object_mut().unwrap().remove(key);
+        cases.push(r);
+    }
+    let mut r = fixture.request.clone();
+    r["epsg"] = json!(26915);
+    cases.push(r);
+    let mut r = base.clone();
+    r["epsg"] = json!(1);
+    cases.push(r);
+    let mut r = base.clone();
+    r["flooded_depth_range"] = json!([1.0, 0.0]);
+    cases.push(r);
+    let mut r = base.clone();
+    r["final_format"] = json!({"nodata": 0.1});
+    cases.push(r);
+    for mask in ["bad-mask.u8", "short-mask.u8", "absent.u8"] {
+        let mut r = base.clone();
+        r["aoi_mask_file"] = json!(mask);
+        cases.push(r);
+    }
+    for (i, request) in cases.into_iter().enumerate() {
+        let name = format!("refused-{i}");
+        assert!(fixture.run(request, &name).is_err(), "case {i}");
+        assert!(
+            !fixture.root.join(&name).exists(),
+            "case {i} created output"
+        );
+    }
+}
+
+fn storage_polygon() -> Vec<u8> {
+    // One rectangle over columns 0-3 and rows 0-1 of the populated fixture grid.
+    let mut wkb = vec![1];
+    wkb.extend(3_u32.to_le_bytes());
+    wkb.extend(1_u32.to_le_bytes());
+    wkb.extend(5_u32.to_le_bytes());
+    for [x, y] in [
+        [1000.125_f64, 1997.75_f64],
+        [1005.125, 1997.75],
+        [1005.125, 2000.25],
+        [1000.125, 2000.25],
+        [1000.125, 1997.75],
+    ] {
+        wkb.extend(x.to_le_bytes());
+        wkb.extend(y.to_le_bytes());
+    }
+    let mut out = (wkb.len() as u32).to_le_bytes().to_vec();
+    out.extend(wkb);
+    out
+}
+
+#[test]
+fn inline_storage_matches_storage_then_composition_bits() {
+    let fixture = Fixture::populated();
+    fs::write(fixture.root.join("areas.wkb"), storage_polygon()).unwrap();
+    write_f32(&fixture.root.join("pool-wet.bin"), &[5.0]);
+    write_f32(&fixture.root.join("pool-dry.bin"), &[-1.0]);
+    let gt = json!([1000.125, 1.25, 0., 2000.25, 0., -1.25]);
+    let pools = ["pool-wet.bin", "pool-dry.bin"];
+    // Three-call reference per profile.
+    for (i, pool) in pools.iter().enumerate() {
+        fixture
+            .run(fixture.request.clone(), &format!("xs-{i}"))
+            .unwrap();
+        let storage: ras_commander_fast_map::storage_session::Request = serde_json::from_value(json!({
+            "schema": "fast-map-storage/1", "storage_areas_file": "areas.wkb", "storage_area_count": 1,
+            "levels_file": pool, "terrain_file": "terrain.bin", "width": 6, "height": 5,
+            "geo_transform": gt, "max_working_bytes": 16_777_216, "threads": 2})).unwrap();
+        ras_commander_fast_map::storage_session::run(
+            &storage,
+            &fixture.root,
+            &fixture.root.join(format!("pool-{i}")),
+        )
+        .unwrap();
+        fs::write(fixture.root.join("zero.u32"), [0_u8; 120]).unwrap();
+        write_f32(&fixture.root.join("dry.f32"), &[f32::NAN; 30]);
+        let component = |d: String, w: String| {
+            json!({"profile_id": "p", "crs": "c", "width": 6, "height": 5,
+            "geo_transform": gt, "depth_file": d, "wse_file": w})
+        };
+        let compose: ras_commander_fast_map::coupled_session::Request = serde_json::from_value(json!({
+            "schema": "fast-map-coupled-diagnostic/2",
+            "xs": component(format!("xs-{i}/depth.bin"), format!("xs-{i}/wse.bin")),
+            "two_d": component("dry.f32".into(), "dry.f32".into()),
+            "two_d_owners_file": "zero.u32", "two_d_cell_count": 0,
+            "storage": {"component": component(format!("pool-{i}/depth.bin"), format!("pool-{i}/wse.bin")),
+                "owners_file": format!("pool-{i}/owners.bin"), "area_count": 1},
+            "max_working_bytes": 16_777_216})).unwrap();
+        ras_commander_fast_map::coupled_session::run(
+            &compose,
+            &fixture.root,
+            &fixture.root.join(format!("composed-{i}")),
+        )
+        .unwrap();
+    }
+    for threads in [1, 3] {
+        let mut inline = fixture.request.clone();
+        inline.as_object_mut().unwrap().remove("levels_file");
+        inline["levels_files"] = json!(["levels.bin", "levels.bin"]);
+        inline["threads"] = json!(threads);
+        inline["storage"] = json!({"storage_areas_file": "areas.wkb", "storage_area_count": 1,
+            "levels_files": pools, "geo_transform": gt});
+        inline["max_working_bytes"] = json!(16_777_216);
+        let out = format!("inline-{threads}");
+        fixture.run(inline, &out).unwrap();
+        for i in 0..2 {
+            for product in ["depth", "wse"] {
+                assert_eq!(
+                    fs::read(fixture.root.join(format!("composed-{i}/{product}.bin"))).unwrap(),
+                    fs::read(
+                        fixture
+                            .root
+                            .join(format!("{out}/profile-{i:04}/{product}.bin"))
+                    )
+                    .unwrap(),
+                    "profile {i} {product} threads {threads}"
+                );
+            }
+            let report: Value = serde_json::from_slice(
+                &fs::read(
+                    fixture
+                        .root
+                        .join(format!("{out}/profile-{i:04}/report.json")),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let reference: Value = serde_json::from_slice(
+                &fs::read(fixture.root.join(format!("composed-{i}/report.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(report["composition"]["counts"], reference["counts"]);
+            assert_eq!(report["composition"]["method"], reference["method"]);
+        }
+    }
+    // The wet pool must actually change the composition relative to the dry one.
+    assert_ne!(
+        fs::read(fixture.root.join("composed-0/wse.bin")).unwrap(),
+        fs::read(fixture.root.join("composed-1/wse.bin")).unwrap()
+    );
+    // Refusals before outputs: wrong transform, wrong levels count, stored grid excluded.
+    let mut bad = fixture.request.clone();
+    bad["max_working_bytes"] = json!(16_777_216);
+    bad["storage"] = json!({"storage_areas_file": "areas.wkb", "storage_area_count": 1,
+        "levels_files": ["pool-wet.bin"], "geo_transform": [1000.0, 1.25, 0., 2000.25, 0., -1.25]});
+    assert!(fixture.run(bad.clone(), "bad-gt").is_err());
+    bad["storage"]["geo_transform"] = gt.clone();
+    bad["storage"]["levels_files"] = json!(["pool-wet.bin", "pool-dry.bin"]);
+    assert!(fixture.run(bad, "bad-count").is_err());
+    assert!(!fixture.root.join("bad-gt").exists() && !fixture.root.join("bad-count").exists());
+}
+
+#[test]
+fn terrain_tiff_matches_staged_terrain_bits_and_refuses_mismatched_grids() {
+    use ras_commander_fast_map::{final_tiff, native_output::FinalFormat};
+    let fixture = Fixture::populated();
+    let gt = [1000.125, 1.25, 0., 2000.25, 0., -1.25];
+    let format: FinalFormat =
+        serde_json::from_value(json!({"nodata": -9999.0, "block_size": 16})).unwrap();
+    let layout = final_tiff::Layout::new(&format, 6, 5, gt).unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    // NaN pixels become the file's nodata and must read back as NaN.
+    final_tiff::write(
+        &fixture.root.join("terrain.tif"),
+        &fixture.terrain,
+        &layout,
+        26915,
+        &pool,
+    )
+    .unwrap();
+    for (window, threads) in [(None, 1), (Some([1, 1, 4, 3]), 3)] {
+        let mut staged = fixture.request.clone();
+        let mut direct = fixture.request.clone();
+        direct.as_object_mut().unwrap().remove("terrain_file");
+        direct["terrain_tiff"] = json!("terrain.tif");
+        direct["threads"] = json!(threads);
+        direct["max_working_bytes"] = json!(64_000_000);
+        if let Some([col, row, width, height]) = window {
+            let crop: Vec<f32> = (row..row + height)
+                .flat_map(|r| fixture.terrain[r * 6 + col..r * 6 + col + width].to_vec())
+                .collect();
+            write_f32(&fixture.root.join("crop.bin"), &crop);
+            staged["terrain_file"] = json!("crop.bin");
+            for r in [&mut staged, &mut direct] {
+                r["window"] = json!({"col": col, "row": row, "width": width, "height": height});
+            }
+        }
+        let name = format!("{window:?}").replace(['[', ']', ' ', ','], "");
+        let a = fixture.run(staged, &format!("staged{name}")).unwrap();
+        let b = fixture.run(direct, &format!("direct{name}")).unwrap();
+        assert_eq!(a["valid_pixels"], b["valid_pixels"]);
+        for product in ["depth", "wse"] {
+            assert_eq!(
+                fs::read(fixture.root.join(format!("staged{name}/{product}.bin"))).unwrap(),
+                fs::read(fixture.root.join(format!("direct{name}/{product}.bin"))).unwrap(),
+                "{product} {window:?}"
+            );
+        }
+    }
+    // Header mismatches and ambiguous terrain selection refuse before outputs.
+    let other =
+        final_tiff::Layout::new(&format, 6, 5, [1000.0, 1.25, 0., 2000.25, 0., -1.25]).unwrap();
+    final_tiff::write(
+        &fixture.root.join("shifted.tif"),
+        &fixture.terrain,
+        &other,
+        26915,
+        &pool,
+    )
+    .unwrap();
+    let mut shifted = fixture.request.clone();
+    shifted.as_object_mut().unwrap().remove("terrain_file");
+    shifted["terrain_tiff"] = json!("shifted.tif");
+    let mut both = fixture.request.clone();
+    both["terrain_tiff"] = json!("terrain.tif");
+    let mut neither = fixture.request.clone();
+    neither.as_object_mut().unwrap().remove("terrain_file");
+    for (i, request) in [shifted, both, neither].into_iter().enumerate() {
+        let name = format!("terrain-refused-{i}");
+        assert!(fixture.run(request, &name).is_err(), "case {i}");
+        assert!(!fixture.root.join(&name).exists());
+    }
+}
+
+/// A multi-profile request whose later profile fails after earlier profiles were
+/// delivered is a partial run: the CLI exits 2 (not 1) and keeps the aborted report.
+#[test]
+fn cli_multi_profile_partial_failure_exits_two() {
+    let fixture = Fixture::populated();
+    write_f32(&fixture.root.join("good.bin"), &[20., 18., 12., 8.]);
+    write_f32(
+        &fixture.root.join("bad.bin"),
+        &[f32::INFINITY, 18., 12., 8.],
+    );
+    let mut multi = fixture.request.clone();
+    multi.as_object_mut().unwrap().remove("levels_file");
+    multi["levels_files"] = json!(["good.bin", "bad.bin"]);
+    fs::write(
+        fixture.root.join("partial.json"),
+        serde_json::to_vec(&multi).unwrap(),
+    )
+    .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_ras2fim-batch"))
+        .arg("one-d-diagnostic")
+        .arg(fixture.root.join("partial.json"))
+        .arg(fixture.root.join("partial"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        result.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: Value =
+        serde_json::from_slice(&fs::read(fixture.root.join("partial/report.json")).unwrap())
+            .unwrap();
+    assert_eq!(report["status"], "aborted");
+    assert_eq!(report["profiles"][0]["status"], "complete");
+    assert!(fixture.root.join("partial/profile-0000/depth.bin").exists());
+}
+
+/// `terrain_tiff` windows stitch values across tile boundaries in both
+/// directions, and apply GDAL's Float32 nodata rule (`ARE_REAL_EQUAL`) at its
+/// edges: values a few ulps from nodata are masked, nearby values are kept.
+#[test]
+fn terrain_tiff_stitches_tiles_and_masks_near_nodata() {
+    use ras_commander_fast_map::effective_terrain::{self, Effective, Grid, NODATA};
+    use ras_commander_fast_map::one_d_terrain;
+    let fixture = Fixture::empty();
+    let root = fixture.root.clone();
+    let (w, h) = (600usize, 300usize); // 256x256 tiles: 3 x 2
+    let near = [
+        NODATA,
+        f32::from_bits(NODATA.to_bits() + 1),
+        f32::from_bits(NODATA.to_bits() - 2),
+        NODATA + 0.01,
+        NODATA - 0.01,
+        -0.0,
+        f32::MIN_POSITIVE,
+    ];
+    let values: Vec<f32> = (0..w * h)
+        .map(|i| {
+            let (r, c) = (i / w, i % w);
+            if (r + c) % 17 == 0 {
+                near[(r * 7 + c) % near.len()]
+            } else {
+                (r as f32) * 1000.0 + c as f32 + 0.25
+            }
+        })
+        .collect();
+    let gt = [500.0, 2.0, 0.0, 9000.0, 0.0, -2.0];
+    let grid = Grid {
+        origin_x: gt[0],
+        origin_y: gt[3],
+        cell_size: gt[1],
+        width: w,
+        height: h,
+    };
+    let path = root.join("tiles.tif");
+    effective_terrain::write_geotiff(
+        &path,
+        Effective {
+            grid,
+            values: values.clone(),
+            report: Value::Null,
+        },
+        26915,
+    )
+    .unwrap();
+    let source = one_d_terrain::inspect(&path, w, h, gt).unwrap();
+    // One block decoded at a time per worker: three 256x256 Float32 copies plus slack.
+    assert_eq!(
+        source.planned_bytes(2),
+        Some(2 * (256 * 256 * 12 + (1 << 20)))
+    );
+    let masked =
+        |v: f32| v == NODATA || (v - NODATA).abs() < f32::EPSILON * (v + NODATA).abs() * 2.0;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(3)
+        .build()
+        .unwrap();
+    for window in [
+        [0, 0, w, h],
+        [250, 250, 20, 10],
+        [3, 1, 597, 299],
+        [255, 0, 2, 300],
+    ] {
+        let [col, row, ww, wh] = window;
+        let expected: Vec<u32> = (row..row + wh)
+            .flat_map(|r| (col..col + ww).map(move |c| (r, c)))
+            .map(|(r, c)| {
+                let v = values[r * w + c];
+                if masked(v) { f32::NAN } else { v }.to_bits()
+            })
+            .collect();
+        for pool in [None, Some(&pool)] {
+            let mut out = vec![0.0f32; ww * wh];
+            source.read(&path, window, &mut out, pool).unwrap();
+            let got: Vec<u32> = out.iter().map(|v| v.to_bits()).collect();
+            assert!(got == expected, "window {window:?} pool {}", pool.is_some());
+        }
+    }
+    // Both masked and kept near-nodata values occur.
+    assert!(near.iter().any(|v| masked(*v)) && near.iter().any(|v| !masked(*v)));
+    assert!(!masked(NODATA + 0.01) && masked(f32::from_bits(NODATA.to_bits() + 1)));
+}

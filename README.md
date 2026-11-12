@@ -99,6 +99,19 @@ inherit the sealed choice. Standalone 1D/2D mapping and catalogs do not expose
 the keyword. These explicit transports retain numerically unqualified discovery
 and diagnostic opt-in even when the named fixture comparisons pass.
 
+### Thread budget
+
+A request's `threads` (or `budgets.threads`) bounds the threads that are busy at
+once. terrio runs its own parallel work on one process-wide pool, sized when it
+starts by `RAYON_NUM_THREADS`; `ras2fim-batch` sets that variable to 1 before any
+thread starts, replacing an inherited value. Engine calls that can reach that
+pool run off request workers, which wait without taking other work, and terrio's
+decoded-block cache is off (the engine budgets its own block cache). OS threads
+can exceed `threads` (idle pool threads, helper threads of blocked workers), busy
+threads cannot. Rust callers that do not run the executable must set
+`RAYON_NUM_THREADS=1` before terrio is first used; `ras2fim-batch method`
+reports `engine.thread_budget`.
+
 ### Native runtime comparison scope
 
 Within the stated coverage, the native-runtime checks below compare complete

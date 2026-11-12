@@ -77,5 +77,9 @@ tests do not qualify this public-wrapper path. A later private terrio reader
 preserves the datum through geographic-on-datum lookup. A narrow private
 0.4.2 maintenance backport is preferred over a broad reader upgrade, because
 the newer reader also changes its Rayon-pool behavior. Either dependency
-change requires separate terrain I/O and distribution qualification. Do not relabel source
+change requires separate terrain I/O and distribution qualification.
+(2026-11-11: the engine now uses terrio 0.8.0; its own thread pool is bounded
+to the request budget by the CLI. Spring River p02 and Whisky Chitto 1D
+products were requalified bit for bit; the Davis public-wrapper CRS path has
+not been rerun.) Do not relabel source
 terrain or bypass boundary provenance checks to obtain a passing gate.

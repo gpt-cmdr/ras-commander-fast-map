@@ -671,7 +671,8 @@ pub fn warp_field(
     g: &DestGrid,
 ) -> Result<Vec<f32>, MapError> {
     let ds = src_dataset(values, inp_rows, inp_cols, gt)?;
-    let out = terrio::ops::warp::warp(&[&ds], &warp_options(env, n, g))
+    let options = warp_options(env, n, g);
+    let out = crate::terrio_pool::call(|| terrio::ops::warp::warp(&[&ds], &options))?
         .map_err(|e| MapError::Terrain(format!("warp: {e}")))?;
     if out.geo_transform() != g.geotransform
         || out.raster.cols != g.width

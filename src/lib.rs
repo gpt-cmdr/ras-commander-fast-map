@@ -19,6 +19,17 @@
 //! Independent [`horizontal`] and [`sloping_session`] methods prepare pixel ownership
 //! directly from cell polygons. Plain sloping reconstructs hydraulic connectivity
 //! and corner interpolation rather than using the Step05 SciPy topology.
+//!
+//! Thread budget: a request's `threads` bounds the threads busy at once only if
+//! terrio's process-wide pool has one thread. terrio sizes that pool from
+//! `RAYON_NUM_THREADS` when it first starts (else one thread per core) and offers
+//! no API to size it later. The `ras2fim-batch` executable sets
+//! `RAYON_NUM_THREADS=1` before any thread starts. **Rust callers of this library
+//! must do the same** (for example as the first statement of `main`, before any
+//! thread or terrio call); otherwise terrio calls can add up to one busy thread
+//! per core. Reports of [`one_d_session`], [`storage_session`] and
+//! [`effective_terrain`] carry `terrio_pool` ([`terrio_pool::status`]) with
+//! `bounded: false` when the pool was configured larger. See [`terrio_pool`].
 #![forbid(unsafe_code)]
 
 /// Version of the standalone crate and Python wheel.
@@ -55,9 +66,11 @@ pub mod model;
 pub mod native_output;
 pub mod one_d;
 pub mod one_d_clip;
+pub mod one_d_delivery;
 pub mod one_d_native;
 pub mod one_d_order;
 pub mod one_d_session;
+pub mod one_d_terrain;
 pub mod ownership;
 mod retained;
 pub mod scipy_interp;
@@ -74,6 +87,7 @@ pub mod stored_grid;
 pub mod terrain;
 pub mod terrain_mods;
 pub mod terrain_scope;
+pub mod terrio_pool;
 pub mod velocity;
 pub mod whole_simulation;
 

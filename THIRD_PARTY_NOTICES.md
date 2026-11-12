@@ -15,8 +15,12 @@ distributed under the BSD 3-Clause license; its notice is retained in
 - [SciPy Delaunay source, v1.18.1](https://github.com/scipy/scipy/blob/v1.18.1/scipy/spatial/_qhull.pyx)
 
 Raster I/O, approximate reprojection and horizontal polygon rasterization use the statically linked
-[`terrio` 0.4.2](https://github.com/opengeos/terrio) dependency, under its MIT
-license, retained in `licenses/terrio-LICENSE.txt`. Terrio ports GDAL scanline
+[`terrio` 0.8.0](https://github.com/opengeos/terrio) dependency (built with
+`default-features = false` and only its `geotiff` feature), under its MIT
+license, retained in `licenses/terrio-LICENSE.txt`; its NOTICE is retained in
+`licenses/dependencies/terrio-0.8.0/`. The crate's declared
+`MIT AND MPL-2.0 AND Apache-2.0` expression covers files outside this build's
+features (the MPL-2.0 file is a point-cloud filter that is not compiled here). Terrio ports GDAL scanline
 rasterization rules; its ownership fill preserves feature order and pixel-centre
 inclusion. `wbvector` 0.1.6 and `wbraster` 0.2.1 provide geometry and typed raster
 data; their MIT/Apache notices are retained in `licenses/`.
