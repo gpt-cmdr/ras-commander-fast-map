@@ -39,11 +39,12 @@ layer written as `Type=Channel` leaves the export equal to the base export).
 | Ground line with a System Name (also a lone feature), Hi / Lo / Set | RAS Mapper's system path. **Joining:** in feature-ID order an unassigned named feature starts a system; same-name features with equal elevation type and Elev Pt Tolerance whose end is within 60 ft of the system's first point are prepended, those whose start is within 60 ft of its last point appended (nearest first). Centerline = members' vertices concatenated. **Profile:** member profiles concatenated with stations offset by the running last station; each member's first point becomes a control cross section (template of that member; Max Reach <= 0 read as 2 x Top Width) entered before the stored stations, so at a junction the next feature's start elevation wins and the previous feature's end elevation is dropped; densification every 100 ft (30.48 m SI); a closing cross section at the system end. **Sections:** cross-section lines perpendicular to the chord half a reach up and down the centerline carry the trapezoid (Top Width = Max Reach narrowed by 0.01); a changing template with Transition Percent > 0 ends its section Top Width x Transition Percent early and that station enters the centre profile (NaN: nothing); toe and ridge stream lines grown from the centerline to the cross-section points in 4-16 lateral steps (resample, smooth cubic blend, Douglas-Peucker, crossing trims); template values interpolated by station for the toe z. Same ribbon TIN and rasterizer; drawn once at the highest member feature ID. | Writer cases W3, W3n, W4, M2: 0 modified px differ (were 1,505-1,507 and 159 px, max 1,032 and 77 ft, under the unnamed rule). Synthetic systems: 3 joined channels with a 20 ft gap, Transition Percent 0 / 0.5 and a lone NaN-transition channel: 1 of 7,118 at 1/32 ft; levee systems split by elevation type, Transition Percent 1, a profile starting at station 10, SetValue members: 0 of 2,494; SetValue channel system in scrambled feature order: 0 of 4,567. Real C: a 3-feature system and two lone named features in two layers, 0 differences | supported |
 | Ground line, Add | Terrain plus the template surface in binary32 on the unrounded terrain (the mosaic and export TIN now hold binary32 values; rounding to 1/32 happens once after every modification, as the TIFF writer does). | Synthetic Add levee (in G1): exact; real C: the Add levee layer, no difference | supported |
 | Named ground line with control points or a NaN template | System path with control points not traced. | — | refused |
-| Polygon, constant (Generate Boundary Elevations = 0) | Pixel centre inside (even-odd), constant `Elevation Value`; a stored profile is **ignored**. | B: 108 px and 722 px; C: 10,759 / 17,828 / 6,626 px; synthetic W1/M1 46,8xx px: all 0 diff | supported (Set/Hi/Lo) |
+| Polygon, constant (Generate Boundary Elevations = 0), one ring | Pixel centre inside (even-odd), constant `Elevation Value`; a stored profile is **ignored**. | B: 108 px and 722 px; C: 10,759 / 17,828 / 6,626 px; synthetic W1/M1 46,8xx px: all 0 diff | supported (Set/Hi/Lo) |
 | Polygon with a control point inside, or with boundary elevations (gen = 1) from perimeter control points or a stored profile, Set / Hi / Lo / Add | Perimeter TIN. Profile: with gen = 1, the layer's points within Elev Pt Tolerance of the perimeter (at their nearest perimeter station, first per station); without such points the stored perimeter profile; with gen = 0 the constant Elevation Value. Douglas-Peucker filter at 0.01 ft (binary32). Perimeter points: the ring with the profile's stations injected and z from the profile; points before the first or after the last station interpolate across the ring start. TIN: the export TIN's Delaunay factory at 0.1 ft (binary32 widened): extent of perimeter and mass points (at least 10 x tolerance, 1:8) widened to three times the perimeter's extent, perimeter points, then the points inside the polygon as mass points, perimeter enforced (an edge that fails stops the enforcement, as in RAS Mapper), triangles touching the super polygon deleted and the deletion flooded across non-perimeter edges. Rasterized per output tile, combined over the cells holding the polygon's extent. | Synthetic: interior points 0 of 2,500; stored profile 2 of 4,080 at 1/32 ft; three perimeter points 0 of 1,225; one perimeter point 0 of 2,500; Add 0 of 2,500; real C: 7 boundary-elevation polygons, no difference; real D: 202 boundary-elevation polygon layers with perimeter control points, 3 px at 1/32 ft | supported |
 | Polygon with boundary elevations sampled from the terrain (gen = 1, no stored profile, no perimeter control point) | RAS Mapper samples each source raster and the terrain HDF's stored level-0 stitch TIN along the perimeter, without modifications, filtered at 0.01; not reproduced. | — | refused |
-| Polygon with shape Z, multi-part polygon needing a TIN | Vertex z storage not measured (a third point column makes RAS Mapper skip the layer); holes need RAS Mapper's multi-part deletion. | — | refused |
-| Ellipse / circle, any rotation | Output-tile pixel centre: circle (equal radii) distance <= radius; ellipse `(c dx + s dy)^2/rx^2 + (s dx - c dy)^2/ry^2 <= 1`, c, s = cos, sin(-rotation in degrees). **Inclusive.** | A: 86 px, 0 diff; synthetic five ellipses (exact circle boundary, rotations 0, 30, -63.5, 90): 0 of 1,005 | supported |
+| Polygon with shape Z | Vertex z storage not measured (a third point column makes RAS Mapper skip the layer). | — | refused |
+| Multi-part polygon (an interior ring or several parts), any elevation form | RAS Mapper does not keep holes. It joins the feature's parts into one ring for its perimeter TIN. Holes and islands are filled in every winding and overlapping parts are joined. Disjoint parts and a leading hole ring leave triangulation artefacts (filled wedges, missing notches) that depend on part order and placement. See below. | Bald Eagle copy, 6.6 and 7.0.1: even-odd fill differed by 70-467 px per case | **refused** in `validate`, before any read or write; rare, such a terrain goes to RAS Mapper |
+| Ellipse / circle, any rotation | Output-tile pixel centre: circle (equal radii) distance <= radius; ellipse `(c dx + s dy)^2/rx^2 + (s dx - c dy)^2/ry^2 <= 1`, c, s = cos, sin(-rotation in degrees). **Inclusive.** A positive rotation turns the RadiusX axis **clockwise** in map view (y up). | A: 86 px, 0 diff; synthetic five ellipses (exact circle boundary, rotations 0, 30, -63.5, 90): 0 of 1,005; Bald Eagle copy, eight rotations, 6.6 and 7.0.1: 0 of 2,889 (see below) | supported |
 
 ## HEC-RAS 6.6 (`hecras_version: "6.6"`)
 
@@ -58,6 +59,63 @@ a boundary-elevation polygon with a stored profile (6.6 samples the terrain,
 engine follows 6.6 for the narrow skip (per output tile, Max Reach / cell <= 1)
 and refuses the two other forms. Under 6.6 every accepted synthetic case
 matches (2 of 8,935 and 1 of 2,499 px at 1/32 ft, the rest exact).
+
+## Multi-part polygons and ellipse rotation (HEC-RAS 6.6 and 7.0.1)
+
+This check follows the ras-commander notebook 321 writer round trip, where RAS
+Mapper filled a written polygon's interior ring and turned `rotation=30`
+clockwise. The cases are on a copy of Bald Eagle Creek (`Terrain50`, 20 ft),
+written with ras-commander's `RasTerrainModWriter`: eight constant SetValue
+polygon layers (outer 660 ft squares, holes 260 ft) and one SetValue ellipse
+layer (420 x 110 ft). References: `export_rasmapper_terrain` over a 6,000 ft
+square `extent` with `downsample_factor=1`, base and modified, each exported
+twice. The repeats are identical, so no pixel is excluded. The engine ran a
+schema 2 request built from `read_layers`, with the same `extent` (300 x 300
+px). The base matches exactly outside the cases. HEC-RAS 6.6 and 7.0.1 exports
+are identical pixel for pixel, base and modified.
+
+| Case (parts in stored order) | RAS Mapper (6.6 = 7.0.1) | Even-odd engine (main d129189), mask / value px, 6.6 and 7.0.1 | After |
+|---|---|---|---|
+| P1 outer CCW, hole CW | hole filled (1,089 px = the full outer square) | 0 / 169 | refused |
+| P2 outer CCW, hole CCW | hole filled | 0 / 169 | refused |
+| P3 outer CW, hole CCW | hole filled | 0 / 169 | refused |
+| P4 outer CW, hole CW | hole filled | 0 / 169 | refused |
+| P5 two disjoint squares | both squares, plus a filled wedge between them and a missing notch in the second | 0 / 70 | refused |
+| P6 two overlapping squares | union (overlap filled) | 0 / 220 | refused |
+| P7 hole ring first, then outer | outer filled except a 298 px triangular wedge below the hole | 0 / 467 | refused |
+| P8 outer, hole, island | everything filled | 0 / 336 | refused |
+
+The rule found: RAS Mapper treats all of a feature's points as **one ring** and
+draws that ring through its perimeter TIN. Flood deletion stops at every
+perimeter edge, so every enclosed region is kept. An engine variant that did
+the same (the engine's perimeter TIN on the joined ring) matched P1-P4, P6 and
+P8 with 0 differences in both versions. It did not match P5 (70 px) or P7 (298
+px, exactly RAS Mapper's unfilled wedge). Those artefacts come from RAS
+Mapper's constraint enforcement on the joined ring's bridge edges and repeated
+vertices, which was not reproduced. The engine therefore **refuses** any
+polygon with more than one ring, in `validate`, before any read or write and
+under both versions. It no longer draws holes that RAS Mapper does not draw.
+A polygon with a hole drawn natively in RAS Mapper was not tested. The refusal
+applies to the stored layout (more than one `Polygon Parts` entry for the
+feature), however the polygon was authored.
+
+This is a rare case. No terrain in the qualification corpora, the
+ras-commander writers or the engine fixtures is known to hold a multi-part
+modification polygon (ras-commander's writers emit one ring per feature).
+The project engineer decided on 2026-11-11 to refuse it rather than look
+further: a terrain holding one goes to RAS Mapper. ras-commander's
+`read_layers` refuses the form up front with a reason, so callers such as
+ras2cng route that terrain to the RAS Mapper export without asking the engine.
+
+| Ellipse rotation (degrees) | 0 | 30 | 90 | -30 | 45 | 150 | 120 | -63.5 |
+|---|---|---|---|---|---|---|---|---|
+| RAS Mapper modified px (6.6 = 7.0.1) | 359 | 362 | 363 | 359 | 361 | 359 | 361 | 365 |
+| Engine mask / value px, before and after (both versions) | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| Footprint mismatch if rotation were counter-clockwise | 0 | 453 | 0 | 453 | 487 | 453 | 453 | 444 |
+
+The engine's `sin(-rotation)` already turns the RadiusX axis clockwise in map
+view, as RAS Mapper does, so no change was needed. The unit test
+`positive_rotation_turns_the_ellipse_clockwise` now pins the direction.
 
 ## Real terrains (whole terrain vs export a, pixels where two exports differ excluded)
 

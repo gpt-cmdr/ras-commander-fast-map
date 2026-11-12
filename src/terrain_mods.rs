@@ -83,9 +83,9 @@
 //!     slopes interpolated linearly by station between cross sections.
 //!   - The system is drawn once, in the place of its highest feature ID,
 //!     with the five-ribbon TIN and rasterizer above.
-//! * **Polygons** with a constant elevation and no control point inside:
-//!   pixel centres inside (even-odd). Otherwise (boundary elevations, a
-//!   control point inside, single ring) RAS Mapper's perimeter TIN:
+//! * **Polygons** (one ring) with a constant elevation and no control point
+//!   inside: pixel centres inside (even-odd). Otherwise (boundary elevations,
+//!   a control point inside) RAS Mapper's perimeter TIN:
 //!   - *Perimeter profile.* With boundary elevations on, control points
 //!     within the Elev Pt Tolerance of the perimeter give the profile (at
 //!     their nearest perimeter station); without such points the stored
@@ -101,8 +101,13 @@
 //!     deleted; rasterized per output tile, combined over the cells holding
 //!     the polygon's extent.
 //! * **Ellipses**: output-tile pixel centres inside or on the ellipse (`<= 1`,
-//!   rotation in degrees); a circle (equal radii) uses the centre distance
-//!   `<= radius`.
+//!   rotation in degrees; a positive rotation turns the RadiusX axis
+//!   clockwise in map view, as in RAS Mapper's exports); a circle (equal
+//!   radii) uses the centre distance `<= radius`.
+//! * **Multi-part polygons** (an interior ring or several parts) are refused:
+//!   HEC-RAS 6.6 and 7.0.1 exports join a feature's parts into one ring for
+//!   the perimeter TIN, which fills holes and, depending on part order and
+//!   placement, leaves triangulation artefacts that are not reproduced.
 //!
 //! Combination (per feature, binary32, on the unrounded terrain): a nodata
 //! terrain pixel takes the modification value; `SetValue` replaces, `Add`
@@ -203,7 +208,8 @@ fn nan_if_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> 
 pub struct Polygon {
     pub elevation_type: ElevationType,
     pub elevation: f64,
-    /// Rings of `[x, y]`; inside is even-odd over all rings.
+    /// Rings of `[x, y]`. Exactly one ring is qualified; a polygon with an
+    /// interior ring or several parts is refused in [`validate`].
     pub rings: Vec<Vec<[f64; 2]>>,
     /// `Generate Boundary Elevations` (optional, default false).
     #[serde(default)]
@@ -308,13 +314,14 @@ pub fn method_record() -> Value {
                              "length_units": "feet (default) or meters: profile densification every 100 ft (single features 100/3.281 m, systems 30.48 m)"},
             "polygon": {"elevation_types": ["SetValue", "SetIfHigher", "SetIfLower", "Add"],
                         "constant": "no boundary elevations and no control point inside: constant fill",
-                        "tin": "boundary elevations from perimeter control points or a stored perimeter profile, interior control points as mass points; one ring"},
-            "ellipse": {"elevation_types": ["SetValue", "SetIfHigher", "SetIfLower"], "rotation": "degrees, any"}
+                        "tin": "boundary elevations from perimeter control points or a stored perimeter profile, interior control points as mass points",
+                        "requires": "one ring (no interior ring, one part)"},
+            "ellipse": {"elevation_types": ["SetValue", "SetIfHigher", "SetIfLower"], "rotation": "degrees, any; positive turns the RadiusX axis clockwise in map view"}
         },
         "ground_line_rule": "profile: binary32 stations shifted to start at 0, clamped to the length, first value per station, 100 ft (100/3.281 m) densification from a running start that only advances over segments longer than the spacing, length appended when the last station is > 0.01 short; binary32 linear query clamped at both ends. Offset lines: toes at Max Reach/2, ridges at Top Width/2, M = centerline station; joints meet at the offset-segment intersection (M averaged) or get the previous end, an arc split while chord-mid/r < 0.95, and the next start; square ends; self-intersections trimmed (farthest crossing later segment, M averaged); profile stations injected by M fraction. Centre and ridges z = profile(station); toes z = profile -/+ (Max Reach/2 - Top Width/2)/slope (binary32 half-widths, binary64 product), slope 0 read as 0.001; Max Reach <= Top Width folds the toes inside the ridges (those strips draw nothing). Ribbon TIN (left toe, left ridge, centre, right ridge, right toe; 0.01 dedupe; shorter diagonal, ties advance the right ribbon; fan at the end), rasterized per 256-pixel output tile with the export TIN rasterizer (inclusive, last triangle wins, clockwise triangles draw nothing). Top Width <= 0 or Max Reach <= 0: no change",
         "system_rule": "named features joined in feature-ID order (same name, elevation type and Elev Pt Tolerance; end-to-start within 60 ft; nearest first), centerline = members' vertices concatenated; profile = member profiles offset by the running last station, each member's first point a control cross section (Max Reach <= 0 read as 2 x Top Width) that enters the centre profile first (the next feature's start elevation wins at a junction); a closing cross section at the system end; per section, cross-section lines perpendicular to the chord half a reach up and down the centerline carry the trapezoid (Top Width = Max Reach narrowed by 0.01), a changing template with positive Transition Percent ends its section Top Width x Transition Percent early (NaN adds nothing); toe and ridge stream lines grown in 4-16 lateral steps (resample, smooth blend, Douglas-Peucker, crossing trims), M-fraction injection, template values interpolated by station; same ribbon TIN and rasterizer; drawn at the highest member feature ID",
         "polygon_rule": "constant: pixel centre inside (even-odd). TIN: perimeter profile from control points within Elev Pt Tolerance of the perimeter (boundary elevations on), else the stored profile (on), else the constant Elevation Value; Douglas-Peucker filtered at 0.01 ft (binary32); perimeter points with z from the profile (wrapping across the ring start); Delaunay factory of the export TIN at 0.1 ft (binary32 widened), extent of perimeter and mass points (10 x tolerance, 1:8) widened to 3 x the perimeter's, perimeter then interior control points inserted, perimeter enforced, triangles touching the super polygon deleted and the deletion flooded across non-perimeter edges; rasterized per output tile over the cells holding the polygon's extent",
-        "ellipse_rule": "per output-tile pixel centre: circle (equal radii) distance <= radius; otherwise (c dx + s dy)^2/rx^2 + (s dx - c dy)^2/ry^2 <= 1 with c, s = cos, sin(-rotation degrees)",
+        "ellipse_rule": "per output-tile pixel centre: circle (equal radii) distance <= radius; otherwise (c dx + s dy)^2/rx^2 + (s dx - c dy)^2/ry^2 <= 1 with c, s = cos, sin(-rotation degrees), so a positive rotation turns the RadiusX axis clockwise in map view (y up), as in HEC-RAS 6.6 and 7.0.1 exports",
         "combine": "binary32 on the unrounded terrain (the mosaic and export TIN hold binary32 values; 1/32 rounding once after all modifications): a nodata terrain pixel takes the modification value; SetValue replaces; Add adds; SetIfHigher/SetIfLower replace when strictly higher/lower; layers stable-sorted by ascending Priority and applied in reverse (Priority 0 last, so it wins), features in stored order",
         "rounding": "binary32 throughout, then nearest 1/32 (ties to even) once at the end",
         "hecras_version": "7.0.1 (default) or 6.6. 6.6 (measured on HEC-RAS 6.6 exports of the synthetic cases): ground lines with Max Reach not wider than one output-tile cell are not drawn; named ground lines and boundary elevations without perimeter control points are refused (6.6 builds systems differently and samples the terrain); all else as 7.0.1",
@@ -324,10 +331,11 @@ pub fn method_record() -> Value {
             "real terrain C, previous round (2 ft, 379.0M px in the source extent; HDF copy reduced to its 10 then-accepted layers, including systems of 3, 2 and lone named channels and a SetValue channel layer; two base and two modified exports, which agree)": "0 mask and 4 value differences, all at 1/32 ft; per layer 0 except 1 pixel at 1/32 ft in the SetValue channel layer",
             "synthetic T2 terrain, 20 ft (one export each)": "named writer cases (22.5 km channel, 21.2 km levee, channel + polygon + levee): 0 modified pixels differ (2 edge pixels differ in the base export); three joined channels with differing templates and profiles, a 20 ft junction gap and Transition Percent 0 / 0.5, a lone channel with NaN Transition Percent and an unnamed channel: 1 of 7,118 pixels at 1/32 ft; levee systems split by elevation type (Transition Percent 1, a profile starting at station 10, SetValue members): 0 of 2,494; a SetValue channel system in scrambled feature order: 0 of 4,567; blank-name cases (sharp bends, short segments, SetValue, Max Reach <= Top Width, ellipses) as before",
             "control points, boundary elevations, Add, NaN templates": "real terrain C, all 13 layers (2 ft, 379.0M px): 0 mask, 4 values at 1/32 ft; real terrain E without its terrain-sampled polygon layer (3 ft, 1.14G px; a 14-feature levee layer with 2,862 control points): 0 mask, 3 values at 1/32 ft; real terrain D without its terrain-sampled polygon layer (228 layers, 924.6M px; 202 boundary-elevation polygon layers with perimeter control points, 20 channel layers with control points): 0 mask, 3 values at 1/32 ft; synthetic polygons (interior points, stored profile, perimeter points, one point, Add): 2 of 12,805 px at 1/32 ft; synthetic ground lines with control points and Add: 1 of 2,499 px at 1/32 ft; NaN and negative templates: exact",
-            "hecras_version 6.6": "HEC-RAS 6.6 exports of the synthetic cases: narrow ground lines 474 of 474 px, bends, short segments, SetValue, narrow templates, ellipses, control points, NaN templates, constant polygons: at most 2 px at 1/32 ft per case"
+            "hecras_version 6.6": "HEC-RAS 6.6 exports of the synthetic cases: narrow ground lines 474 of 474 px, bends, short segments, SetValue, narrow templates, ellipses, control points, NaN templates, constant polygons: at most 2 px at 1/32 ft per case",
+            "ellipse rotation and multi-part polygons (Bald Eagle Creek copy, 20 ft, 300 x 300 px extent exports, HEC-RAS 6.6 and 7.0.1, two repeats agree)": "ellipses 420 x 110 ft at rotations 0, 30, 90, -30, 45, 150, 120, -63.5: 0 mask and 0 value differences in both versions (a counter-clockwise reading would differ by 444-487 px at every rotation but 0 and 90). Multi-part constant polygons (holes in all four windings, disjoint parts, overlapping parts, hole ring first, hole with an island): even-odd fill differed by 70-467 px per case; the exports fill holes and islands, join overlaps and draw triangulation artefacts for disjoint parts and a leading hole ring, identically in 6.6 and 7.0.1; refused"
         },
         "known_differences": "RasMapperLib's binary64 powers (.NET Framework Math.Pow, e.g. distances as Pow(x, 0.5)) are not correctly rounded; this engine uses correctly rounded square roots and products. On terrain C's 3-feature system this moves 4 stream-line points by up to 6e-5 ft; no pixel changed in the measured cases",
-        "refused": "boundary elevations sampled from the terrain (no stored profile and no perimeter control point: RAS Mapper samples each source raster and the stored stitch TIN), shape-Z polygons (vertex z storage not measured), multi-part polygons needing a TIN, named ground lines with a NaN template or in a layer with control points, a NaN Top Width with a finite Max Reach, multi-part features, any other modification type (the caller also refuses duplicate priorities)"
+        "refused": "boundary elevations sampled from the terrain (no stored profile and no perimeter control point: RAS Mapper samples each source raster and the stored stitch TIN), shape-Z polygons (vertex z storage not measured), multi-part polygons (an interior ring or several parts: RAS Mapper joins the parts into one perimeter-TIN ring, filling holes, with triangulation artefacts that depend on part order and placement), named ground lines with a NaN template or in a layer with control points, a NaN Top Width with a finite Max Reach, multi-part features, any other modification type (the caller also refuses duplicate priorities)"
     })
 }
 
@@ -408,6 +416,16 @@ pub fn validate(layers: &[Layer]) -> Result<(), MapError> {
                             .any(|r| r.len() < 3 || r.iter().flatten().any(|v| !finite(*v)))
                     {
                         return Err(invalid(format!("polygon layer {name:?}: invalid polygon")));
+                    }
+                    if f.rings.len() > 1 {
+                        // HEC-RAS 6.6 and 7.0.1 exports join a feature's parts
+                        // into one perimeter-TIN ring: holes are filled and,
+                        // depending on part order and placement, triangulation
+                        // artefacts appear that are not reproduced. Refused
+                        // here, before any read or write.
+                        return Err(MapError::Unsupported(format!(
+                            "polygon layer {name:?}: multi-part polygons (an interior ring or several parts) are not qualified; RAS Mapper fills holes"
+                        )));
                     }
                     if f.use_shape_z && !f.generate_boundary {
                         // Elevations from the polygon's own vertex Z: how RAS
@@ -2352,7 +2370,7 @@ fn polygon_needs_tin(f: &Polygon, cps: &[ControlPoint]) -> bool {
             .any(|c| !c.elevation.is_nan() && point_in_rings(&f.rings, c.x, c.y))
 }
 
-/// The perimeter TIN of a polygon (single ring).
+/// The perimeter TIN of a polygon (single ring; [`validate`] refuses more).
 fn polygon_tin(
     f: &Polygon,
     cps: &[ControlPoint],
@@ -2847,6 +2865,51 @@ mod tests {
     }
 
     #[test]
+    fn multi_part_polygons_are_refused_before_any_write() {
+        // HEC-RAS 6.6 and 7.0.1 exports fill holes (any winding) and draw
+        // triangulation artefacts for other multi-part layouts: refused.
+        let sq = |c: f64, h: f64| {
+            vec![
+                [c - h, c - h],
+                [c + h, c - h],
+                [c + h, c + h],
+                [c - h, c + h],
+            ]
+        };
+        let rev = |mut r: Vec<[f64; 2]>| {
+            r.reverse();
+            r
+        };
+        let ok = poly(sq(10.0, 5.0), ElevationType::SetValue, 7.0);
+        let layouts = [
+            vec![sq(50.0, 30.0), rev(sq(50.0, 10.0))],
+            vec![sq(50.0, 30.0), sq(50.0, 10.0)],
+            vec![rev(sq(50.0, 30.0)), sq(50.0, 10.0)],
+            vec![rev(sq(50.0, 30.0)), rev(sq(50.0, 10.0))],
+            vec![rev(sq(50.0, 10.0)), sq(50.0, 30.0)],
+            vec![sq(30.0, 5.0), sq(70.0, 5.0)],
+        ];
+        for rings in layouts {
+            let mut f = poly(Vec::new(), ElevationType::SetValue, 10.0);
+            f.rings = rings;
+            let layers = [poly_layer(vec![ok.clone(), f], Vec::new())];
+            assert!(matches!(validate(&layers), Err(MapError::Unsupported(_))));
+            for version in [RasVersion::V7_0_1, RasVersion::V6_6] {
+                let mut v = vec![0.0_f32; 100 * 100];
+                let err = apply_version(&layers, &grid(), &mut v, version).unwrap_err();
+                assert!(matches!(err, MapError::Unsupported(_)), "{err:?}");
+                assert!(
+                    v.iter().all(|z| *z == 0.0),
+                    "nothing written before refusing"
+                );
+            }
+        }
+        // One ring is accepted.
+        let layers = [poly_layer(vec![ok], Vec::new())];
+        assert!(validate(&layers).is_ok());
+    }
+
+    #[test]
     fn straight_levee_matches_closed_form() {
         let f = levee(
             vec![[10.0, 50.0], [90.0, 50.0]],
@@ -3012,6 +3075,25 @@ mod tests {
         apply(&[ellipse(3.0, 1.0, 90.0)], &g, &mut v).unwrap();
         assert_eq!(at(&v, 50.5, 53.5), 5.0);
         assert_eq!(at(&v, 52.5, 50.5), 1.0);
+    }
+
+    #[test]
+    fn positive_rotation_turns_the_ellipse_clockwise() {
+        // HEC-RAS 6.6 and 7.0.1 exports turn the RadiusX axis clockwise in
+        // map view (y up) for a positive rotation.
+        let g = grid();
+        let at = |v: &[f32], x: f64, y: f64| v[((100.0 - y) as usize) * 100 + x as usize];
+        for (rotation, inside, outside) in [
+            (45.0, (53.5, 47.5), (53.5, 53.5)),
+            (-45.0, (53.5, 53.5), (53.5, 47.5)),
+            (30.0, (55.5, 47.5), (55.5, 53.5)),
+            (-30.0, (55.5, 53.5), (55.5, 47.5)),
+        ] {
+            let mut v = vec![1.0_f32; 100 * 100];
+            apply(&[ellipse(6.0, 1.0, rotation)], &g, &mut v).unwrap();
+            assert_eq!(at(&v, inside.0, inside.1), 5.0, "rotation {rotation}");
+            assert_eq!(at(&v, outside.0, outside.1), 1.0, "rotation {rotation}");
+        }
     }
 
     #[test]

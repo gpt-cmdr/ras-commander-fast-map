@@ -456,6 +456,27 @@ fn modifications_follow_priority_and_round() {
 }
 
 #[test]
+fn multi_part_polygon_is_refused_before_reads() {
+    // The source does not exist: the refusal must come before any read.
+    let dir = scratch();
+    let srcs = json!([{"path": "missing.tif", "mask": mask("m.u1", 10, 10)}]);
+    let outer = json!([[0.0, 0.0], [60.0, 0.0], [60.0, 60.0], [0.0, 60.0]]);
+    let hole = json!([[20.0, 20.0], [20.0, 40.0], [40.0, 40.0], [40.0, 20.0]]);
+    for version in ["7.0.1", "6.6"] {
+        let req = request(
+            srcs.clone(),
+            json!({"schema": "ras-commander-effective-terrain-request/2", "modifications": 1,
+                   "hecras_version": version, "modification_layers": [
+                {"kind": "polygon", "name": "pad", "priority": 0,
+                 "features": [{"elevation_type": "SetValue", "elevation": 1.0, "rings": [outer, hole]}]}]}),
+        );
+        let err = effective_terrain::compute(&req, &dir).err().unwrap();
+        assert_eq!(err.kind(), "unsupported", "{err:?}");
+        assert!(format!("{err:?}").contains("multi-part"), "{err:?}");
+    }
+}
+
+#[test]
 fn modification_count_must_match_and_v1_refuses_layers() {
     let dir = scratch();
     let srcs = json!([{"path": "missing.tif", "mask": mask("m.u1", 10, 10)}]);
