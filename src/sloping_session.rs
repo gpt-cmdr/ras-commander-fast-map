@@ -22,7 +22,18 @@ use std::{
 
 type PinnedHydraulics = Mutex<Option<(String, Arc<Vec<sloping::PreparedProfile>>)>>;
 
-type CachedGeometry = (Vec<Mesh>, Vec<Vec<Option<sloping::CellStencil>>>);
+/// Complete geometry, or the compact stencil closure of a staged cell subset.
+type CachedGeometry = (
+    Vec<Mesh>,
+    Vec<Vec<Option<sloping::CellStencil>>>,
+    Option<StagedGeometry>,
+);
+struct StagedGeometry {
+    /// Per mesh: staged global cell ids; compact cell i is staged[i].
+    cells: Vec<Vec<u32>>,
+    equivalent_bytes: u64,
+    record: Value,
+}
 type WindowKey = (
     String,
     String,
@@ -49,6 +60,9 @@ pub struct PreparedSession {
     geometry_preparations: u64,
     terrain: Option<(String, Arc<NativeTerrain>)>,
     geometry: Option<(String, Arc<CachedGeometry>)>,
+    /// Admitted resident allowance of `geometry`, kept beside a staged load
+    /// until the new geometry is admitted.
+    geometry_resident: u64,
     windows: Retained<WindowKey, WindowData>,
     hydraulics: Mutex<Retained<String, Vec<sloping::PreparedProfile>>>,
     pool: Option<(usize, Arc<rayon::ThreadPool>)>,
@@ -57,6 +71,15 @@ pub struct PreparedSession {
 impl PreparedSession {
     pub(crate) fn preparation_counts(&self) -> (u64, u64) {
         (self.terrain_preparations, self.geometry_preparations)
+    }
+
+    /// Drop geometry a caller prepared for a request it then refused.
+    pub(crate) fn release_geometry(&mut self) {
+        self.geometry = None;
+        self.geometry_resident = 0;
+        *self.pinned_hydraulics.lock().unwrap() = None;
+        self.hydraulics.lock().unwrap().clear();
+        self.windows.clear();
     }
 
     pub(crate) fn install<R: Send>(
@@ -104,6 +127,31 @@ pub(crate) fn geometry_key(req: &Request, base: &Path) -> Result<String, MapErro
             }
         }
     }
+    // A staged subset is a different compact geometry, even over the same mesh,
+    // and its stencils exist only for the owner cells it was loaded for.
+    if let Some(files) = &req.staged_cells_files {
+        for filename in files {
+            key.push_str("|staged:");
+            key.push_str(&identity(&model::resolve(base, filename))?);
+        }
+        let mut owners = req.owner_cells.clone();
+        owners.sort_unstable();
+        owners.dedup();
+        let encoded: Vec<u8> = owners
+            .iter()
+            .flat_map(|&[m, c]| {
+                (m as u64)
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain((c as u64).to_le_bytes())
+            })
+            .collect();
+        key.push_str(&format!(
+            "|owners:{}:{:016x}",
+            owners.len(),
+            crate::sink::fnv1a64(&encoded)
+        ));
+    }
     Ok(key)
 }
 
@@ -131,6 +179,17 @@ pub struct Request {
     pub export_physical_ownership: bool,
     pub mesh_files: Vec<String>,
     pub owner_cells: Vec<[usize; 2]>,
+    /// Per mesh: a `<u4` file of strictly ascending global cell ids
+    /// (`ras-commander-staged-cells/1`). With it every profile values file
+    /// holds exactly those cells' WSE in that order, and geometry is the
+    /// compact stencil closure of `owner_cells` (which stay global). Absent,
+    /// the complete mesh is loaded and staged as before.
+    #[serde(default)]
+    pub staged_cells_files: Option<Vec<String>>,
+    /// Internal: budget for a staged load when `max_working_bytes` is only a
+    /// planning probe (grouped admission). Never deserialized.
+    #[serde(skip)]
+    pub(crate) load_budget: Option<u64>,
     pub profiles: Vec<Profile>,
     pub threads: usize,
     #[serde(default = "one_profile")]
@@ -282,9 +341,12 @@ fn render(
     if !hydraulic_reused {
         for ((mesh, stencil), filename) in meshes.iter().zip(stencils).zip(&profile.values_files) {
             let wse = values(&model::resolve(base, filename), mesh.cells.len())?;
-            new_prepared.push(sloping::prepare_profile_with_options(
-                mesh, stencil, &wse, 0.001, pool, options,
-            )?);
+            // Only a staged mesh without owner cells has no faces; nothing reads it.
+            new_prepared.push(if mesh.faces.is_empty() {
+                sloping::PreparedProfile::unread(options)
+            } else {
+                sloping::prepare_profile_with_options(mesh, stencil, &wse, 0.001, pool, options)?
+            });
             if needs_cells {
                 cell_values.push(wse);
             }
@@ -619,18 +681,15 @@ impl Geometry {
         let mut stencils = sloping::prepare_stencils(&mesh, &cell_faces)?;
         for (cell, stencil) in stencils.iter_mut().enumerate() {
             if let Some(stencil) = stencil {
-                stencil.square_center = Some(self.cells[cell].point);
-                for &face in &self.cells[cell].faces {
-                    let f = &self.faces[face];
-                    if f.cells[0] == cell {
-                        stencil.physical_ring.extend(f.polyline.iter().copied());
-                    } else {
-                        stencil
-                            .physical_ring
-                            .extend(f.polyline.iter().rev().copied());
-                    }
-                }
-                stencil.physical_ring.dedup();
+                sloping::set_physical_ring(
+                    stencil,
+                    cell,
+                    self.cells[cell].point,
+                    self.cells[cell].faces.iter().map(|&face| {
+                        let f = &self.faces[face];
+                        (f.cells, f.polyline.as_slice())
+                    }),
+                );
             }
         }
         if let Some(elevations) = &self.vertex_elevations {
@@ -640,8 +699,108 @@ impl Geometry {
     }
 }
 
+/// Validate and load (or reuse) the compact geometry of a staged cell subset
+/// before the array plan, which sizes geometry from the compact rows. Every
+/// load allocation is charged before it is made against the load budget less
+/// what the session keeps resident meanwhile (`resident`). Nothing is stored
+/// in the session here: the caller installs the geometry only once the plan is
+/// admitted. Returns the geometry and whether this call prepared it.
+fn staged_geometry(
+    req: &Request,
+    files: &[String],
+    base: &Path,
+    session: Option<&PreparedSession>,
+    key: &str,
+    resident: u64,
+) -> Result<(Arc<CachedGeometry>, bool), MapError> {
+    if files.len() != req.mesh_files.len() {
+        return Err(MapError::Invalid(
+            "staged_cells_files needs one file per mesh".into(),
+        ));
+    }
+    if req.velocity_normals_files.is_some()
+        || req.shear_stress.is_some()
+        || req.storage_areas_file.is_some()
+        || req.storage_area_count != 0
+        || req.terrain_scope.is_some()
+        || req.export_physical_ownership
+        || req.grid_contract.is_some()
+        || req.reduce_max
+        || !req.derived_products.is_empty()
+    {
+        return Err(MapError::Unsupported(
+            "staged_cells is qualified for sloping depth/WSE without velocity, shear, storage areas, terrain scope, stored grid or ownership export".into(),
+        ));
+    }
+    if let Some(s) = session
+        && let Some((old, geometry)) = &s.geometry
+        && old == key
+    {
+        return Ok((geometry.clone(), false));
+    }
+    let allowed = req.load_budget.unwrap_or(req.max_working_bytes);
+    let limit = allowed.checked_sub(resident).ok_or_else(|| {
+        MapError::Budget(format!(
+            "staged geometry load: resident caches need {resident} bytes, allowed {allowed} bytes"
+        ))
+    })?;
+    let budget = crate::sloping_binary::LoadBudget::new(limit);
+    let mut owners = vec![Vec::new(); req.mesh_files.len()];
+    for &[mesh, cell] in &req.owner_cells {
+        owners
+            .get_mut(mesh)
+            .ok_or_else(|| {
+                MapError::Invalid("sloping ownership requires physical mesh cells".into())
+            })?
+            .push(cell);
+    }
+    let mut meshes = Vec::new();
+    let mut stencils = Vec::new();
+    let mut cells = Vec::new();
+    let mut records = Vec::new();
+    let mut equivalent_bytes = 0_u64;
+    for ((mesh, staged), mut owned) in req.mesh_files.iter().zip(files).zip(owners) {
+        owned.sort_unstable();
+        owned.dedup();
+        let staged = crate::sloping_binary::read_staged(&model::resolve(base, staged), &budget)?;
+        let compact = crate::sloping_binary::load_compact(
+            &model::resolve(base, mesh),
+            staged,
+            &owned,
+            &budget,
+        )?;
+        records.push(
+            json!({"staged_cells":compact.staged.len(),"owner_cells":owned.len(),
+            "faces":compact.mesh.faces.len(),"corners":compact.mesh.corners.len(),
+            "parent_cells":compact.parent[0],"parent_faces":compact.parent[1],
+            "parent_corners":compact.parent[2],"equivalent_bytes":compact.equivalent_bytes}),
+        );
+        equivalent_bytes = equivalent_bytes
+            .checked_add(compact.equivalent_bytes)
+            .ok_or_else(|| MapError::Budget("staged geometry size overflow".into()))?;
+        meshes.push(compact.mesh);
+        stencils.push(compact.stencils);
+        cells.push(compact.staged);
+    }
+    let record = json!({"method":crate::sloping_binary::STAGED_METHOD,
+        "load_budget_bytes":limit,"load_peak_charged_bytes":budget.peak(),
+        "resident_charged_bytes":budget.used(),"meshes":records});
+    Ok((
+        Arc::new((
+            meshes,
+            stencils,
+            Some(StagedGeometry {
+                cells,
+                equivalent_bytes,
+                record,
+            }),
+        )),
+        true,
+    ))
+}
+
 pub fn method_record() -> Value {
-    json!({"method_id":"rasmapper-plain-sloping/1", "backend":"rust", "experimental":true,
+    let mut record = json!({"method_id":"rasmapper-plain-sloping/1", "backend":"rust", "experimental":true,
         "native_version_qualified":"7.0.1", "stream_outputs":true, "export_physical_ownership":true, "native_ownership":true,"aoi_mask":crate::aoi::METHOD,
         "enhanced_options":true,"enhanced_method_id":"rasmapper-sloping-with-faces/1",
         "depth_weighted_faces":true,
@@ -676,7 +835,9 @@ pub fn method_record() -> Value {
             "UseDepthWeightedFaces":false,"FaceWSMode":"Adjusted"},
         "native_plot_tolerance":0.001_f32,"extra_depth_cutoff":null,
         "scope":"2D cells; plain cell-corner sloping; optional storage-area level pools; no 1D, slopingPretty or additional rendering options",
-        "reuse":"geometry, terrio ownership and terrain prepared once; bounded Rayon pixel and reconstruction workers"})
+        "reuse":"geometry, terrio ownership and terrain prepared once; bounded Rayon pixel and reconstruction workers"});
+    record["staged_cells"] = crate::sloping_binary::STAGED_METHOD.into();
+    record
 }
 
 pub fn native_grid_method_record() -> Value {
@@ -1009,18 +1170,7 @@ fn run_internal(
             sum.checked_add(fs::metadata(model::resolve(base, p))?.len())
                 .ok_or_else(|| MapError::Budget("sloping geometry size overflow".into()))
         })?;
-    let binary_bytes = req.mesh_files.iter().try_fold(0_u64, |sum, name| {
-        sum.checked_add(crate::sloping_binary::input_bytes(&model::resolve(
-            base, name,
-        ))?)
-        .ok_or_else(|| MapError::Budget("sloping binary geometry size overflow".into()))
-    })?;
-    let geometry_bytes = geometry_bytes
-        .checked_add(binary_bytes)
-        .ok_or_else(|| MapError::Budget("sloping geometry size overflow".into()))?;
     let cache = 64_u64 << 20;
-    // JSON parsing, topology, stencils, one hydraulic profile and IO copies are
-    // conservatively admitted, rather than claiming an OS-enforced RSS limit.
     let persistent_bytes = if session.is_some() {
         req.window_cache_bytes
     } else {
@@ -1031,6 +1181,52 @@ fn run_internal(
     } else {
         0
     };
+    let staged = match &req.staged_cells_files {
+        Some(files) => {
+            if files.len() != req.mesh_files.len() {
+                return Err(MapError::Invalid(
+                    "staged_cells_files needs one file per mesh".into(),
+                ));
+            }
+            let key = geometry_key(req, base)?;
+            // Resident while it loads: the terrain block cache, the retained
+            // window/hydraulic budgets and any current geometry it may replace.
+            let old = session
+                .as_ref()
+                .filter(|s| s.geometry.as_ref().is_some_and(|(k, _)| k != &key))
+                .map_or(0, |s| s.geometry_resident);
+            let resident = cache
+                .checked_add(persistent_bytes)
+                .and_then(|v| v.checked_add(hydraulic_bytes))
+                .and_then(|v| v.checked_add(old))
+                .ok_or_else(|| MapError::Budget("staged geometry plan overflow".into()))?;
+            Some(staged_geometry(
+                req,
+                files,
+                base,
+                session.as_deref(),
+                &key,
+                resident,
+            )?)
+        }
+        None => None,
+    };
+    let binary_bytes = match &staged {
+        // The compact rows' binary size takes the complete mesh's place in the
+        // same conservative geometry allowance.
+        Some((geometry, _)) => geometry.2.as_ref().unwrap().equivalent_bytes,
+        None => req.mesh_files.iter().try_fold(0_u64, |sum, name| {
+            sum.checked_add(crate::sloping_binary::input_bytes(&model::resolve(
+                base, name,
+            ))?)
+            .ok_or_else(|| MapError::Budget("sloping binary geometry size overflow".into()))
+        })?,
+    };
+    let geometry_bytes = geometry_bytes
+        .checked_add(binary_bytes)
+        .ok_or_else(|| MapError::Budget("sloping geometry size overflow".into()))?;
+    // JSON parsing, topology, stencils, one hydraulic profile and IO copies are
+    // conservatively admitted, rather than claiming an OS-enforced RSS limit.
     if let Some(s) = session.as_mut() {
         s.windows.resize(persistent_bytes);
         s.hydraulics.lock().unwrap().resize(hydraulic_bytes);
@@ -1313,6 +1509,15 @@ fn run_internal(
         admitted,
         additional,
     )?;
+    // A staged geometry prepared for this request joins the session only now
+    // that the request is admitted; a refusal above leaves the session as it was.
+    if let Some((geometry, true)) = &staged
+        && let Some(s) = session.as_mut()
+    {
+        s.geometry = Some((key.clone(), geometry.clone()));
+        s.geometry_resident = geometry_bytes.saturating_mul(16);
+        s.geometry_preparations += 1;
+    }
     if plan_only {
         return Ok(json!({"planned_bytes":admitted}));
     }
@@ -1335,18 +1540,28 @@ fn run_internal(
     let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || -> Result<(), MapError> {
             let tick = Instant::now();
-            let geometry_reused = session
-                .as_ref()
-                .is_some_and(|s| s.geometry.as_ref().is_some_and(|(old, _)| old == &key));
-            if !geometry_reused && let Some(s) = session.as_mut() {
+            let staged_loaded = staged.as_ref().is_some_and(|(_, loaded)| *loaded);
+            let geometry_reused = !staged_loaded
+                && session
+                    .as_ref()
+                    .is_some_and(|s| s.geometry.as_ref().is_some_and(|(old, _)| old == &key));
+            if !geometry_reused
+                && !staged_loaded
+                && let Some(s) = session.as_mut()
+            {
                 s.geometry = None;
                 s.hydraulics.lock().unwrap().clear();
                 s.windows.clear();
             }
-            if !geometry_reused && let Some(s) = session.as_mut() {
+            if !geometry_reused
+                && !staged_loaded
+                && let Some(s) = session.as_mut()
+            {
                 s.geometry_preparations += 1;
             }
-            let geometry = if geometry_reused {
+            let geometry = if let Some((geometry, _)) = &staged {
+                geometry.clone()
+            } else if geometry_reused {
                 session
                     .as_ref()
                     .unwrap()
@@ -1364,12 +1579,40 @@ fn run_internal(
                     meshes.push(mesh);
                     stencils.push(stencil);
                 }
-                Arc::new((meshes, stencils))
+                Arc::new((meshes, stencils, None))
             };
             if let Some(s) = session.as_mut() {
                 s.geometry = Some((key.clone(), geometry.clone()));
+                s.geometry_resident = geometry_bytes.saturating_mul(16);
             }
-            let (meshes, stencils) = &*geometry;
+            let (meshes, stencils, staged_cells) = &*geometry;
+            // Pixel ownership labels stay global; stencils/profiles are compact.
+            let owner_cells: Vec<[usize; 2]> = match staged_cells {
+                Some(subset) => req
+                    .owner_cells
+                    .iter()
+                    .map(|&[mesh, cell]| {
+                        subset
+                            .cells
+                            .get(mesh)
+                            .and_then(|cells| {
+                                u32::try_from(cell)
+                                    .ok()
+                                    .and_then(|c| cells.binary_search(&c).ok())
+                            })
+                            .map(|local| [mesh, local])
+                            .ok_or_else(|| {
+                                MapError::Invalid(
+                                    "staged cells must include every owner cell".into(),
+                                )
+                            })
+                    })
+                    .collect::<Result<_, _>>()?,
+                None => req.owner_cells.clone(),
+            };
+            if let Some(subset) = staged_cells {
+                report["staged_cells"] = subset.record.clone();
+            }
             let velocity_normals = req
                 .velocity_normals_files
                 .as_ref()
@@ -1457,7 +1700,7 @@ fn run_internal(
                 Vec::new()
             };
             report["session"] = json!({"terrain_reused":terrain_reused,"geometry_reused":geometry_reused,"retained_window_budget_bytes":persistent_bytes});
-            for &[mesh, cell] in &req.owner_cells {
+            for &[mesh, cell] in &owner_cells {
                 if mesh >= meshes.len()
                     || cell >= meshes[mesh].cells.len()
                     || meshes[mesh].cells[cell].virtual_cell
@@ -1523,8 +1766,7 @@ fn run_internal(
                 )?;
                 let mut owner = pool.install(|| {
                     if let Some(layout) = native_grid {
-                        let squares: Vec<_> = req
-                            .owner_cells
+                        let squares: Vec<_> = owner_cells
                             .iter()
                             .map(|&[mesh, cell]| {
                                 stencils[mesh][cell].as_ref().and_then(|s| s.square)
@@ -1671,7 +1913,7 @@ fn run_internal(
                     transform,
                     owner: &data.owner,
                     terrain: &data.ground,
-                    owner_cells: &req.owner_cells,
+                    owner_cells: &owner_cells,
                 };
                 let weights = sloping::PixelWeights::prepare(
                     stencils,
@@ -1699,7 +1941,7 @@ fn run_internal(
                 transform,
                 owner: &data.owner,
                 terrain: &data.ground,
-                owner_cells: &req.owner_cells,
+                owner_cells: &owner_cells,
             };
             let storage = req
                 .storage_areas_file
@@ -2225,9 +2467,12 @@ fn render_native_rows(
     let mut prepared = Vec::new();
     for ((mesh, stencil), filename) in meshes.iter().zip(stencils).zip(&profile.values_files) {
         let values = values(&model::resolve(base, filename), mesh.cells.len())?;
-        prepared.push(sloping::prepare_profile_with_options(
-            mesh, stencil, &values, 0.001, pool, options,
-        )?);
+        // Only a staged mesh without owner cells has no faces; nothing reads it.
+        prepared.push(if mesh.faces.is_empty() {
+            sloping::PreparedProfile::unread(options)
+        } else {
+            sloping::prepare_profile_with_options(mesh, stencil, &values, 0.001, pool, options)?
+        });
     }
     crate::terrain_scope::deny_wet_foreign(foreign, window.owner, window.owner_cells, |m, c| {
         prepared[m].is_wet(c)

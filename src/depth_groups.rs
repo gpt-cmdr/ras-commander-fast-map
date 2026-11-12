@@ -98,6 +98,7 @@ pub fn method_record() -> Value {
         "products":["depth_max"],"render_modes":["sloping"],"saved_timesteps_only":true,
         "aoi_mask":crate::aoi::METHOD,"local_spill":true,"max_inflight_profiles":1,
         "buffer_protocol":"ras-commander-depth-group-buffer/1",
+        "staged_cells":crate::sloping_binary::STAGED_METHOD,
         "hydraulic_qualification":"native-per-time-depth-reduction/prepared-2d-component/1",
         "qualification_scope":"3 saved private mixed-fixture profiles, physical 2D component, inclusive 0.5 ft cutoff, full/cropped windows, ordered/reverse/single groups, resident NONE and local-spill LZW; not native Max-WSE rendering"})
 }
@@ -455,27 +456,41 @@ pub fn run_with_session(
     }
     let mut model = req.model.clone();
     model.max_working_bytes -= reserved;
+    // Planning loads a staged compact geometry: its load is charged against
+    // the budget left after the group reserve, not the unlimited planning probe.
+    model.load_budget = Some(model.max_working_bytes);
+    let prepared_before = session.preparation_counts().1;
     let mut peak_mapping = 0;
     // All windows are admitted before terrain payload reads or accumulator allocation.
     // Header/descriptors are inspected by the existing sloping planner.
     model.profiles.truncate(1);
-    for job in &req.jobs {
-        model.window = job.window;
-        model.aoi_file = job.aoi_file.clone();
-        let available = model.max_working_bytes;
-        model.max_working_bytes = u64::MAX;
-        let plan = sloping_session::plan_with_session(&model, base, session)?;
-        model.max_working_bytes = available;
-        let total = add(reserved, plan)?;
-        if total > req.model.max_working_bytes {
-            return Err(budget(
-                "mapping plus group plan",
-                total,
-                req.model.max_working_bytes,
-            ));
+    let planned = (|| -> Result<u64, MapError> {
+        let mut peak = 0;
+        for job in &req.jobs {
+            model.window = job.window;
+            model.aoi_file = job.aoi_file.clone();
+            let available = model.max_working_bytes;
+            model.max_working_bytes = u64::MAX;
+            let plan = sloping_session::plan_with_session(&model, base, session);
+            model.max_working_bytes = available;
+            let plan = plan?;
+            let total = add(reserved, plan)?;
+            if total > req.model.max_working_bytes {
+                return Err(budget(
+                    "mapping plus group plan",
+                    total,
+                    req.model.max_working_bytes,
+                ));
+            }
+            peak = peak.max(plan);
         }
-        peak_mapping = peak_mapping.max(plan);
+        Ok(peak)
+    })();
+    // A refused request does not keep geometry it prepared while planning.
+    if planned.is_err() && session.preparation_counts().1 != prepared_before {
+        session.release_geometry();
     }
+    peak_mapping = peak_mapping.max(planned?);
     let scratch = if spilled > 0 {
         Some(scratch_dir(req.scratch.as_ref().unwrap(), base)?)
     } else {
@@ -625,6 +640,11 @@ pub fn run_with_session(
                     };
                     let mapped =
                         sloping_session::run_to_sink(&model, base, out, session, &mut consume)?;
+                    if report.get("staged_cells").is_none()
+                        && let Some(record) = mapped.get("staged_cells")
+                    {
+                        report["staged_cells"] = record.clone();
+                    }
                     if mapped["status"] != "complete" || !seen {
                         return Err(MapError::Invalid(format!(
                             "incomplete mapped sample {source_index}: {}",
