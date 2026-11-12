@@ -1,6 +1,39 @@
 # Changelog
 
-## Unreleased
+## 0.18.0 - 2026-11-12
+
+Release summary. Read these before upgrading:
+
+- **Effective terrain results change for schema 1.** `effective_terrain` now
+  runs and advertises `rasmapper-effective-terrain/2` for both request schemas.
+  Schema 1 requests (unmodified terrains) are still accepted, but their values
+  differ from earlier engines (RAS Mapper render-block sampling and its export
+  TIN) and their receipts report `/2`; `/1` is no longer listed as compatible.
+  Terrain modifications are supported through schema 2; unqualified forms,
+  including multi-part polygons and shape-Z polygons without boundary
+  elevations, are refused before any read or write so callers can use the RAS
+  Mapper export instead.
+- **terrio 0.8.0, and the engine keeps its thread budget.** The terrio upgrade
+  removes every C compiler requirement. terrio 0.8.0 runs its internal parallel
+  work on a process-wide pool of its own; the engine now confines that pool to
+  one thread and calls into it from a helper thread, so a request never has more
+  busy threads than it was given (checked in CI on Linux and Windows). terrio's
+  own internal parallelism is therefore not used, which costs some speed on
+  burn-heavy storage requests (about 2.4 s to 2.8-3.3 s in one Windows
+  measurement); outputs are unchanged. Rust callers that use the library without
+  `ras2fim-batch` must set `RAYON_NUM_THREADS=1` before terrio is first used;
+  reports show the pool as `terrio_pool`.
+- **1D mapping performance** (opt-in, capability-advertised): parallel render
+  over tile rows (`render_workers`), multi-profile requests (`multi_profile`),
+  engine-written `final_format` GeoTIFFs (`native_final_format`), inline storage
+  composition (`inline_storage`) and a direct terrain GeoTIFF read
+  (`terrain_tiff`). JSON requests from earlier releases are unchanged.
+- **Rust API changes (minor version):** `one_d_session::Request.levels_file` and
+  `terrain_file` became `Option<PathBuf>`, the 1D and coupled request structs
+  gained fields, and `one_d_terrain::Source::planned_bytes` changed signature.
+  Struct-literal callers must be updated; JSON callers are unaffected.
+
+### Changes in detail
 
 - Shape-Z polygons without boundary elevations (elevations from vertex Z) are
   now refused, as `method_record` and Commander's `read_layers` already state;

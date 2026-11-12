@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "ras-commander-fast-map"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "clipper2-rust",
  "flate2",
