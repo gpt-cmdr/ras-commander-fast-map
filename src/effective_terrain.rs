@@ -986,13 +986,11 @@ pub fn write_geotiff(path: &Path, effective: Effective, epsg: u32) -> Result<(),
         ],
         ..Default::default()
     };
-    terrio::write_raster_dataset(
-        &dataset,
-        path.to_str()
-            .ok_or_else(|| invalid("output path is not UTF-8"))?,
-        &options,
-    )
-    .map_err(|e| invalid(format!("effective terrain GeoTIFF write: {e}")))
+    let path = path
+        .to_str()
+        .ok_or_else(|| invalid("output path is not UTF-8"))?;
+    crate::terrio_pool::call(|| terrio::write_raster_dataset(&dataset, path, &options))
+        .map_err(|e| invalid(format!("effective terrain GeoTIFF write: {e}")))
 }
 
 /// CLI entry: compute and write `effective_terrain.tif` and `report.json`.

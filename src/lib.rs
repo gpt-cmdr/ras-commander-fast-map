@@ -76,6 +76,7 @@ pub mod stored_grid;
 pub mod terrain;
 pub mod terrain_mods;
 pub mod terrain_scope;
+pub mod terrio_pool;
 pub mod velocity;
 pub mod whole_simulation;
 

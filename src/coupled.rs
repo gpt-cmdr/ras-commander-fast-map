@@ -74,6 +74,22 @@ pub fn compose_with_storage_into(
     depth: &mut [f32],
     wse: &mut [f32],
 ) -> Result<StorageCounts, MapError> {
+    compose_with_storage_at(0, owners, cell_count, xs, mesh, storage, depth, wse)
+}
+
+/// [`compose_with_storage_into`] over a chunk of a larger grid whose first
+/// pixel is `offset`: error messages name pixels of the whole grid.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compose_with_storage_at(
+    offset: usize,
+    owners: &[u32],
+    cell_count: usize,
+    xs: Products<'_>,
+    mesh: Products<'_>,
+    storage: Storage<'_>,
+    depth: &mut [f32],
+    wse: &mut [f32],
+) -> Result<StorageCounts, MapError> {
     let n = owners.len();
     if storage.area_count == 0
         || storage.area_count >= u32::MAX as usize
@@ -96,11 +112,12 @@ pub fn compose_with_storage_into(
             || (owner != 0 && owners[i] != 0)
         {
             return Err(MapError::Invalid(format!(
-                "coupled storage pixel {i}: invalid products, ownership or overlapping 2D coverage"
+                "coupled storage pixel {}: invalid products, ownership or overlapping 2D coverage",
+                offset + i
             )));
         }
     }
-    let base = compose_into_impl(owners, cell_count, xs, mesh, depth, wse, true)?;
+    let base = compose_into_impl(offset, owners, cell_count, xs, mesh, depth, wse, true)?;
     let mut counts = StorageCounts {
         base,
         storage_owned_pixels: 0,
@@ -130,11 +147,12 @@ pub fn compose_into(
     depth: &mut [f32],
     wse: &mut [f32],
 ) -> Result<Counts, MapError> {
-    compose_into_impl(owners, cell_count, xs, mesh, depth, wse, false)
+    compose_into_impl(0, owners, cell_count, xs, mesh, depth, wse, false)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn compose_into_impl(
+    offset: usize,
     owners: &[u32],
     cell_count: usize,
     xs: Products<'_>,
@@ -169,7 +187,8 @@ fn compose_into_impl(
             || (owner == 0 && mesh.depth[i].is_finite())
         {
             return Err(MapError::Invalid(format!(
-                "coupled pixel {i}: invalid ownership, product mask or value"
+                "coupled pixel {}: invalid ownership, product mask or value",
+                offset + i
             )));
         }
     }

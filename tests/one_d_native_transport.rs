@@ -747,3 +747,127 @@ fn terrain_tiff_matches_staged_terrain_bits_and_refuses_mismatched_grids() {
         assert!(!fixture.root.join(&name).exists());
     }
 }
+
+/// A multi-profile request whose later profile fails after earlier profiles were
+/// delivered is a partial run: the CLI exits 2 (not 1) and keeps the aborted report.
+#[test]
+fn cli_multi_profile_partial_failure_exits_two() {
+    let fixture = Fixture::populated();
+    write_f32(&fixture.root.join("good.bin"), &[20., 18., 12., 8.]);
+    write_f32(
+        &fixture.root.join("bad.bin"),
+        &[f32::INFINITY, 18., 12., 8.],
+    );
+    let mut multi = fixture.request.clone();
+    multi.as_object_mut().unwrap().remove("levels_file");
+    multi["levels_files"] = json!(["good.bin", "bad.bin"]);
+    fs::write(
+        fixture.root.join("partial.json"),
+        serde_json::to_vec(&multi).unwrap(),
+    )
+    .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_ras2fim-batch"))
+        .arg("one-d-diagnostic")
+        .arg(fixture.root.join("partial.json"))
+        .arg(fixture.root.join("partial"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        result.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: Value =
+        serde_json::from_slice(&fs::read(fixture.root.join("partial/report.json")).unwrap())
+            .unwrap();
+    assert_eq!(report["status"], "aborted");
+    assert_eq!(report["profiles"][0]["status"], "complete");
+    assert!(fixture.root.join("partial/profile-0000/depth.bin").exists());
+}
+
+/// `terrain_tiff` windows stitch values across tile boundaries in both
+/// directions, and apply GDAL's Float32 nodata rule (`ARE_REAL_EQUAL`) at its
+/// edges: values a few ulps from nodata are masked, nearby values are kept.
+#[test]
+fn terrain_tiff_stitches_tiles_and_masks_near_nodata() {
+    use ras_commander_fast_map::effective_terrain::{self, Effective, Grid, NODATA};
+    use ras_commander_fast_map::one_d_terrain;
+    let fixture = Fixture::empty();
+    let root = fixture.root.clone();
+    let (w, h) = (600usize, 300usize); // 256x256 tiles: 3 x 2
+    let near = [
+        NODATA,
+        f32::from_bits(NODATA.to_bits() + 1),
+        f32::from_bits(NODATA.to_bits() - 2),
+        NODATA + 0.01,
+        NODATA - 0.01,
+        -0.0,
+        f32::MIN_POSITIVE,
+    ];
+    let values: Vec<f32> = (0..w * h)
+        .map(|i| {
+            let (r, c) = (i / w, i % w);
+            if (r + c) % 17 == 0 {
+                near[(r * 7 + c) % near.len()]
+            } else {
+                (r as f32) * 1000.0 + c as f32 + 0.25
+            }
+        })
+        .collect();
+    let gt = [500.0, 2.0, 0.0, 9000.0, 0.0, -2.0];
+    let grid = Grid {
+        origin_x: gt[0],
+        origin_y: gt[3],
+        cell_size: gt[1],
+        width: w,
+        height: h,
+    };
+    let path = root.join("tiles.tif");
+    effective_terrain::write_geotiff(
+        &path,
+        Effective {
+            grid,
+            values: values.clone(),
+            report: Value::Null,
+        },
+        26915,
+    )
+    .unwrap();
+    let source = one_d_terrain::inspect(&path, w, h, gt).unwrap();
+    // One block decoded at a time per worker: three 256x256 Float32 copies plus slack.
+    assert_eq!(
+        source.planned_bytes(2),
+        Some(2 * (256 * 256 * 12 + (1 << 20)))
+    );
+    let masked =
+        |v: f32| v == NODATA || (v - NODATA).abs() < f32::EPSILON * (v + NODATA).abs() * 2.0;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(3)
+        .build()
+        .unwrap();
+    for window in [
+        [0, 0, w, h],
+        [250, 250, 20, 10],
+        [3, 1, 597, 299],
+        [255, 0, 2, 300],
+    ] {
+        let [col, row, ww, wh] = window;
+        let expected: Vec<u32> = (row..row + wh)
+            .flat_map(|r| (col..col + ww).map(move |c| (r, c)))
+            .map(|(r, c)| {
+                let v = values[r * w + c];
+                if masked(v) { f32::NAN } else { v }.to_bits()
+            })
+            .collect();
+        for pool in [None, Some(&pool)] {
+            let mut out = vec![0.0f32; ww * wh];
+            source.read(&path, window, &mut out, pool).unwrap();
+            let got: Vec<u32> = out.iter().map(|v| v.to_bits()).collect();
+            assert!(got == expected, "window {window:?} pool {}", pool.is_some());
+        }
+    }
+    // Both masked and kept near-nodata values occur.
+    assert!(near.iter().any(|v| masked(*v)) && near.iter().any(|v| !masked(*v)));
+    assert!(!masked(NODATA + 0.01) && masked(f32::from_bits(NODATA.to_bits() + 1)));
+}

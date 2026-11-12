@@ -1898,6 +1898,9 @@ fn run_internal(
                                             "shared_nodata_tiles":summary.shared_nodata_tiles,
                                             "file_bytes":summary.file_bytes});
                                     }
+                                    // On a request worker (its stack, not the main
+                                    // thread's); terrio's calls run on helper threads
+                                    // while the worker waits (`terrio_pool::call`).
                                     None => pool.install(|| {
                                         crate::geotiff::write(
                                             &path,

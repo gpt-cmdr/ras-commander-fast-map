@@ -116,7 +116,8 @@ pub struct InlineStorage {
 
 pub fn terrain_capability() -> Value {
     json!({"control": "terrain_tiff", "reader": "terrio", "schemas": [NATIVE_SCHEMA, CLIPPED_SCHEMA, STORED_GRID_SCHEMA],
-        "source": "single-band Float32 tiled GeoTIFF with the request width, height and geotransform",
+        "source": "single-band Float32 GeoTIFF with the request width, height and geotransform; tiles (or strips) of at most 16 MiB",
+        "admission": "header only before admission; read scratch planned per worker from the block size",
         "nodata": "GDAL Float32 nodata mask (ARE_REAL_EQUAL) to NaN; other values keep their bits",
         "equivalent": "masked GDAL window read of the same file, as caller-staged terrain_file"})
 }
@@ -429,7 +430,7 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
     };
     let terrain_bytes = match &terrain_source {
         Some(source) => source
-            .planned_bytes(window.width, threads)
+            .planned_bytes(threads)
             .ok_or_else(|| MapError::Budget("terrain read plan overflow".into()))?,
         None => 0,
     };
@@ -634,7 +635,7 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
             if terrain.iter().any(|v| v.is_infinite()) {
                 return Err(MapError::Invalid("infinite storage terrain".into()));
             }
-            let mut labels = vec![0_u32; pixels];
+            let mut labels = filled(pixels, 0_u32)?;
             let storage_pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads.min(4))
                 .build()
@@ -666,12 +667,12 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
                 prepared,
                 labels,
                 area_count: storage.storage_area_count,
-                zero_owners: vec![0_u32; pixels],
-                dry: vec![f32::NAN; pixels],
-                storage_depth: vec![f32::NAN; pixels],
-                storage_wse: vec![f32::NAN; pixels],
-                depth: vec![f32::NAN; pixels],
-                wse: vec![f32::NAN; pixels],
+                zero_owners: filled(pixels, 0_u32)?,
+                dry: filled(pixels, f32::NAN)?,
+                storage_depth: filled(pixels, f32::NAN)?,
+                storage_wse: filled(pixels, f32::NAN)?,
+                depth: filled(pixels, f32::NAN)?,
+                wse: filled(pixels, f32::NAN)?,
                 chunk: 1 << 20,
             })
         }
@@ -880,6 +881,16 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
     Ok(report)
 }
 
+/// A buffer of `n` copies of `value`, its allocation failing as a budget error
+/// instead of aborting (inline storage buffers are planned in `storage_bytes`).
+fn filled<T: Clone>(n: usize, value: T) -> Result<Vec<T>, MapError> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n)
+        .map_err(|e| MapError::Budget(e.to_string()))?;
+    v.resize(n, value);
+    Ok(v)
+}
+
 /// Per-request inline storage state; buffers are reused for every profile.
 struct Inline {
     prepared: crate::storage_area::StorageAreaPixels,
@@ -929,7 +940,8 @@ impl Inline {
         let (xs_depth, xs_wse): (&[f32], &[f32]) = (depth, wse);
         let compose = |(i, (out_depth, out_wse)): (usize, (&mut [f32], &mut [f32]))| {
             let range = i * chunk..i * chunk + out_depth.len();
-            crate::coupled::compose_with_storage_into(
+            crate::coupled::compose_with_storage_at(
+                range.start,
                 &self.zero_owners[range.clone()],
                 0,
                 crate::coupled::Products {

@@ -121,6 +121,10 @@ impl RowWriter {
                 "native GeoTIFF row count exceeds height".into(),
             ));
         }
+        // At most one strip (one TIFF block row) per terrio call, with the
+        // strips left over from an earlier call: terrio encodes a single chunk
+        // on the calling thread and never reaches its pool, so no helper thread
+        // is needed here (`terrio_pool`; the thread-budget tests sample it).
         for chunk in values.chunks(self.width * strip_rows(self.width).min(self.height)) {
             self.writer
                 .write_rows(
@@ -138,8 +142,8 @@ impl RowWriter {
         if self.written != self.height {
             return Err(MapError::Invalid("native GeoTIFF incomplete rows".into()));
         }
-        self.writer
-            .finish()
+        let writer = self.writer;
+        crate::terrio_pool::call(|| writer.finish())
             .map_err(|e| MapError::Io(format!("native GeoTIFF finish: {e}")))
     }
 }

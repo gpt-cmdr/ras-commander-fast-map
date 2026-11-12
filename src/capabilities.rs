@@ -10,7 +10,8 @@ pub fn engine_method_record() -> serde_json::Value {
         "engine": {
             "package": "ras-commander-fast-map",
             "version": crate::ENGINE_VERSION,
-            "source_commit": crate::ENGINE_COMMIT
+            "source_commit": crate::ENGINE_COMMIT,
+            "thread_budget": crate::terrio_pool::contract()
         },
         "storage": crate::storage_session::method_record(),
         "coupled_diagnostic": crate::coupled::method_record(),
