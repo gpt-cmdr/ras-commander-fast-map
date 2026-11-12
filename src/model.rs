@@ -44,7 +44,9 @@ pub enum TerrainSpec {
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CrsIdentity {
-    /// terrio must identify the terrain EPSG code itself and it must equal `crs_epsg`.
+    /// terrio must identify the terrain EPSG code itself and it must equal `crs_epsg`; or, when
+    /// terrio gives no code (a user-defined projected CRS, as HEC-RAS writes some terrains), the
+    /// terrain WKT must match the definition of `crs_epsg` by [`crate::crs_match::RULE`].
     Epsg,
     /// The caller independently verified the CRS (e.g. rasterio/PROJ identification) and pins
     /// terrio's exact WKT by FNV-1a 64 hash (printed by `terrain-info`). A terrio-identified EPSG

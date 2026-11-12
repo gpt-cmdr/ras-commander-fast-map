@@ -823,6 +823,7 @@ fn build_report(
             "block": t.block, "blocks": t.blocks(), "nodata": t.nodata, "epsg": t.epsg,
             "nodata_f32_exact": crate::terrain::nodata_f32_exact(t.nodata),
             "crs_identity": t.crs_identity, "crs_wkt_fnv1a64": t.crs_wkt_fnv1a64,
+            "crs_epsg_match": t.crs_epsg_match,
             "decode_policy": "one TIFF block per terrio read_window call (serial decode on the calling worker)",
             "stats": tstats,
         })),

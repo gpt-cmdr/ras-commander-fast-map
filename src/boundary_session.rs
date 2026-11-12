@@ -1538,6 +1538,18 @@ fn execute(req: &Request, base: &Path, out: &Path, report: &mut Value) -> Result
     report["render_seconds"] = render_tick.elapsed().as_secs_f64().into();
     report["terrain_cache"] =
         serde_json::to_value(sources[0].terrain.stats()).map_err(|e| invalid(&e.to_string()))?;
+    // How each terrain's CRS was identified as the session EPSG.
+    report["terrain_crs"] = json!(
+        sources
+            .iter()
+            .map(|source| json!({
+                "path":source.terrain.path, "epsg":source.terrain.epsg,
+                "crs_identity":source.terrain.crs_identity,
+                "crs_wkt_fnv1a64":source.terrain.crs_wkt_fnv1a64,
+                "crs_epsg_match":source.terrain.crs_epsg_match,
+            }))
+            .collect::<Vec<_>>()
+    );
     if native {
         report["terrain_source_count"] = sources.len().into();
         report["terrain_sources"] = json!(
