@@ -37,7 +37,9 @@ that were measured. Contract `/2` is advertised.
 2. **Callers.** Commander's `read_layers` must send the new fields
    (`modification_rules.md`); ras2cng's policy check still sends every modified
    terrain to RAS Mapper and must be changed explicitly.
-3. **Shape-Z and multi-part TIN polygons; named ground lines with control points or
+3. **Shape-Z and multi-part polygons** (RAS Mapper joins the parts into one
+   perimeter-TIN ring; reproducing its artefacts for disjoint parts and a
+   leading hole ring needs its constraint enforcement on that ring). **Named ground lines with control points or
    NaN templates, and under 6.6.** No corpus needs them yet.
 4. **Export-TIN ties on A.** They move with RAS Mapper's hash seed, so a fixed
    order cannot reproduce every export.
