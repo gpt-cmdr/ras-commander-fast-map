@@ -7,7 +7,8 @@
 //! - the threads named `terrio-par-*` (terrio's process-wide pool): at most one;
 //! - CPU time per thread (Linux `/proc/<pid>/task/*/schedstat`, nanoseconds;
 //!   Windows `QueryThreadCycleTime`, cycles calibrated against the wall clock),
-//!   from which the CPU the child used over every `WINDOW` of wall time gives its
+//!   each thread's share capped at the wall time between samples, from which
+//!   the CPU the child used over every `WINDOW` of wall time gives its
 //!   busy threads: never more than the request's `threads` (plus `TOLERANCE`
 //!   for sampling skew);
 //! - for the record, OS threads and threads running or ready (Linux `R`; Windows
@@ -64,11 +65,14 @@ struct ThreadSample {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Default)]
 struct Sampler;
 
 #[cfg(target_os = "linux")]
 impl Sampler {
+    fn new() -> Self {
+        Self
+    }
+
     fn sample(&mut self, pid: u32) -> Option<Vec<ThreadSample>> {
         let mut threads = Vec::new();
         for entry in fs::read_dir(format!("/proc/{pid}/task")).ok()?.flatten() {
@@ -133,8 +137,8 @@ struct Sampler {
 }
 
 #[cfg(windows)]
-impl Default for Sampler {
-    fn default() -> Self {
+impl Sampler {
+    fn new() -> Self {
         // Cycles this thread counts per nanosecond of wall time while it spins.
         // A spin the scheduler interrupts counts fewer cycles, so the fastest of
         // several short spins is the clock's rate.
@@ -275,11 +279,13 @@ impl Sampler {
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-#[derive(Default)]
 struct Sampler;
 
 #[cfg(not(any(target_os = "linux", windows)))]
 impl Sampler {
+    fn new() -> Self {
+        Self
+    }
     fn sample(&mut self, _pid: u32) -> Option<Vec<ThreadSample>> {
         None
     }
@@ -307,7 +313,7 @@ struct Trace {
 fn trace(child: &mut Child) -> Trace {
     let pid = child.id();
     let started = Instant::now();
-    let mut sampler = Sampler::default();
+    let mut sampler = Sampler::new();
     let mut t = Trace::default();
     let mut names: HashMap<u64, String> = HashMap::new();
     let mut last: HashMap<u64, f64> = HashMap::new();
@@ -324,6 +330,10 @@ fn trace(child: &mut Child) -> Trace {
         }
         if let Some(threads) = sampler.sample(pid) {
             let now = started.elapsed().as_secs_f64();
+            // One thread uses at most the wall time between two samples: this
+            // bounds a clock conversion that overstates (Windows cycle counts
+            // on a host whose cycle rate varies).
+            let interval_ns = history.last().map_or(0.0, |h| (now - h.0) * 1e9);
             let mut running = 0;
             let mut terrio_running = 0;
             let mut next = HashMap::new();
@@ -337,7 +347,7 @@ fn trace(child: &mut Child) -> Trace {
                 running += th.running as usize;
                 terrio_running += (th.running && name.starts_with("terrio-par")) as usize;
                 if let Some(before) = last.get(&th.tid) {
-                    cumulative += (th.cpu_ns - before).max(0.0);
+                    cumulative += (th.cpu_ns - before).clamp(0.0, interval_ns);
                 }
                 next.insert(th.tid, th.cpu_ns);
             }
