@@ -27,7 +27,7 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings -A clippy::chunks_exact_to_as_chunks
       - run: cargo test --locked --all-targets
       # Thread budget measured on the optimized executable, as shipped.
-      - run: cargo test --release --locked --test thread_budget
+      - run: cargo test --release --locked --test thread_budget -- --nocapture
       - run: cargo publish --locked --dry-run
   wheels:
     strategy:
@@ -79,7 +79,7 @@ jobs:
       - name: Thread budget tests (Windows)
         if: runner.os == 'Windows'
         shell: bash
-        run: cargo test --release --locked --test thread_budget --target "${{ matrix.target }}"
+        run: cargo test --release --locked --test thread_budget --target "${{ matrix.target }}" -- --nocapture
       - uses: PyO3/maturin-action@v1
         if: runner.os != 'Windows'
         with:
