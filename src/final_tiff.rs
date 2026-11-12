@@ -537,7 +537,7 @@ pub struct Writer {
     pos: u64,
     big: bool,
     layout: Layout,
-    geo_keys: Vec<u16>,
+    geo_keys: crate::crs::GeoKeys,
     levels: Vec<Level>,
     shared: (u64, u64),
     rows_in: usize,
@@ -560,29 +560,35 @@ pub fn check_epsg(epsg: u32) -> Result<(u16, bool), MapError> {
     Ok((code, geographic))
 }
 
+/// [`check_epsg`] for any output CRS: the GeoKey tags the final writer
+/// writes, refused before any read when it cannot write them.
+pub fn check_crs(crs: &crate::crs::OutputCrs) -> Result<crate::crs::GeoKeys, MapError> {
+    match crs {
+        crate::crs::OutputCrs::Epsg(epsg) => {
+            let (code, geographic) = check_epsg(*epsg)?;
+            // Model type, raster type PixelIsArea, the EPSG CRS code.
+            Ok(crate::crs::GeoKeys::from_epsg(code, geographic))
+        }
+        crate::crs::OutputCrs::GeoKeys(keys) => {
+            keys.validate()?;
+            Ok((**keys).clone())
+        }
+    }
+}
+
 impl Writer {
     /// Create the file and write its header and the shared nodata tile.
     pub fn create(path: &Path, layout: &Layout, epsg: u32) -> Result<Self, MapError> {
-        let (code, geographic) = check_epsg(epsg)?;
-        // GeoKey directory: model type, raster type PixelIsArea, the EPSG CRS code.
-        let geo_keys = vec![
-            1,
-            1,
-            0,
-            3,
-            1024,
-            0,
-            1,
-            if geographic { 2 } else { 1 },
-            1025,
-            0,
-            1,
-            1,
-            if geographic { 2048 } else { 3072 },
-            0,
-            1,
-            code,
-        ];
+        Self::create_crs(path, layout, &crate::crs::OutputCrs::Epsg(epsg))
+    }
+
+    /// [`Self::create`] with an EPSG code or verbatim GeoKeys.
+    pub fn create_crs(
+        path: &Path,
+        layout: &Layout,
+        crs: &crate::crs::OutputCrs,
+    ) -> Result<Self, MapError> {
+        let geo_keys = check_crs(crs)?;
         let block = layout.block;
         let sizes = layout.level_sizes();
         let mut worst = 1_u64 << 20;
@@ -927,8 +933,15 @@ impl Writer {
                 tags.extend([
                     (33550, Tag::Double(vec![t[1], -t[5], 0.0])),
                     (33922, Tag::Double(vec![0.0, 0.0, 0.0, t[0], t[3], 0.0])),
-                    (34735, Tag::Short(self.geo_keys.clone())),
+                    (34735, Tag::Short(self.geo_keys.directory.clone())),
                 ]);
+                // Verbatim GeoKeys of a CRS without an EPSG code; none for a code.
+                if !self.geo_keys.doubles.is_empty() {
+                    tags.push((34736, Tag::Double(self.geo_keys.doubles.clone())));
+                }
+                if !self.geo_keys.ascii.is_empty() {
+                    tags.push((34737, Tag::Ascii(self.geo_keys.ascii.clone())));
+                }
                 if count > 1 {
                     tags.push((
                         42112,
@@ -978,6 +991,23 @@ pub fn write(
     epsg: u32,
     pool: &rayon::ThreadPool,
 ) -> Result<Summary, MapError> {
+    write_crs(
+        path,
+        values,
+        layout,
+        &crate::crs::OutputCrs::Epsg(epsg),
+        pool,
+    )
+}
+
+/// [`write`] with an EPSG code or verbatim GeoKeys.
+pub fn write_crs(
+    path: &Path,
+    values: &[f32],
+    layout: &Layout,
+    crs: &crate::crs::OutputCrs,
+    pool: &rayon::ThreadPool,
+) -> Result<Summary, MapError> {
     if layout
         .window_width
         .checked_mul(layout.window_height)
@@ -987,7 +1017,7 @@ pub fn write(
             "final_format buffer dimensions mismatch".into(),
         ));
     }
-    let mut writer = Writer::create(path, layout, epsg)?;
+    let mut writer = Writer::create_crs(path, layout, crs)?;
     // Bounded pieces keep the per-call work on tile-row boundaries.
     for chunk in values.chunks(layout.window_width * layout.block) {
         writer.write_rows(chunk, pool)?;

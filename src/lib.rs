@@ -54,6 +54,7 @@ pub mod cache;
 mod capabilities;
 pub mod coupled;
 pub mod coupled_session;
+pub mod crs;
 pub mod depth_groups;
 pub mod effective_terrain;
 mod export_tin;

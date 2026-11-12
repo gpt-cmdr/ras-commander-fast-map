@@ -91,6 +91,9 @@ pub struct Request {
     pub final_format: Option<crate::native_output::FinalFormat>,
     #[serde(default)]
     pub epsg: Option<u32>,
+    /// Verbatim GeoKey tags instead of `epsg` (see `one_d_delivery`).
+    #[serde(default)]
+    pub crs_geokeys: Option<crate::crs::GeoKeys>,
     #[serde(default)]
     pub aoi_mask_file: Option<PathBuf>,
     #[serde(default)]
@@ -135,6 +138,7 @@ impl Request {
         crate::one_d_delivery::Options {
             final_format: self.final_format.clone(),
             epsg: self.epsg,
+            crs_geokeys: self.crs_geokeys.clone(),
             aoi_mask_file: self.aoi_mask_file.clone(),
             flooded_depth_range: self.flooded_depth_range,
         }

@@ -732,7 +732,7 @@ pub fn run_with_session(
                                 width,
                                 height,
                                 transform,
-                                req.model.epsg,
+                                &crate::crs::OutputCrs::Epsg(req.model.epsg),
                                 req.compression,
                             )
                         })?)

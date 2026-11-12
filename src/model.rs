@@ -50,6 +50,13 @@ pub enum CrsIdentity {
     /// terrio's exact WKT by FNV-1a 64 hash (printed by `terrain-info`). A terrio-identified EPSG
     /// that differs still fails.
     CallerVerifiedWkt { fnv1a64: String },
+    /// The terrain's own GeoKey tags equal the request's `crs_geokeys` exactly (methods that
+    /// advertise `crs_any`). The CRS needs no EPSG code; see [`crate::crs`].
+    Geokeys,
+    /// The terrain TIFF carries no CRS at all (no GeoKey tags, none terrio reads), as RAS
+    /// Mapper writes terrain sources whose CRS has no EPSG code; the request's `crs_geokeys`
+    /// declares it (methods that advertise `crs_any`).
+    Untagged,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]

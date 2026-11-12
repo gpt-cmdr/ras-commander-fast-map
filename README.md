@@ -249,7 +249,8 @@ With `stream_outputs=true, geotiff_outputs=true`, sloping requests write
 lossless LZW `depth.tif` and `wse.tif` beneath each unit folder and stream JSON
 completion records instead of arrays. Records include pixel counts and native
 write timing. terrio owns encoding; no GDAL/Python dependency is added to the
-engine. This route requires an EPSG-identifiable CRS and excludes velocity.
+engine. This route requires an EPSG code or verbatim `crs_geokeys` (see
+[Any CRS](#any-crs-verbatim-geokeys)) and excludes velocity.
 Commander validates output metadata before delivery. Ordinary array streams
 and binary-file output remain compatible. Inspect advertised capability flags
 before selecting a delivery path.
@@ -313,7 +314,7 @@ Inspect the `native_final_format` capability before sending it.
 | `overview_resampling` | string, default `"average"` | Only `"average"` |
 
 The file is a single-band Float32 GeoTIFF (BigTIFF when the uncompressed levels
-could pass 4 GB) with the EPSG code, the grid transform, `GDAL_NODATA` and, with
+could pass 4 GB) with the EPSG code (or the request's verbatim `crs_geokeys`), the grid transform, `GDAL_NODATA` and, with
 overviews, the `rio_overview` `resampling=average` item. Window pixels keep the
 product's Float32 bits; only the invalid marker, placement, tiling, compression
 and overviews differ from the LZW route. `full_grid.transform` must equal the
@@ -632,6 +633,62 @@ dry cells; the dam-break p07 2D cells also match for Max and one output time.
 Lower-priority sources are not mosaicked: RAS Mapper's export resamples them
 with a rule close to, but not, pixel-centre bilinear (84% of float32 values
 reproduced), so a native mosaic is unqualified.
+
+## Any CRS (verbatim GeoKeys)
+
+`effective_terrain`, `sloping` (both schemas), `horizontal` and the 1D/coupled
+`final_format` delivery accept a CRS with no EPSG code, such as ESRI:102630
+(NAD83 / Alabama West, US survey feet). They advertise `crs_any: true`,
+`crs_identity_kinds` and `output_crs_kinds` on their method records (the 1D
+and coupled records on `native_final_format`). Other methods still require an
+EPSG code.
+
+Such a request gives `crs_geokeys` instead of `epsg` (`epsg` is then 0 or
+absent; giving both is refused):
+
+```json
+"crs_geokeys": {"directory": [1, 1, 0, 18, 1024, 0, 1, 1, "..."],
+  "doubles": [30.0, -87.5, "..."],
+  "ascii": "NAD_1983_StatePlane_Alabama_West_FIPS_0102_Feet|NAD83|"},
+"crs_identity": {"kind": "geokeys"}
+```
+
+The three members are the GeoKeyDirectoryTag, GeoDoubleParamsTag and
+GeoAsciiParamsTag values of a GeoTIFF in that CRS (`ascii` without its NUL),
+as `ras2fim-batch terrain-info` prints them (`geokeys`, `geokeys_fnv1a64`).
+Every engine-written GeoTIFF (effective terrain, LZW/NONE products and
+`final_format`) stores these three tags unchanged, so GDAL, rasterio and terrio
+decode the same CRS from the output as from the source. Nothing is converted
+from WKT or PROJ, and no CRS is re-encoded or approximated. Products written
+through terrio get the tags after terrio closes the file: their first image
+directory is rewritten at the end of the file and the pixels are unchanged.
+EPSG requests write the same files as before.
+
+The terrain identity is checked before any read:
+
+| `crs_identity.kind` | With `crs_geokeys` |
+| --- | --- |
+| `geokeys` | The terrain's own GeoKey tags must equal `crs_geokeys` exactly |
+| `untagged` | The terrain carries no CRS at all (no GeoKey tags, none terrio reads). RAS Mapper writes such terrain sources for CRSs without an EPSG code; the caller declares the CRS (for example from the terrain HDF) |
+| `caller_verified_wkt` | The WKT hash pin, as before |
+| `epsg` | Refused: there is no code |
+
+The keys are checked only as a georeferencing model. They must be a
+well-formed directory with a projected, geographic or user-defined
+`GTModelTypeGeoKey`, PixelIsArea (or no raster type), and values stored in the
+double and ASCII tags. Reports give `output_crs: {"kind": "geokeys",
+"fnv1a64": ...}`. An effective-terrain request with `epsg: 0` and no keys is now
+refused: older engines wrote `ProjectedCSTypeGeoKey 0`, which GDAL reads as a
+local CRS in metres.
+
+Round trip (rasterio 1.5.2, GDAL 3.12.2, pyproj 3.8.0, Windows, this engine's
+effective terrain from a 40 x 40 GDAL-written source): the output CRS equals the
+source's under GDAL (`==`, identical WKT) and pyproj (`equals`, `is_exact_same`,
+same linear units and datum). This held for ESRI:102630, ESRI:102003,
+ESRI:102008 and ESRI:54009 (Mollweide); custom Transverse Mercator (international
+feet), Lambert conformal (Clarke 1866), Albers (US survey feet, towgs84) and
+oblique Mercator; a geographic CRS on a custom sphere; and EPSG:2277. The
+installed-wheel smoke repeats it for ESRI:102630 sloping products.
 
 ## Storage-area surfaces
 

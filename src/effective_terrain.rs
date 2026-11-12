@@ -139,7 +139,13 @@ pub struct Request {
     pub sources: Vec<Source>,
     #[serde(default)]
     pub stitch_tin: Option<StitchTin>,
+    /// EPSG code of the sources and the output. 0 or absent with `crs_geokeys`.
+    #[serde(default)]
     pub epsg: u32,
+    /// The output CRS as verbatim GeoKey tags, for a CRS without an EPSG code
+    /// (see [`crate::crs`]). Sources are identified by `crs_identity`.
+    #[serde(default)]
+    pub crs_geokeys: Option<crate::crs::GeoKeys>,
     pub crs_identity: CrsIdentity,
     /// Explicit lattice. Default: the finest source's lattice over `extent`.
     #[serde(default)]
@@ -166,7 +172,7 @@ pub struct Request {
 }
 
 pub fn method_record() -> Value {
-    json!({
+    let mut record = json!({
         "method_id": METHOD_ID,
         "request_schema": SCHEMA,
         "request_schemas": [SCHEMA_V1, SCHEMA],
@@ -190,7 +196,16 @@ pub fn method_record() -> Value {
         },
         "known_differences": "inside export-TIN gap fills: the order of segments with equal hash comes from RAS Mapper's parallel collection and its hash seed varies by process, which decides cocircular Delaunay ties; this engine fixes one order (type id 7, 8 range partitions). On terrain A another seed order (type id 23) leaves 82 value differences in an independent prototype, consistent with the remaining differences being ordering ties. RAS Mapper's own repeated exports also disagree on some of these pixels",
         "refused": "modification forms listed in modifications.refused, non-float32/rotated/non-square sources, sources in different CRSs"
-    })
+    });
+    crate::crs::advertise(&mut record);
+    record
+}
+
+impl Request {
+    /// The output CRS: `epsg`, or `crs_geokeys` (validated).
+    pub fn output_crs(&self) -> Result<crate::crs::OutputCrs, MapError> {
+        crate::crs::OutputCrs::resolve(self.epsg, self.crs_geokeys.as_ref())
+    }
 }
 
 fn invalid(msg: impl Into<String>) -> MapError {
@@ -221,6 +236,12 @@ impl Request {
         crate::terrain_mods::RasVersion::parse(self.hecras_version.as_deref())?;
         if self.sources.is_empty() {
             return Err(invalid("at least one source is required"));
+        }
+        if self.output_crs()? == crate::crs::OutputCrs::Epsg(0) {
+            // ProjectedCSTypeGeoKey 0 reads as a local CRS in metres: never a label.
+            return Err(invalid(
+                "epsg must be a CRS code; for a CRS without one give crs_geokeys",
+            ));
         }
         if self.threads == 0 || self.max_working_bytes == 0 {
             return Err(invalid("threads and max_working_bytes must be positive"));
@@ -669,15 +690,16 @@ pub struct Effective {
 /// Compute the effective terrain in memory.
 pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
     req.validate()?;
+    let crs = req.output_crs()?;
     let started = Instant::now();
     let cache = (req.max_working_bytes / 4 / req.sources.len() as u64).max(1 << 20);
     let mut sources = Vec::with_capacity(req.sources.len());
     for s in &req.sources {
         let path = model::resolve(base, &s.path);
-        let terrain = NativeTerrain::open(
+        let terrain = NativeTerrain::open_crs(
             path.to_str()
                 .ok_or_else(|| invalid("source path is not UTF-8"))?,
-            req.epsg,
+            &crs,
             s.crs_identity.as_ref().unwrap_or(&req.crs_identity),
             QueryConvention::PixelCenter,
             NodataPolicy::Dry,
@@ -962,7 +984,17 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
 
 /// Write `effective` as a tiled float32 GeoTIFF with nodata -9999.
 pub fn write_geotiff(path: &Path, effective: Effective, epsg: u32) -> Result<(), MapError> {
-    use wbraster::{DataType, Raster, crs_info::CrsInfo, raster::RasterData};
+    write_geotiff_crs(path, effective, &crate::crs::OutputCrs::Epsg(epsg))
+}
+
+/// [`write_geotiff`] with an EPSG code or verbatim GeoKeys (added after terrio
+/// closes the file; pixels and the other tags are unchanged).
+pub fn write_geotiff_crs(
+    path: &Path,
+    effective: Effective,
+    crs: &crate::crs::OutputCrs,
+) -> Result<(), MapError> {
+    use wbraster::{DataType, Raster, raster::RasterData};
     let g = effective.grid;
     let transform = g.transform();
     let raster = Raster {
@@ -975,7 +1007,7 @@ pub fn write_geotiff(path: &Path, effective: Effective, epsg: u32) -> Result<(),
         cell_size_y: -transform[5],
         nodata: NODATA as f64,
         data_type: DataType::F32,
-        crs: CrsInfo::from_epsg(epsg),
+        crs: crate::geotiff::crs_info(crs),
         metadata: Vec::new(),
         data: RasterData::F32(effective.values),
     };
@@ -991,23 +1023,28 @@ pub fn write_geotiff(path: &Path, effective: Effective, epsg: u32) -> Result<(),
         ],
         ..Default::default()
     };
-    let path = path
+    let text = path
         .to_str()
         .ok_or_else(|| invalid("output path is not UTF-8"))?;
-    crate::terrio_pool::call(|| terrio::write_raster_dataset(&dataset, path, &options))?
-        .map_err(|e| invalid(format!("effective terrain GeoTIFF write: {e}")))
+    crate::terrio_pool::call(|| terrio::write_raster_dataset(&dataset, text, &options))?
+        .map_err(|e| invalid(format!("effective terrain GeoTIFF write: {e}")))?;
+    crate::geotiff::finish_crs(path, crs)
 }
 
 /// CLI entry: compute and write `effective_terrain.tif` and `report.json`.
 pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
+    let crs = req.output_crs()?;
     let effective = compute(req, base)?;
     std::fs::create_dir_all(out)?;
     let mut report = effective.report.clone();
     let tif = out.join("effective_terrain.tif");
     let partial = out.join("effective_terrain.partial.tif");
     let write_started = Instant::now();
-    write_geotiff(&partial, effective, req.epsg)?;
+    write_geotiff_crs(&partial, effective, &crs)?;
     std::fs::rename(&partial, &tif)?;
+    if crs.geokeys().is_some() {
+        report["output_crs"] = crs.echo();
+    }
     report["status"] = "complete".into();
     report["output"] = tif.display().to_string().into();
     report["write_seconds"] = write_started.elapsed().as_secs_f64().into();

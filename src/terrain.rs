@@ -13,6 +13,7 @@
 //! multiplication and absurd layouts fail with a typed `unsupported` error instead of panicking.
 use crate::MapError;
 use crate::cache::{CacheStats, TileCache};
+use crate::crs::OutputCrs;
 use crate::model::{CrsIdentity, NodataPolicy, QueryConvention};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,6 +56,12 @@ pub struct TerrainInfo {
     pub band_count: usize,
     pub crs: terrio::crs::SpatialRef,
     pub crs_wkt_fnv1a64: Option<String>,
+    /// The file's GeoKey tags as stored (`crs_geokeys` of a request in its CRS).
+    pub geokeys: Option<crate::crs::GeoKeys>,
+    pub geokeys_fnv1a64: Option<String>,
+    /// Why the GeoKey tags could not be read (`geokeys` is then null).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geokeys_error: Option<String>,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -83,6 +90,10 @@ pub enum Hit {
 pub fn inspect(path: &str) -> Result<TerrainInfo, MapError> {
     let r = open_lazy(path)?;
     let block = r.block_size().unwrap_or((0, 0));
+    let (geokeys, geokeys_error) = match crate::crs::read_geokeys(std::path::Path::new(path)) {
+        Ok(keys) => (keys, None),
+        Err(e) => (None, Some(e.to_string())),
+    };
     Ok(TerrainInfo {
         path: path.to_string(),
         geo_transform: r.geo_transform(),
@@ -105,6 +116,9 @@ pub fn inspect(path: &str) -> Result<TerrainInfo, MapError> {
         band_count: r.band_count(),
         crs: r.crs(),
         crs_wkt_fnv1a64: wkt_fnv(&r.crs()),
+        geokeys_fnv1a64: geokeys.as_ref().map(crate::crs::GeoKeys::fnv1a64),
+        geokeys,
+        geokeys_error,
     })
 }
 
@@ -139,6 +153,28 @@ impl NativeTerrain {
         policy: NodataPolicy,
         cache_budget: u64,
     ) -> Result<Self, MapError> {
+        Self::open_crs(
+            path,
+            &OutputCrs::Epsg(expected_epsg),
+            identity,
+            query,
+            policy,
+            cache_budget,
+        )
+    }
+
+    /// [`Self::open`] for a request CRS that is an EPSG code or verbatim GeoKeys
+    /// (see [`crate::crs`]). With GeoKeys, identity `geokeys` requires the
+    /// terrain's own GeoKey tags to equal them exactly; `caller_verified_wkt`
+    /// checks the pin as before; `epsg` is refused (there is no code).
+    pub fn open_crs(
+        path: &str,
+        expected: &OutputCrs,
+        identity: &CrsIdentity,
+        query: QueryConvention,
+        policy: NodataPolicy,
+        cache_budget: u64,
+    ) -> Result<Self, MapError> {
         let r = open_lazy(path)?;
         if r.band_count() != 1 {
             return Err(MapError::Unsupported(format!(
@@ -164,6 +200,43 @@ impl NativeTerrain {
             )));
         }
         let crs = r.crs();
+        let expected_epsg = match expected {
+            OutputCrs::Epsg(code) => *code,
+            OutputCrs::GeoKeys(keys) => {
+                let label = match identity {
+                    CrsIdentity::Geokeys => {
+                        let own = crate::crs::read_geokeys(std::path::Path::new(path))?;
+                        if own.as_ref() != Some(&**keys) {
+                            return Err(MapError::Unsupported(format!(
+                                "{path}: terrain GeoKey tags {} differ from crs_geokeys {}",
+                                own.map_or("(none)".into(), |k| k.fnv1a64()),
+                                keys.fnv1a64()
+                            )));
+                        }
+                        "terrain_geokeys_verbatim"
+                    }
+                    CrsIdentity::CallerVerifiedWkt { fnv1a64 } => {
+                        check_wkt_pin(path, &crs, fnv1a64)?;
+                        "caller_verified_wkt_fnv1a64"
+                    }
+                    CrsIdentity::Untagged => {
+                        let own = crate::crs::read_geokeys(std::path::Path::new(path))?;
+                        if own.is_some() || !crs.is_unknown() {
+                            return Err(MapError::Unsupported(format!(
+                                "{path}: crs_identity untagged, but the terrain carries a CRS; use geokeys or caller_verified_wkt"
+                            )));
+                        }
+                        "untagged_caller_declared_geokeys"
+                    }
+                    CrsIdentity::Epsg => {
+                        return Err(MapError::Invalid(
+                            "crs_identity epsg needs an EPSG code; with crs_geokeys use geokeys or caller_verified_wkt".into(),
+                        ));
+                    }
+                };
+                return Self::finish_open(r, path, 0, label, crs, query, policy, cache_budget);
+            }
+        };
         let crs_identity = match (crs.epsg, identity) {
             (Some(e), _) if e != expected_epsg => {
                 return Err(MapError::Unsupported(format!(
@@ -185,7 +258,38 @@ impl NativeTerrain {
                 check_wkt_pin(path, &crs, fnv1a64)?;
                 "caller_verified_wkt_fnv1a64"
             }
+            (_, CrsIdentity::Geokeys | CrsIdentity::Untagged) => {
+                return Err(MapError::Invalid(
+                    "crs_identity geokeys and untagged need crs_geokeys (a method that advertises crs_any)"
+                        .into(),
+                ));
+            }
         };
+        Self::finish_open(
+            r,
+            path,
+            expected_epsg,
+            crs_identity,
+            crs,
+            query,
+            policy,
+            cache_budget,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_open(
+        r: LazyRaster,
+        path: &str,
+        expected_epsg: u32,
+        crs_identity: &'static str,
+        crs: terrio::crs::SpatialRef,
+        query: QueryConvention,
+        policy: NodataPolicy,
+        cache_budget: u64,
+    ) -> Result<Self, MapError> {
+        // Checked north-up by `open_crs`.
+        let gt = r.geo_transform();
         let block = r
             .block_size()
             .filter(|b| b.0 > 0 && b.1 > 0)

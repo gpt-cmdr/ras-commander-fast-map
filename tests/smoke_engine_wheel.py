@@ -149,6 +149,49 @@ def sloping_smoke(engine, root, terrain):
     print("Installed wheel: plain/enhanced sloping options, binary geometry, profiles, file/stream AOI PASS")
 
 
+def any_crs_smoke(engine, root):
+    """A CRS without an EPSG code (ESRI:102630, US survey feet): GDAL reads the
+    engine's products in exactly the terrain's CRS (verbatim GeoKeys)."""
+    folder = root / "sloping-inputs"
+    request = dict(schema="ras-commander-sloping-request/1", terrain_transform=[0., 1., 0., 8., 0., -1.],
+        window=[0, 4, 4, 4], geometry_file="cell.wkb", mesh_files=["mesh.json"], owner_cells=[[0, 0]],
+        profiles=[dict(id=name, values_files=[f"{name}.bin"]) for name in ["a", "b"]],
+        threads=2, max_working_bytes=256 << 20)
+    results = {}
+    for name, crs in [("epsg", "EPSG:3857"), ("esri", "ESRI:102630")]:
+        terrain = root / f"terrain-{name}.tif"
+        with rasterio.open(terrain, "w", driver="GTiff", width=8, height=8, count=1,
+                           dtype="float32", crs=crs, transform=Affine(1, 0, 0, 0, -1, 8),
+                           nodata=-9999) as ds:
+            ds.write(np.full((8, 8), 100, dtype=np.float32), 1)
+        info = json.loads(subprocess.check_output([engine, "terrain-info", str(terrain)], text=True))
+        model = dict(request)
+        model.update(terrain=str(terrain), aoi_file="aoi.wkb", stream_outputs=True,
+                     geotiff_outputs=True, products=["depth", "wse"], compression="DEFLATE",
+                     final_format={"nodata": -9999.0, "block_size": 16})
+        if name == "epsg":
+            model.update(epsg=3857, crs_identity={"kind": "epsg"})
+        else:
+            assert info["epsg"] is None and info["geokeys"]["directory"][:2] == [1, 1]
+            model.update(crs_geokeys=info["geokeys"], crs_identity={"kind": "geokeys"})
+        for final in (True, False):
+            if not final:
+                model.pop("final_format"); model["compression"] = "LZW"
+            path = folder / f"crs-{name}-{final}.json"
+            path.write_text(json.dumps(model))
+            out = folder / f"crs-{name}-{final}"
+            subprocess.run([engine, "sloping", str(path), str(out)], check=True, capture_output=True)
+            for profile in ("a", "b"):
+                for product in ("depth", "wse"):
+                    with rasterio.open(terrain) as src, rasterio.open(out / profile / f"{product}.tif") as ds:
+                        assert ds.crs == src.crs and ds.crs.to_wkt() == src.crs.to_wkt(), (name, ds.crs)
+                        results[(name, final, profile, product)] = ds.read(1)
+    for key, values in results.items():
+        if key[0] == "esri":
+            np.testing.assert_array_equal(values.view("<u4"), results[("epsg",) + key[1:]].view("<u4"))
+    print("Installed wheel: ESRI:102630 terrain, verbatim GeoKeys in strip and final products PASS")
+
+
 def native_one_d_smoke(engine, root):
     """Installed executable includes ranked scanlines and global crop transport."""
     folder=root/"native-one-d";folder.mkdir()
@@ -203,6 +246,7 @@ def main():
     assert method["sloping"]["method_id"] == "rasmapper-plain-sloping/1"
     assert method["sloping"]["native_output_compression"] == ["NONE", "LZW"]
     assert method["depth_groups"]["request_schema"] == "ras-commander-depth-groups-request/1"
+    assert method["sloping"]["crs_any"] and method["effective_terrain"]["crs_any"]
     with tempfile.TemporaryDirectory(prefix="ras2fim-wheel-") as tmp:
         root = Path(tmp)
         terrain = root / "terrain.tif"
@@ -211,6 +255,7 @@ def main():
                            transform=Affine(1, 0, 0, 0, -1, 8), nodata=-9999) as ds:
             ds.write(np.full((8, 8), 100, dtype=np.float32), 1)
         sloping_smoke(engine,root,terrain)
+        any_crs_smoke(engine,root)
         native_one_d_smoke(engine,root)
         ownership=np.tile(np.array([1,1,1,2,2,0],dtype="<u4"),(4,1))
         ownership.tofile(root/"owner.bin")

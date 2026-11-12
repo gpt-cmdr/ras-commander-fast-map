@@ -18,6 +18,22 @@
 - Qualified per release (2026-11-12): HEC-RAS 6.6, 6.7 Beta 4/5, 7.0, 7.0.1
   and 7.0.2 exports, 0 mask and 0 value differences on every layer each rule
   accepts; see `modifications.qualified`.
+- **Any CRS (verbatim GeoKeys).** `effective_terrain`, `sloping` (both
+  schemas), `horizontal` and 1D/coupled `final_format` delivery accept a CRS
+  without an EPSG code, such as ESRI:102630 (US survey feet). The new optional
+  `crs_geokeys` request field holds the GeoKey tags of a GeoTIFF in that CRS,
+  and every engine-written GeoTIFF stores them unchanged. New `crs_identity`
+  kinds: `geokeys` (the terrain's own tags must equal them) and `untagged`
+  (RAS Mapper terrain sources that carry no CRS). These methods advertise
+  `crs_any: true`, `crs_identity_kinds` and `output_crs_kinds`.
+  `terrain-info` prints `geokeys` and `geokeys_fnv1a64`. Request schemas and
+  method IDs are unchanged; EPSG requests write the same bytes. New library
+  API: `crs` module, `NativeTerrain::open_crs`,
+  `effective_terrain::write_geotiff_crs`, `final_tiff::{write_crs, check_crs,
+  Writer::create_crs}`.
+- **Effective terrain refuses `epsg: 0` without `crs_geokeys`.** Earlier
+  engines accepted it and labelled the output `ProjectedCSTypeGeoKey 0`, which
+  GDAL reads as a local CRS in metres.
 
 ## 0.19.0 - 2026-11-12
 
