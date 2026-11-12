@@ -455,6 +455,93 @@ fn modifications_follow_priority_and_round() {
     assert_eq!(out.report["method_id"], METHOD_ID);
 }
 
+/// Every accepted HEC-RAS release label gives the same pixels as its rule,
+/// the report names both, and the method record advertises the table.
+#[test]
+fn hecras_release_labels_follow_their_rule() {
+    let dir = scratch();
+    let g = grid(1000.0, 2000.0, 10.0, 20, 12);
+    write_source(&dir, "a.tif", g, vec![50.0; 20 * 12]);
+    write_mask(&dir, "a.u1", 20, 12, |_, _| true);
+    let ring = json!([[
+        [1040.0, 1920.0],
+        [1120.0, 1920.0],
+        [1120.0, 1980.0],
+        [1040.0, 1980.0]
+    ]]);
+    let build = |version: Option<&str>| {
+        let mut extra = json!({
+            "schema": "ras-commander-effective-terrain-request/2",
+            "modifications": 1,
+            "modification_layers": [{"kind": "polygon", "name": "pad", "priority": 0,
+                "features": [{"elevation_type": "SetValue", "elevation": 60.0, "rings": ring}]}]
+        });
+        if let Some(v) = version {
+            extra["hecras_version"] = json!(v);
+        }
+        let req = request(
+            json!([{"path": "a.tif", "mask": mask("a.u1", 20, 12)}]),
+            extra,
+        );
+        effective_terrain::compute(&req, &dir).unwrap()
+    };
+    let default = build(None);
+    assert_eq!(default.report["modifications"]["hecras_rule"], "7.0.1");
+    assert_eq!(
+        default.report["modifications"]["hecras_version"],
+        Value::Null
+    );
+    let record = effective_terrain::method_record();
+    let table = record["hecras_versions"].as_object().unwrap();
+    for (label, rule) in [
+        ("6.6", "6.6"),
+        ("6.7", "6.7"),
+        ("6.7 Beta 4", "6.7"),
+        ("6.7 Beta 5", "6.7"),
+        ("7.0", "7.0.1"),
+        ("7.0.0", "7.0.1"),
+        ("7.0.1", "7.0.1"),
+        ("7.0.2", "7.0.1"),
+    ] {
+        assert_eq!(table[label], rule, "{label}");
+        let out = build(Some(label));
+        assert_eq!(out.report["modifications"]["hecras_rule"], rule);
+        assert_eq!(out.report["modifications"]["hecras_version"], label);
+        assert!(
+            out.values
+                .iter()
+                .zip(&default.values)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+    }
+    assert_eq!(table.len(), 8);
+}
+
+#[test]
+fn unqualified_hecras_version_is_refused_before_reads() {
+    // The source does not exist: the refusal must come before any read.
+    let dir = scratch();
+    let srcs = json!([{"path": "missing.tif", "mask": mask("m.u1", 10, 10)}]);
+    for schema in [
+        "ras-commander-effective-terrain-request/1",
+        "ras-commander-effective-terrain-request/2",
+    ] {
+        for version in ["6.5", "6.4.1", "7.1", "7.0.3", "6.60", "latest"] {
+            let req = request(
+                srcs.clone(),
+                json!({"schema": schema, "hecras_version": version}),
+            );
+            let err = effective_terrain::compute(&req, &dir).err().unwrap();
+            assert_eq!(err.kind(), "unsupported", "{err:?}");
+            let text = format!("{err:?}");
+            assert!(
+                text.contains("not a qualified HEC-RAS release") && text.contains(version),
+                "{text}"
+            );
+        }
+    }
+}
+
 #[test]
 fn multi_part_polygon_is_refused_before_reads() {
     // The source does not exist: the refusal must come before any read.
@@ -462,7 +549,7 @@ fn multi_part_polygon_is_refused_before_reads() {
     let srcs = json!([{"path": "missing.tif", "mask": mask("m.u1", 10, 10)}]);
     let outer = json!([[0.0, 0.0], [60.0, 0.0], [60.0, 60.0], [0.0, 60.0]]);
     let hole = json!([[20.0, 20.0], [20.0, 40.0], [40.0, 40.0], [40.0, 20.0]]);
-    for version in ["7.0.1", "6.6"] {
+    for version in ["7.0.1", "6.6", "6.7", "7.0.2"] {
         let req = request(
             srcs.clone(),
             json!({"schema": "ras-commander-effective-terrain-request/2", "modifications": 1,

@@ -35,12 +35,14 @@ in the *base* mosaic (the rule from #19), with modifications switched off too.
   SetIfLower, NaN templates, negative slopes, Max Reach <= Top Width, named and
   joined `System Name` systems, control points); polygons (constant, stored
   boundary profiles, control points, interior points; SetValue/Add/Hi/Lo; one
-  ring); ellipses and circles, rotated or not (positive rotation clockwise). Optional `hecras_version` (`7.0.1`
-  default, `6.6`).
+  ring); ellipses and circles, rotated or not (positive rotation clockwise). Optional `hecras_version`: a HEC-RAS release label
+  (`6.6`, `6.7`, `6.7 Beta 4/5`, `7.0`, `7.0.0`, `7.0.1`, `7.0.2`) mapped to
+  the 7.0.1 (default), 6.6 or 6.7 rule; anything else refused
+  (`effective_terrain.hecras_versions`).
 - Refused with a reason: boundary elevations sampled from the terrain, shape-Z
   polygons, multi-part polygons (interior rings or several parts: RAS Mapper
   fills holes), named ground lines with control
-  points or a NaN template (and under 6.6), a NaN Top Width with a finite Max
+  points or a NaN template (and under 6.6 and 6.7), a NaN Top Width with a finite Max
   Reach, other modification types.
 - Optional per-source `crs_identity` (sources whose WKT text differs but whose CRS
   is equal).

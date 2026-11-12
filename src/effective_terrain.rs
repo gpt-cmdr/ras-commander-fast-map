@@ -155,8 +155,10 @@ pub struct Request {
     /// Schema 2: every modification layer of the terrain (see `terrain_mods`).
     #[serde(default)]
     pub modification_layers: Vec<crate::terrain_mods::Layer>,
-    /// HEC-RAS version whose modification rules to follow: `7.0.1`
-    /// (default) or `6.6`.
+    /// HEC-RAS release whose modification rules to follow (omitted: the
+    /// 7.0.1 rule). One of the labels in
+    /// [`crate::terrain_mods::HECRAS_VERSIONS`]; any other label is refused
+    /// before any read.
     #[serde(default)]
     pub hecras_version: Option<String>,
     pub threads: usize,
@@ -168,7 +170,8 @@ pub fn method_record() -> Value {
         "method_id": METHOD_ID,
         "request_schema": SCHEMA,
         "request_schemas": [SCHEMA_V1, SCHEMA],
-        "reference": "RasTerrain.export_rasmapper_terrain(downsample_factor=1, rasterize_modifications=False) for schema 1; rasterize_modifications=True with modification_layers (schema 2); HEC-RAS 7.0.1, or 6.6 with hecras_version",
+        "reference": "RasTerrain.export_rasmapper_terrain(downsample_factor=1, rasterize_modifications=False) for schema 1; rasterize_modifications=True with modification_layers (schema 2); HEC-RAS 7.0.1, or another release named by hecras_version (see hecras_versions)",
+        "hecras_versions": crate::terrain_mods::hecras_versions_record(),
         "receipt_method_id": "rasmapper-effective-terrain/2 for both request schemas: schema 1 (no modifications) is still accepted, but its values follow the /2 rule, which differs numerically from /1 engines",
         "modifications": crate::terrain_mods::method_record(),
         "lattice": "finest source by extent-derived cell size (ties: priority), union of source extents snapped outward; or a supplied grid. Pixel centres follow the export's 256-pixel tiles with recomputed tile pitch and pixel size",
@@ -211,10 +214,11 @@ impl Request {
                 )));
             }
             crate::terrain_mods::validate(&self.modification_layers)?;
-            crate::terrain_mods::RasVersion::parse(self.hecras_version.as_deref())?;
         } else {
             return Err(invalid(format!("schema must be {SCHEMA} or {SCHEMA_V1}")));
         }
+        // An unqualified release is refused under either schema, before any read.
+        crate::terrain_mods::RasVersion::parse(self.hecras_version.as_deref())?;
         if self.sources.is_empty() {
             return Err(invalid("at least one source is required"));
         }
@@ -944,7 +948,8 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
         "sample_seconds": sample_seconds,
         "export_tin": tin,
         "stitch_tin": {"supplied": req.stitch_tin.is_some(), "used": false},
-        "modifications": {"layers": mods, "seconds": mods_seconds},
+        "modifications": {"layers": mods, "seconds": mods_seconds,
+                          "hecras_version": req.hecras_version, "hecras_rule": version.rule()},
         "valid_pixels": valid,
         "seconds": started.elapsed().as_secs_f64(),
     });
