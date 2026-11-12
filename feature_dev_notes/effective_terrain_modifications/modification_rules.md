@@ -43,7 +43,7 @@ layer written as `Type=Channel` leaves the export equal to the base export).
 | Polygon with a control point inside, or with boundary elevations (gen = 1) from perimeter control points or a stored profile, Set / Hi / Lo / Add | Perimeter TIN. Profile: with gen = 1, the layer's points within Elev Pt Tolerance of the perimeter (at their nearest perimeter station, first per station); without such points the stored perimeter profile; with gen = 0 the constant Elevation Value. Douglas-Peucker filter at 0.01 ft (binary32). Perimeter points: the ring with the profile's stations injected and z from the profile; points before the first or after the last station interpolate across the ring start. TIN: the export TIN's Delaunay factory at 0.1 ft (binary32 widened): extent of perimeter and mass points (at least 10 x tolerance, 1:8) widened to three times the perimeter's extent, perimeter points, then the points inside the polygon as mass points, perimeter enforced (an edge that fails stops the enforcement, as in RAS Mapper), triangles touching the super polygon deleted and the deletion flooded across non-perimeter edges. Rasterized per output tile, combined over the cells holding the polygon's extent. | Synthetic: interior points 0 of 2,500; stored profile 2 of 4,080 at 1/32 ft; three perimeter points 0 of 1,225; one perimeter point 0 of 2,500; Add 0 of 2,500; real C: 7 boundary-elevation polygons, no difference; real D: 202 boundary-elevation polygon layers with perimeter control points, 3 px at 1/32 ft | supported |
 | Polygon with boundary elevations sampled from the terrain (gen = 1, no stored profile, no perimeter control point) | RAS Mapper samples each source raster and the terrain HDF's stored level-0 stitch TIN along the perimeter, without modifications, filtered at 0.01; not reproduced. | — | refused |
 | Polygon with shape Z | Vertex z storage not measured (a third point column makes RAS Mapper skip the layer). | — | refused |
-| Multi-part polygon (an interior ring or several parts), any elevation form | RAS Mapper does not keep holes. It joins the feature's parts into one ring for its perimeter TIN. Holes and islands are filled in every winding and overlapping parts are joined. Disjoint parts and a leading hole ring leave triangulation artefacts (filled wedges, missing notches) that depend on part order and placement. See below. | Bald Eagle copy, 6.6 and 7.0.1: even-odd fill differed by 70-467 px per case | **refused** in `validate`, before any read or write |
+| Multi-part polygon (an interior ring or several parts), any elevation form | RAS Mapper does not keep holes. It joins the feature's parts into one ring for its perimeter TIN. Holes and islands are filled in every winding and overlapping parts are joined. Disjoint parts and a leading hole ring leave triangulation artefacts (filled wedges, missing notches) that depend on part order and placement. See below. | Bald Eagle copy, 6.6 and 7.0.1: even-odd fill differed by 70-467 px per case | **refused** in `validate`, before any read or write; rare, such a terrain goes to RAS Mapper |
 | Ellipse / circle, any rotation | Output-tile pixel centre: circle (equal radii) distance <= radius; ellipse `(c dx + s dy)^2/rx^2 + (s dx - c dy)^2/ry^2 <= 1`, c, s = cos, sin(-rotation in degrees). **Inclusive.** A positive rotation turns the RadiusX axis **clockwise** in map view (y up). | A: 86 px, 0 diff; synthetic five ellipses (exact circle boundary, rotations 0, 30, -63.5, 90): 0 of 1,005; Bald Eagle copy, eight rotations, 6.6 and 7.0.1: 0 of 2,889 (see below) | supported |
 
 ## HEC-RAS 6.6 (`hecras_version: "6.6"`)
@@ -98,6 +98,14 @@ under both versions. It no longer draws holes that RAS Mapper does not draw.
 A polygon with a hole drawn natively in RAS Mapper was not tested. The refusal
 applies to the stored layout (more than one `Polygon Parts` entry for the
 feature), however the polygon was authored.
+
+This is a rare case. No terrain in the qualification corpora, the
+ras-commander writers or the engine fixtures is known to hold a multi-part
+modification polygon (ras-commander's writers emit one ring per feature).
+The project engineer decided on 2026-11-11 to refuse it rather than look
+further: a terrain holding one goes to RAS Mapper. ras-commander's
+`read_layers` refuses the form up front with a reason, so callers such as
+ras2cng route that terrain to the RAS Mapper export without asking the engine.
 
 | Ellipse rotation (degrees) | 0 | 30 | 90 | -30 | 45 | 150 | 120 | -63.5 |
 |---|---|---|---|---|---|---|---|---|
