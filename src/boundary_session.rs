@@ -37,6 +37,34 @@ pub struct Request {
     pub diagnostic_units: bool,
     #[serde(default)]
     pub additional_terrains: Vec<AdditionalTerrain>,
+    /// The GeoJSON `crs` name for a model in a CRS without an EPSG code
+    /// (`model.crs_geokeys`): the caller's WKT of that CRS (GDAL's or PROJ's
+    /// reading of the terrain), written verbatim. Required with
+    /// `crs_geokeys`, refused without; EPSG models keep `EPSG:<code>`.
+    #[serde(default)]
+    pub crs_wkt: Option<String>,
+}
+
+/// The GeoJSON `crs` name of a boundary request.
+fn crs_name(req: &Request) -> Result<(crate::crs::OutputCrs, String), MapError> {
+    let crs = crate::crs::OutputCrs::resolve(req.model.epsg, req.model.crs_geokeys.as_ref())?;
+    let name = match (&crs, &req.crs_wkt) {
+        (crate::crs::OutputCrs::Epsg(code), None) => format!("EPSG:{code}"),
+        (crate::crs::OutputCrs::GeoKeys(_), Some(wkt))
+            if !wkt.trim().is_empty() && wkt.len() <= 65_536 =>
+        {
+            wkt.clone()
+        }
+        (crate::crs::OutputCrs::GeoKeys(_), _) => {
+            return Err(invalid(
+                "a boundary model with crs_geokeys needs crs_wkt (at most 64 KiB) to label its GeoJSON",
+            ));
+        }
+        (crate::crs::OutputCrs::Epsg(_), Some(_)) => {
+            return Err(invalid("crs_wkt belongs to crs_geokeys models only"));
+        }
+    };
+    Ok((crs, name))
 }
 /// Original native source order; each source retains its own sample lattice.
 #[derive(Deserialize)]
@@ -646,16 +674,29 @@ fn composed_depth(
         .is_finite()
         .then_some(result.values.depth))
 }
+/// `crs_any` on a boundary record: GeoJSON labelled with the request's WKT.
+fn advertise_boundary(mut record: Value) -> Value {
+    crate::crs::advertise(&mut record);
+    record["output_crs_kinds"] = json!(["epsg", "wkt"]);
+    record["geojson_crs"] = json!(
+        "EPSG:<code>, or the request's crs_wkt verbatim for crs_geokeys models (legacy GeoJSON crs member, read by GDAL/OGR and pyproj)"
+    );
+    record
+}
 pub fn method_record() -> Value {
-    json!({"method_id":contour::METHOD_ID,"coordinate_precision":0.001,"native_vector_parity":false,"scope":"physical 2D cells; horizontal or plain corner sloping; deterministic zero-depth contours","differences":"stable ordered all-subject integer union; RASMapper polygons can differ in holes and quantized coordinates","depth_cutoff":0,"cell_wet_tolerance":0.001,"cell_wet_rule":"float32 cell WSE > float32(minimum elevation + 0.001); no per-pixel depth filtering"})
+    advertise_boundary(
+        json!({"method_id":contour::METHOD_ID,"coordinate_precision":0.001,"native_vector_parity":false,"scope":"physical 2D cells; horizontal or plain corner sloping; deterministic zero-depth contours","differences":"stable ordered all-subject integer union; RASMapper polygons can differ in holes and quantized coordinates","depth_cutoff":0,"cell_wet_tolerance":0.001,"cell_wet_rule":"float32 cell WSE > float32(minimum elevation + 0.001); no per-pixel depth filtering"}),
+    )
 }
 pub fn native_method_record() -> Value {
-    json!({"method_id":crate::boundary_native_contour::METHOD_ID,
+    advertise_boundary(
+        json!({"method_id":crate::boundary_native_contour::METHOD_ID,
         "coordinate_precision":0.001,"native_vector_parity":false,
         "native_parity_qualified":false,
         "scope":"ordered original terrain sources; plain 2D, stored XS and storage signed samples; explicit native serial ring order",
         "native_reference_order":"serial source/tile/stitch order",
-        "depth_cutoff":0,"unsupported":"terrain modifications, face options, encroachment, blocked polygons and ambiguous/fuzzy physical 2D stitch-point ownership"})
+        "depth_cutoff":0,"unsupported":"terrain modifications, face options, encroachment, blocked polygons and ambiguous/fuzzy physical 2D stitch-point ownership"}),
+    )
 }
 /// One bounded batch. The complete physical geometry and hydraulics remain global.
 pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
@@ -752,7 +793,8 @@ fn execute(req: &Request, base: &Path, out: &Path, report: &mut Value) -> Result
             "storage-area surfaces are not qualified for boundaries".into(),
         ));
     }
-    if m.epsg == 0
+    let (crs, crs_label) = crs_name(req)?;
+    if crs == crate::crs::OutputCrs::Epsg(0)
         || m.threads == 0
         || m.threads > 64
         || m.max_inflight_profiles == 0
@@ -899,10 +941,10 @@ fn execute(req: &Request, base: &Path, out: &Path, report: &mut Value) -> Result
         if !source_paths.insert(fs::canonicalize(&path)?) {
             return Err(invalid("duplicate original boundary terrain source"));
         }
-        let terrain = NativeTerrain::open(
+        let terrain = NativeTerrain::open_crs(
             path.to_str()
                 .ok_or_else(|| invalid("non-UTF8 terrain path"))?,
-            m.epsg,
+            &crs,
             identity,
             QueryConvention::PixelCenter,
             NodataPolicy::Dry,
@@ -1507,7 +1549,7 @@ fn execute(req: &Request, base: &Path, out: &Path, report: &mut Value) -> Result
                 })
                 .sum();
             let stats = json!({"polygon_count":polygon_count,"hole_count":hole_count,"vertex_count":vertex_count,"area":area,"hydraulic_seconds":hydraulic_seconds,"contour_seconds":contour_tick.elapsed().as_secs_f64(),"surface_worker_seconds":surface_worker_seconds,"contour_worker_seconds":contour_worker_seconds});
-            let product = json!({"type":"FeatureCollection","crs":{"type":"name","properties":{"name":format!("EPSG:{}",m.epsg)}},"features":[{"type":"Feature","properties":{"profile_id":profile.id,"interpolation":req.interpolation,"method_id":result.method_id,"native_vector_parity":false},"geometry":{"type":"MultiPolygon","coordinates":result.coordinates}}]});
+            let product = json!({"type":"FeatureCollection","crs":{"type":"name","properties":{"name":crs_label}},"features":[{"type":"Feature","properties":{"profile_id":profile.id,"interpolation":req.interpolation,"method_id":result.method_id,"native_vector_parity":false},"geometry":{"type":"MultiPolygon","coordinates":result.coordinates}}]});
             Ok((product, stats))
         };
         let products = pool.install(|| {

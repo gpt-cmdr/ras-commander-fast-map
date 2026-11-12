@@ -17,7 +17,13 @@ pub const MAX_THREADS: usize = 64;
 pub struct SessionRequest {
     pub schema: String,
     /// Declared CRS of every grid, sample and AOI bound. No reprojection is ever performed.
+    /// 0 or absent with `crs_geokeys`.
+    #[serde(default)]
     pub crs_epsg: u32,
+    /// The declared CRS as verbatim GeoKey tags, for a CRS without an EPSG code
+    /// (see [`crate::crs`]). Outputs are raw arrays; reports echo `output_crs`.
+    #[serde(default)]
+    pub crs_geokeys: Option<crate::crs::GeoKeys>,
     pub terrain: TerrainSpec,
     pub budgets: Budgets,
     pub products: Vec<Product>,

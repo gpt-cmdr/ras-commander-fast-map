@@ -571,7 +571,7 @@ pub fn check_crs(crs: &crate::crs::OutputCrs) -> Result<crate::crs::GeoKeys, Map
         }
         crate::crs::OutputCrs::GeoKeys(keys) => {
             keys.validate()?;
-            Ok((**keys).clone())
+            Ok(keys.written())
         }
     }
 }

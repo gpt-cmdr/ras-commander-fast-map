@@ -50,7 +50,12 @@ pub struct Request {
 #[serde(deny_unknown_fields)]
 pub struct TerrainSpec {
     pub path: String,
+    /// EPSG code of the terrain; 0 or absent with `crs_geokeys`.
+    #[serde(default)]
     pub epsg: u32,
+    /// Terrain CRS as verbatim GeoKey tags (see [`crate::crs`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crs_geokeys: Option<crate::crs::GeoKeys>,
     pub crs_identity: CrsIdentity,
 }
 
@@ -58,7 +63,14 @@ pub struct TerrainSpec {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceCrs {
     Terrain,
-    Epsg { code: u32 },
+    Epsg {
+        code: u32,
+    },
+    /// The caller's WKT of the source CRS, for a terrain that carries no CRS
+    /// of its own (`crs_identity` `untagged`) or one without an EPSG code.
+    Wkt {
+        wkt: String,
+    },
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -101,7 +113,13 @@ pub enum NudgeMethod {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Nudge {
+    /// Destination EPSG code; 0 or absent with `dst_wkt`.
+    #[serde(default)]
     pub dst_epsg: u32,
+    /// Destination CRS as WKT, for a destination without an EPSG code. The
+    /// engine writes raw arrays; the caller labels them with this CRS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst_wkt: Option<String>,
     pub error_threshold: f64,
     pub memory_limit_bytes: f64,
     pub method: NudgeMethod,
@@ -999,9 +1017,9 @@ impl<'a> Session<'a> {
         let tstr = tpath
             .to_str()
             .ok_or_else(|| MapError::Invalid("terrain path not UTF-8".into()))?;
-        let terrain = NativeTerrain::open(
+        let terrain = NativeTerrain::open_crs(
             tstr,
-            req.terrain.epsg,
+            &crate::crs::OutputCrs::resolve(req.terrain.epsg, req.terrain.crs_geokeys.as_ref())?,
             &req.terrain.crs_identity,
             QueryConvention::PixelCenter,
             NodataPolicy::RawValue,
@@ -1019,9 +1037,18 @@ impl<'a> Session<'a> {
                 .crs(),
             SourceCrs::Epsg { code } => terrio::crs::SpatialRef::parse(&format!("EPSG:{code}"))
                 .map_err(|e| MapError::Invalid(format!("source_crs: {e}")))?,
+            SourceCrs::Wkt { wkt } => wkt_crs(wkt, "source_crs")?,
         };
-        let dst_srs = terrio::crs::SpatialRef::parse(&format!("EPSG:{}", req.nudge.dst_epsg))
-            .map_err(|e| MapError::Invalid(format!("dst_epsg: {e}")))?;
+        let dst_srs = match (req.nudge.dst_epsg, &req.nudge.dst_wkt) {
+            (code, None) => terrio::crs::SpatialRef::parse(&format!("EPSG:{code}"))
+                .map_err(|e| MapError::Invalid(format!("dst_epsg: {e}")))?,
+            (0, Some(wkt)) => wkt_crs(wkt, "nudge.dst_wkt")?,
+            (_, Some(_)) => {
+                return Err(MapError::Invalid(
+                    "give either nudge.dst_epsg or nudge.dst_wkt, not both".into(),
+                ));
+            }
+        };
         let env = WarpEnv {
             src_srs_wkt: src_srs.to_wkt().unwrap_or_default(),
             dst_srs_wkt: dst_srs.to_wkt().unwrap_or_default(),
@@ -1465,8 +1492,24 @@ pub fn run_profile(s: &Session, p: &Profile, out: &Path) -> Result<Value, MapErr
     }))
 }
 
+/// A caller-declared CRS from WKT, refused when terrio cannot use it.
+fn wkt_crs(wkt: &str, field: &str) -> Result<terrio::crs::SpatialRef, MapError> {
+    if wkt.trim().is_empty() || wkt.len() > 65_536 {
+        return Err(MapError::Invalid(format!(
+            "{field}: empty or longer than 64 KiB"
+        )));
+    }
+    let crs = terrio::crs::SpatialRef::from_wkt(wkt.trim());
+    if crs.is_unknown() || crs.to_wkt().is_none() {
+        return Err(MapError::Unsupported(format!(
+            "{field}: terrio cannot read this WKT"
+        )));
+    }
+    Ok(crs)
+}
+
 pub fn method_record() -> Value {
-    json!({
+    let mut record = json!({
         "method_version": METHOD,
         "upstream": "andycarter-pe/ras2fim-2d @3146f647 generate_depth_wsel_rasters_mp_05.py",
         "axes": "exact caller-supplied np.arange query axes; never x0 + i*res; raster affine separate",
@@ -1477,7 +1520,11 @@ pub fn method_record() -> Value {
         "nudge": "terrio 0.4.2 native warp, nearest, explicit dest grid, approximate transformer (error_threshold), GDAL-style chunks (memory_limit); lookup = same-config f32 index warp in 24-bit passes",
         "aoi": "selects destination pixels only; global inputs, grid and chunks unchanged; output = crop(full) by construction; optional caller polygon mask",
         "not_in_engine": ["sample preparation", "Qhull/SciPy Delaunay", "wet union rasterization", "dest grid derivation", "product 11"]
-    })
+    });
+    crate::crs::advertise(&mut record);
+    record["source_crs_kinds"] = json!(["terrain", "epsg", "wkt"]);
+    record["dst_crs_kinds"] = json!(["epsg", "wkt"]);
+    record
 }
 
 fn profile_result(r: Result<Value, MapError>, p: &Profile) -> Value {
@@ -1684,6 +1731,7 @@ mod tests {
         let env = test_env();
         let n = Nudge {
             dst_epsg: 3857,
+            dst_wkt: None,
             error_threshold: 0.125,
             memory_limit_bytes: 64.0 * 1024.0 * 1024.0,
             method: NudgeMethod::Lookup,
@@ -1766,6 +1814,7 @@ mod tests {
         };
         let mut n = Nudge {
             dst_epsg: 3857,
+            dst_wkt: None,
             error_threshold: 0.125,
             memory_limit_bytes: 1.0,
             method: NudgeMethod::Lookup,

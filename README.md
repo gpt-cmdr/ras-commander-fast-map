@@ -636,12 +636,13 @@ reproduced), so a native mosaic is unqualified.
 
 ## Any CRS (verbatim GeoKeys)
 
-`effective_terrain`, `sloping` (both schemas), `horizontal` and the 1D/coupled
-`final_format` delivery accept a CRS with no EPSG code, such as ESRI:102630
-(NAD83 / Alabama West, US survey feet). They advertise `crs_any: true`,
-`crs_identity_kinds` and `output_crs_kinds` on their method records (the 1D
-and coupled records on `native_final_format`). Other methods still require an
-EPSG code.
+Every method accepts a CRS with no EPSG code, such as ESRI:102630 (NAD83 /
+Alabama West, US survey feet), and advertises `crs_any: true`,
+`crs_identity_kinds` and `output_crs_kinds` on its method record:
+effective terrain, sloping (both schemas), horizontal, whole-simulation
+products, depth groups, boundaries (legacy and native), the batch session,
+Step05, storage, and the 1D and coupled methods (also on
+`native_final_format`).
 
 Such a request gives `crs_geokeys` instead of `epsg` (`epsg` is then 0 or
 absent; giving both is refused):
@@ -679,10 +680,29 @@ The terrain identity is checked before any read:
 
 The keys are checked only as a georeferencing model. They must be a
 well-formed directory with a projected, geographic or user-defined
-`GTModelTypeGeoKey`, PixelIsArea (or no raster type), and values stored in the
-double and ASCII tags. Reports (effective terrain, sloping, its
-`physical_ownership`, horizontal, 1D/coupled delivery) give `output_crs:
-{"kind": "geokeys", "fnv1a64": ...}`; depth groups refuse `crs_geokeys`. An effective-terrain request with `epsg: 0` and no keys is now
+`GTModelTypeGeoKey`, with values in the directory itself (location 34735, after
+the entries), the double tag or the ASCII tag. Raster type PixelIsPoint is
+accepted: every writer places the tie point at the outer pixel corner, so that
+one key is written as PixelIsArea, with the area geotransform GDAL derives from
+the source. The CRS keys are unchanged. Reports (effective terrain, sloping, its
+`physical_ownership`, horizontal, the batch session, 1D/coupled delivery, depth
+group metadata) give `output_crs: {"kind": "geokeys", "fnv1a64": ...}`; the
+fingerprint is of the keys as written.
+
+Per method, for a CRS without an EPSG code:
+
+| Method | Request | Output label |
+| --- | --- | --- |
+| Effective terrain, sloping, `final_format` | `crs_geokeys` | GeoKey tags in the GeoTIFF |
+| Horizontal, whole simulation, batch session (`crs_geokeys` beside `crs_epsg`), storage, 1D, coupled | `crs_geokeys` (terrain identity) | raw arrays; the caller labels them |
+| Depth groups | `model.crs_geokeys` and `crs_wkt` | GeoTIFF groups: GeoKey tags; group metadata `crs_wkt`: the request's WKT, verbatim, with `crs_geokeys` |
+| Boundaries | `model.crs_geokeys` and `crs_wkt` | GeoJSON `crs` member `{"type": "name", "properties": {"name": <crs_wkt>}}`, verbatim |
+| Step05 | `terrain.crs_geokeys`; `source_crs` `{"kind": "wkt", "wkt": ...}` for an untagged terrain; `nudge.dst_wkt` instead of `dst_epsg` | raw arrays in the destination CRS; the caller labels them |
+
+`crs_wkt` should be GDAL's (or PROJ's) WKT of the terrain CRS, as rasterio
+reads it. RFC 7946 GeoJSON has no `crs` member; the legacy member carries the
+WKT, which GDAL/OGR and pyproj read. EPSG requests keep `EPSG:<code>`, and their
+outputs are byte-identical to 0.18.0. An effective-terrain request with `epsg: 0` and no keys is now
 refused: older engines wrote `ProjectedCSTypeGeoKey 0`, which GDAL reads as a
 local CRS in metres.
 

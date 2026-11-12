@@ -33,6 +33,13 @@
   API: `crs` module, `NativeTerrain::open_crs`,
   `effective_terrain::write_geotiff_crs`, `final_tiff::{write_crs, check_crs,
   Writer::create_crs}`.
+- **Any CRS on every method.** Depth groups (GeoTIFF keys; buffer metadata
+  `crs_wkt` from the request), boundaries (GeoJSON `crs` name = request
+  `crs_wkt`), the batch session (`crs_geokeys`), Step05 (terrain
+  `crs_geokeys`, `source_crs` `wkt`, `nudge.dst_wkt`), whole simulation,
+  storage, 1D and coupled methods advertise `crs_any`. PixelIsPoint keys are
+  accepted (written PixelIsArea; CRS keys unchanged) and keys stored in the
+  directory are copied with it.
 - **Effective terrain refuses `epsg: 0` without `crs_geokeys`.** Earlier
   engines accepted it and labelled the output `ProjectedCSTypeGeoKey 0`, which
   GDAL reads as a local CRS in metres.

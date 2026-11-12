@@ -32,6 +32,24 @@ pub fn engine_method_record() -> serde_json::Value {
         "whole_simulation": crate::whole_simulation::method_record(),
         "effective_terrain": crate::effective_terrain::method_record()
     });
+    // Methods whose own outputs are CRS-free raw arrays or whose terrain and
+    // delivery fields already take crs_geokeys: the caller's CRS (any) is
+    // carried unchanged (see `crs`).
+    for key in [
+        "storage",
+        "coupled_diagnostic",
+        "coupled_native_grid_diagnostic",
+        "coupled_storage_diagnostic",
+        "one_d_diagnostic",
+        "one_d_native_diagnostic",
+        "one_d_clipped_diagnostic",
+        "one_d_clipped_native_grid_diagnostic",
+        "whole_simulation",
+    ] {
+        if registry[key].is_object() {
+            crate::crs::advertise(&mut registry[key]);
+        }
+    }
     let specifications = [
         (
             "sloping_native_grid",

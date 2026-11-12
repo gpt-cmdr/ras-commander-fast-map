@@ -14,9 +14,13 @@
 //! is converted to GeoKeys here, so no CRS is re-encoded or approximated.
 //!
 //! Only the georeferencing model is checked ([`GeoKeys::validate`]): the
-//! directory must be well formed, name a projected, geographic or
-//! user-defined model, and declare pixels as areas (or not declare them), as
-//! every engine writer places the tie point at the outer pixel corner.
+//! directory must be well formed and name a projected, geographic or
+//! user-defined model. Every engine writer places the tie point at the outer
+//! pixel corner, so a source declaring PixelIsPoint (`GTRasterTypeGeoKey` 2)
+//! is written with that one key set to PixelIsArea ([`GeoKeys::written`]):
+//! the raster type is not part of the CRS, and the written geotransform is
+//! the area geotransform GDAL derives from the source. Keys stored in the
+//! directory itself (location 34735) are copied with it.
 use crate::MapError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -120,8 +124,10 @@ impl GeoKeys {
         }
     }
 
+    /// The key entries: the `n` of the header, not values stored after them.
     fn entries(&self) -> impl Iterator<Item = &[u16]> {
-        self.directory.get(4..).unwrap_or(&[]).chunks(4)
+        let n = self.directory.get(3).map_or(0, |n| usize::from(*n));
+        self.directory.get(4..4 + 4 * n).unwrap_or(&[]).chunks(4)
     }
 
     /// `(location, count, value or offset)` of key `id`.
@@ -147,7 +153,8 @@ impl GeoKeys {
             ));
         }
         let n = usize::from(d[3]);
-        if n == 0 || n > MAX_KEYS || d.len() != 4 + 4 * n {
+        // Values stored in the directory itself (location 34735) follow the entries.
+        if n == 0 || n > MAX_KEYS || d.len() < 4 + 4 * n || d.len() > 4 + 8 * MAX_KEYS {
             return Err(bad("directory length does not match its key count"));
         }
         if self.doubles.len() > MAX_DOUBLES || self.ascii.len() > MAX_ASCII {
@@ -168,6 +175,7 @@ impl GeoKeys {
             last = Some(id);
             let ok = match loc {
                 0 => count == 1,
+                GEO_KEY_DIRECTORY => count >= 1 && off >= 4 + 4 * n && off + count <= d.len(),
                 GEO_DOUBLE_PARAMS => count >= 1 && off + count <= self.doubles.len(),
                 GEO_ASCII_PARAMS => count >= 1 && off + count <= self.ascii.len(),
                 _ => false,
@@ -196,12 +204,34 @@ impl GeoKeys {
                 )));
             }
         }
-        if self.key(1025).is_some_and(|k| k != (0, 1, 1)) {
+        if self
+            .key(1025)
+            .is_some_and(|k| k != (0, 1, 1) && k != (0, 1, 2))
+        {
             return Err(bad(
-                "GTRasterTypeGeoKey (1025) must be PixelIsArea (1) or absent: engine products are pixel areas",
+                "GTRasterTypeGeoKey (1025) must be PixelIsArea (1), PixelIsPoint (2) or absent",
             ));
         }
         Ok(())
+    }
+
+    /// The keys engine writers store: these keys with `GTRasterTypeGeoKey`
+    /// PixelIsPoint (2) written as PixelIsArea (1), since every writer places
+    /// the tie point at the outer pixel corner. Otherwise unchanged.
+    pub fn written(&self) -> GeoKeys {
+        let mut out = self.clone();
+        let n = out.directory.get(3).map_or(0, |n| usize::from(*n));
+        for k in out
+            .directory
+            .get_mut(4..4 + 4 * n)
+            .unwrap_or(&mut [])
+            .chunks_mut(4)
+        {
+            if k.len() == 4 && k[0] == 1025 && k[1] == 0 && k[3] == 2 {
+                k[3] = 1;
+            }
+        }
+        out
     }
 
     /// FNV-1a 64 of the three tags' little-endian payloads (ASCII with its NUL),
@@ -262,7 +292,9 @@ impl OutputCrs {
     pub fn echo(&self) -> Value {
         match self {
             Self::Epsg(code) => json!({"kind": "epsg", "code": code}),
-            Self::GeoKeys(keys) => json!({"kind": "geokeys", "fnv1a64": keys.fnv1a64()}),
+            Self::GeoKeys(keys) => {
+                json!({"kind": "geokeys", "fnv1a64": keys.written().fnv1a64()})
+            }
         }
     }
 }
@@ -283,7 +315,8 @@ pub fn capability() -> Value {
         "source": "the GeoKey tags of a GeoTIFF in the CRS, as `terrain-info` prints them (`geokeys`)",
         "written": "GeoKeyDirectoryTag, GeoDoubleParamsTag and GeoAsciiParamsTag copied verbatim; no WKT or PROJ conversion",
         "terrain_identity": "crs_identity geokeys: the terrain's own GeoKey tags equal crs_geokeys exactly; untagged: the terrain carries no CRS at all (RAS Mapper terrain sources in a CRS without an EPSG code) and crs_geokeys declares it; caller_verified_wkt: the pinned WKT hash as before; epsg: refused with crs_geokeys",
-        "refused": "a directory without a projected, geographic or user-defined model, PixelIsPoint, or keys stored outside the double/ASCII tags"
+        "raster_type": "PixelIsPoint sources are written PixelIsArea with GDAL's area geotransform; the CRS keys are unchanged",
+        "refused": "a directory without a projected, geographic or user-defined model, or keys stored outside the directory, double and ASCII tags"
     })
 }
 
@@ -474,6 +507,7 @@ pub fn read_geokeys(path: &Path) -> Result<Option<GeoKeys>, MapError> {
 /// data, other tags and later directories are unchanged.
 pub fn insert_geokeys(path: &Path, keys: &GeoKeys) -> Result<(), MapError> {
     keys.validate()?;
+    let keys = &keys.written();
     let (mut r, first) = Reader::open(path, true)?;
     let (mut entries, next) = r.ifd(first)?;
     if entries
@@ -631,13 +665,19 @@ mod tests {
             f(&mut k);
             assert!(k.validate().is_err());
         };
-        refuse(&|k| k.directory[3] = 17);
+        refuse(&|k| k.directory[3] = 19);
         refuse(&|k| k.directory[0] = 2);
         refuse(&|k| k.doubles.truncate(6));
         refuse(&|k| k.ascii.truncate(50));
         refuse(&|k| k.doubles[0] = f64::NAN);
-        // PixelIsPoint.
-        refuse(&|k| k.directory[11] = 2);
+        // An unknown raster type.
+        refuse(&|k| k.directory[11] = 3);
+        // A key stored in the directory itself, out of range.
+        refuse(&|k| {
+            k.directory
+                .splice(72..76, [3092, 34735, 2, 76])
+                .for_each(drop)
+        });
         // Model type 0 and a local CRS without the projected key.
         refuse(&|k| k.directory[7] = 0);
         refuse(&|k| {
@@ -646,6 +686,26 @@ mod tests {
         // Keys out of order.
         refuse(&|k| k.directory.swap(4, 8));
         refuse(&|k| k.ascii.push('\u{e9}'));
+    }
+
+    #[test]
+    fn point_sources_are_written_as_areas_and_directory_keys_are_kept() {
+        let mut point = alabama_west();
+        point.directory[11] = 2;
+        point.validate().unwrap();
+        let written = point.written();
+        assert_eq!(written, alabama_west());
+        assert_ne!(point.fnv1a64(), written.fnv1a64());
+        // ProjCoordTransGeoKey stored in the directory (location 34735).
+        let mut inline = alabama_west();
+        inline.directory[3] = 19;
+        inline.directory.extend([4099, 34735, 1, 4 + 19 * 4, 9001]);
+        inline.validate().unwrap();
+        // Its value must lie after the entries, inside the directory.
+        let mut bad = inline.clone();
+        bad.directory[79] = 7;
+        assert!(bad.validate().is_err());
+        assert_eq!(inline.written(), inline);
     }
 
     #[test]

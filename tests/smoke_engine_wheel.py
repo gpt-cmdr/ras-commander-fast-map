@@ -352,6 +352,27 @@ def main():
                         want[0, 1] = np.nan
                     np.testing.assert_array_equal(got, want)
         print("Installed wheel: Step05 shared-terrain batch, bbox and polygon mask PASS")
+        # The same Step05 batch on the same pixels in ESRI:102630 (no EPSG code):
+        # terrain by verbatim GeoKeys, destination by WKT. Bit-identical arrays.
+        esri = root / "terrain-step05-esri.tif"
+        with rasterio.open(esri, "w", driver="GTiff", width=8, height=8, count=1,
+                           dtype="float32", crs="ESRI:102630",
+                           transform=Affine(1, 0, 0, 0, -1, 8), nodata=-9999) as ds:
+            ds.write(np.full((8, 8), 100, dtype=np.float32), 1)
+            wkt = ds.crs.to_wkt()
+        info = json.loads(subprocess.check_output([engine, "terrain-info", str(esri)], text=True))
+        request["terrain"] = {"path": str(esri), "crs_geokeys": info["geokeys"],
+                              "crs_identity": {"kind": "geokeys"}}
+        request["nudge"] = dict(request["nudge"], dst_epsg=0, dst_wkt=wkt)
+        rp.write_text(json.dumps(request))
+        esri_out = root / "out-esri"
+        result = subprocess.run([engine, "step05", str(rp), str(esri_out)])
+        if result.returncode:
+            raise AssertionError((esri_out / "report.json").read_text())
+        for path in (out / "units").rglob("*.f32"):
+            other = esri_out / path.relative_to(out)
+            assert path.read_bytes() == other.read_bytes(), path
+        print("Installed wheel: Step05 on ESRI:102630 (GeoKeys terrain, WKT destination) PASS")
 
 
 if __name__ == "__main__":

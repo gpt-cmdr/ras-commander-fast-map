@@ -334,7 +334,7 @@ fn crs_refusals_happen_before_outputs() {
     );
     // PixelIsPoint keys are refused.
     let mut point = alabama_west();
-    point.directory[11] = 2;
+    point.directory[11] = 3;
     assert!(
         refused(
             "tagged.tif",
@@ -498,36 +498,7 @@ fn sloping_refuses_a_label_other_than_the_terrain_keys() {
         .unwrap()
         .to_string();
     assert!(error.contains("must be decimal strings"), "{error}");
-    // Depth groups (EPSG only) refuse the keys before any output.
-    let mut plain = sloping_model(&dir.0, true);
-    for flag in ["stream_outputs", "geotiff_outputs"] {
-        plain.as_object_mut().unwrap().remove(flag);
-    }
-    let mut groups: ras_commander_fast_map::depth_groups::Request = serde_json::from_value(
-        json!({"schema": ras_commander_fast_map::depth_groups::SCHEMA,
-            "model": plain, "source_indices": [0, 1],
-            "depth_units": "feet", "depth_cutoff_ft": 0.0, "max_accumulator_bytes": 0,
-            "compression": "NONE", "scratch": {"path": dir.0.to_str().unwrap(),
-                "node_local": true, "max_bytes": 1024},
-            "jobs": [{"job_id": "j", "reach_id": "r", "window": [0, 0, 4, 4],
-                "groups": [{"group_id": "g", "timesteps": [0]}]}]}),
-    )
-    .unwrap();
-    assert!(
-        groups
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("EPSG code")
-    );
-    groups.model.crs_geokeys = None;
-    groups.model.epsg = 2277;
-    let other = groups
-        .validate()
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
-    assert!(!other.contains("crs_geokeys"), "{other}");
+
     let mut model = sloping_model(&dir.0, true);
     model["crs_identity"] = json!({"kind": "epsg"});
     let req: sloping_session::Request = serde_json::from_value(model).unwrap();
@@ -610,32 +581,242 @@ fn one_d_final_delivery_writes_keys() {
 }
 
 #[test]
-fn capability_is_advertised_only_where_supported() {
+fn capability_is_advertised_on_every_method() {
     let record = engine_method_record();
     for method in [
         "effective_terrain",
         "sloping",
         "sloping_native_grid",
         "horizontal",
-    ] {
-        assert_eq!(record[method]["crs_any"], true, "{method}");
-        assert!(
-            record[method]["crs_identity_kinds"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("untagged")),
-            "{method}"
-        );
-    }
-    for method in [
-        "step05_r2",
         "depth_groups",
         "boundary",
         "native_boundary",
         "batch_session_r1",
+        "step05_r2",
         "whole_simulation",
         "storage",
+        "coupled_diagnostic",
+        "coupled_storage_diagnostic",
+        "one_d_clipped_diagnostic",
     ] {
-        assert!(record[method].get("crs_any").is_none(), "{method}");
+        assert_eq!(record[method]["crs_any"], true, "{method}");
     }
+    assert_eq!(
+        record["native_boundary"]["output_crs_kinds"],
+        json!(["epsg", "wkt"])
+    );
+    assert_eq!(record["step05_r2"]["dst_crs_kinds"], json!(["epsg", "wkt"]));
+}
+
+const ESRI_WKT: &str = "PROJCS[\"NAD_1983_StatePlane_Alabama_West_FIPS_0102_Feet\",GEOGCS[\"NAD83\",DATUM[\"North_American_Datum_1983\",SPHEROID[\"GRS 1980\",6378137,298.257222101]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]],PROJECTION[\"Transverse_Mercator\"],PARAMETER[\"latitude_of_origin\",30],PARAMETER[\"central_meridian\",-87.5],PARAMETER[\"scale_factor\",0.999933333333333],PARAMETER[\"false_easting\",1968500],PARAMETER[\"false_northing\",0],UNIT[\"US survey foot\",0.304800609601219],AXIS[\"Easting\",EAST],AXIS[\"Northing\",NORTH],AUTHORITY[\"ESRI\",\"102630\"]]";
+
+/// A storage-only boundary request over a 4 x 4 terrain (as in `boundary_session`).
+fn boundary_request(dir: &Path, keys: bool) -> Value {
+    let g = Grid {
+        origin_x: 0.,
+        origin_y: 4.,
+        cell_size: 1.,
+        width: 4,
+        height: 4,
+    };
+    let crs = if keys {
+        OutputCrs::GeoKeys(alabama_west().into())
+    } else {
+        OutputCrs::Epsg(2227)
+    };
+    effective_terrain::write_geotiff_crs(
+        &dir.join("terrain.tif"),
+        effective(g, vec![0.; 16]),
+        &crs,
+    )
+    .unwrap();
+    fs::write(dir.join("mask"), vec![1u8; 65536]).unwrap();
+    fs::write(dir.join("perimeter"), (-9999f32).to_le_bytes().repeat(513)).unwrap();
+    fs::write(dir.join("levels"), 1f32.to_le_bytes()).unwrap();
+    let mut polygon = vec![1u8];
+    for n in [3u32, 1, 5] {
+        polygon.extend(n.to_le_bytes());
+    }
+    for p in [[0.0f64, 0.0f64], [0., 4.], [4., 4.], [4., 0.], [0., 0.]] {
+        polygon.extend(le(&p, f64::to_le_bytes));
+    }
+    let mut geometry = (polygon.len() as u32).to_le_bytes().to_vec();
+    geometry.extend(polygon);
+    fs::write(dir.join("storage.wkb"), geometry).unwrap();
+    let mut v = json!({"schema":"ras-commander-boundary-request/2", "interpolation":"sloping",
+        "contour_method":"rasmapper-serial-zero-depth-contours/1",
+        "model":{"schema":"ras-commander-sloping-request/1", "terrain":"terrain.tif",
+            "terrain_transform":[0,1,0,4,0,-1], "window":[0,0,4,4],
+            "geometry_file":"unused", "mesh_files":[], "owner_cells":[], "storage_areas_file":"storage.wkb",
+            "storage_area_count":1, "profiles":[{"id":"a", "values_files":[], "storage_area_values_file":"levels"}],
+            "threads":1, "max_inflight_profiles":1, "max_working_bytes":134217728},
+        "terrain_metadata":{"shape":[4,4], "transform":[0,1,0,4,0,-1], "tile_shape":[256,256],
+            "tile_grid":[1,1], "selected_tiles":[0], "mask":{"path":"mask", "dtype":"|u1", "shape":[1,65536]},
+            "perimeter":{"path":"perimeter", "dtype":"<f4", "shape":[1,513]}}});
+    if keys {
+        v["model"]["crs_geokeys"] = keys_json();
+        v["model"]["crs_identity"] = json!({"kind": "geokeys"});
+        v["crs_wkt"] = ESRI_WKT.into();
+    } else {
+        v["model"]["epsg"] = 2227.into();
+        v["model"]["crs_identity"] = json!({"kind": "epsg"});
+    }
+    v
+}
+
+#[test]
+fn boundary_geojson_names_the_request_wkt_and_keeps_epsg() {
+    use ras_commander_fast_map::boundary_session;
+    let (k, e) = (scratch(), scratch());
+    let run = |dir: &Path, keys: bool| {
+        let req: boundary_session::Request =
+            serde_json::from_value(boundary_request(dir, keys)).unwrap();
+        boundary_session::run(&req, dir, &dir.join("out")).unwrap();
+        serde_json::from_slice::<Value>(&fs::read(dir.join("out").join("a.geojson")).unwrap())
+            .unwrap()
+    };
+    let (kp, ep) = (run(&k.0, true), run(&e.0, false));
+    assert_eq!(kp["crs"]["properties"]["name"], ESRI_WKT);
+    assert_eq!(ep["crs"]["properties"]["name"], "EPSG:2227");
+    assert_eq!(kp["features"], ep["features"]);
+    // crs_wkt is required with crs_geokeys and refused without.
+    for (keys, drop_wkt, add_wkt) in [(true, true, false), (false, false, true)] {
+        let dir = scratch();
+        let mut v = boundary_request(&dir.0, keys);
+        if drop_wkt {
+            v.as_object_mut().unwrap().remove("crs_wkt");
+        }
+        if add_wkt {
+            v["crs_wkt"] = ESRI_WKT.into();
+        }
+        let req: boundary_session::Request = serde_json::from_value(v).unwrap();
+        let error = boundary_session::run(&req, &dir.0, &dir.0.join("out")).unwrap_err();
+        assert!(error.to_string().contains("crs_wkt"), "{error}");
+    }
+}
+
+fn groups_request(dir: &Path, keys: bool, sink: &str) -> Value {
+    let mut model = sloping_model(dir, keys);
+    for flag in ["stream_outputs", "geotiff_outputs"] {
+        model.as_object_mut().unwrap().remove(flag);
+    }
+    let mut v = json!({"schema": ras_commander_fast_map::depth_groups::SCHEMA, "model": model,
+        "source_indices": [0, 1], "depth_units": "feet", "depth_cutoff_ft": 0.0,
+        "max_accumulator_bytes": 1u64 << 20, "compression": "LZW", "sink": sink,
+        "jobs": [{"job_id": "j", "reach_id": "r", "window": [0, 0, 4, 4],
+            "groups": [{"group_id": "g", "timesteps": [1, 0]}]}]});
+    if keys {
+        v["crs_wkt"] = ESRI_WKT.into();
+    }
+    v
+}
+
+#[test]
+fn depth_groups_carry_the_keys_and_the_request_wkt() {
+    use ras_commander_fast_map::depth_groups;
+    let (k, e) = (scratch(), scratch());
+    let run = |dir: &Path, keys: bool| {
+        let req: depth_groups::Request =
+            serde_json::from_value(groups_request(dir, keys, "grouped-geotiff")).unwrap();
+        depth_groups::run(&req, dir, &dir.join("out")).unwrap()
+    };
+    let (kr, er) = (run(&k.0, true), run(&e.0, false));
+    let (kt, et) = (k.0.join("out/j/g.tif"), e.0.join("out/j/g.tif"));
+    assert_alabama_west(&kt);
+    assert_eq!(
+        read_geokeys(&et).unwrap(),
+        Some(GeoKeys::from_epsg(2277, false))
+    );
+    assert_eq!(pixels(&kt), pixels(&et));
+    let (kt, et) = (kr.to_string(), er.to_string());
+    assert!(
+        kt.contains(&serde_json::to_string(ESRI_WKT).unwrap()),
+        "{kt}"
+    );
+    assert!(kt.contains(&alabama_west().fnv1a64()));
+    assert!(!et.contains("NAD_1983_StatePlane_Alabama") && !et.contains(&alabama_west().fnv1a64()));
+    // A model with keys needs crs_wkt; an EPSG model refuses it.
+    let dir = scratch();
+    let mut v = groups_request(&dir.0, true, "grouped-geotiff");
+    v.as_object_mut().unwrap().remove("crs_wkt");
+    let req: depth_groups::Request = serde_json::from_value(v).unwrap();
+    assert!(req.validate().unwrap_err().to_string().contains("crs_wkt"));
+    let mut v = groups_request(&dir.0, false, "grouped-geotiff");
+    v["crs_wkt"] = ESRI_WKT.into();
+    let req: depth_groups::Request = serde_json::from_value(v).unwrap();
+    assert!(req.validate().unwrap_err().to_string().contains("crs_wkt"));
+}
+
+#[test]
+fn batch_session_samples_a_geokeys_terrain_like_its_epsg_twin() {
+    use ras_commander_fast_map::{model::SessionRequest, session};
+    let g = Grid {
+        origin_x: 0.,
+        origin_y: 100.,
+        cell_size: 1.,
+        width: 100,
+        height: 100,
+    };
+    let values: Vec<f32> = (0..10_000)
+        .map(|i| 95.0 + (i % 97) as f32 * 0.0625)
+        .collect();
+    let (k, e) = (scratch(), scratch());
+    let mut outputs = Vec::new();
+    for (dir, keys) in [(&k.0, true), (&e.0, false)] {
+        let crs = if keys {
+            OutputCrs::GeoKeys(alabama_west().into())
+        } else {
+            OutputCrs::Epsg(2277)
+        };
+        effective_terrain::write_geotiff_crs(
+            &dir.join("terrain.tif"),
+            effective(g, values.clone()),
+            &crs,
+        )
+        .unwrap();
+        let (n, step) = (9usize, 10.0);
+        let samples: Vec<Value> = (0..n * n)
+            .map(|i| {
+                json!([
+                    (i % n) as f64 * step,
+                    (i / n) as f64 * step,
+                    100.0 + 0.01 * i as f64
+                ])
+            })
+            .collect();
+        let mut simplices = Vec::new();
+        for j in 0..n - 1 {
+            for i in 0..n - 1 {
+                let a = j * n + i;
+                simplices.push(json!([a, a + 1, a + n + 1]));
+                simplices.push(json!([a, a + n + 1, a + n]));
+            }
+        }
+        let mut v = json!({"schema": "ras2fim-batch-session/1",
+            "terrain": {"mode": "native_geotiff", "path": "terrain.tif", "query": "pixel_center",
+                "nodata_policy": "dry"},
+            "budgets": {"threads": 2, "max_cache_bytes": 1u64 << 24, "max_inflight_profiles": 1,
+                "max_profile_bytes": 1u64 << 28, "output_tile": 16, "max_tiles_in_flight": 4},
+            "products": ["wse", "depth"],
+            "profiles": [{"id": "p", "source": {"kind": "inline", "samples": samples, "simplices": simplices,
+                "grid": {"kind": "explicit", "width": 40, "height": 30, "x0": 0.5, "y0": 0.5, "dx": 1.2, "dy": 1.2},
+                "mask_all_wet": true}}],
+            "aois": [{"id": "full"}], "error_policy": "fail_fast"});
+        if keys {
+            v["crs_geokeys"] = keys_json();
+            v["terrain"]["crs_identity"] = json!({"kind": "geokeys"});
+        } else {
+            v["crs_epsg"] = 2277.into();
+            v["terrain"]["crs_identity"] = json!({"kind": "epsg"});
+        }
+        let req: SessionRequest = serde_json::from_value(v).unwrap();
+        let report = session::run(&req, dir, &dir.join("out")).unwrap();
+        assert_eq!(report["status"], "complete", "{report}");
+        assert_eq!(report.get("output_crs").is_some(), keys);
+        outputs.push(
+            ["wse", "depth"]
+                .map(|p| fs::read(dir.join("out/units/p/full").join(format!("{p}.bin"))).unwrap()),
+        );
+    }
+    assert_eq!(outputs[0], outputs[1]);
 }

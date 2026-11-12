@@ -57,6 +57,12 @@ pub struct Request {
     pub max_accumulator_bytes: u64,
     #[serde(default)]
     pub scratch: Option<Scratch>,
+    /// For a model in a CRS without an EPSG code (`model.crs_geokeys`): the
+    /// caller's WKT of that CRS, given verbatim as the group metadata's
+    /// `crs_wkt` (GeoTIFF groups carry the GeoKey tags themselves). Required
+    /// with `crs_geokeys`, refused without.
+    #[serde(default)]
+    pub crs_wkt: Option<String>,
 }
 fn cutoff_default() -> f64 {
     0.5
@@ -93,14 +99,18 @@ pub struct Group {
 }
 
 pub fn method_record() -> Value {
-    json!({"method_id":METHOD,"request_schema":SCHEMA,"report_schema":REPORT_SCHEMA,
+    let mut record = json!({"method_id":METHOD,"request_schema":SCHEMA,"report_schema":REPORT_SCHEMA,
         "sinks":["grouped-geotiff","grouped-buffer"],"compression":["NONE","LZW"],
         "products":["depth_max"],"render_modes":["sloping"],"saved_timesteps_only":true,
         "aoi_mask":crate::aoi::METHOD,"local_spill":true,"max_inflight_profiles":1,
         "buffer_protocol":"ras-commander-depth-group-buffer/1",
         "staged_cells":crate::sloping_binary::STAGED_METHOD,
         "hydraulic_qualification":"native-per-time-depth-reduction/prepared-2d-component/1",
-        "qualification_scope":"3 saved private mixed-fixture profiles, physical 2D component, inclusive 0.5 ft cutoff, full/cropped windows, ordered/reverse/single groups, resident NONE and local-spill LZW; not native Max-WSE rendering"})
+        "qualification_scope":"3 saved private mixed-fixture profiles, physical 2D component, inclusive 0.5 ft cutoff, full/cropped windows, ordered/reverse/single groups, resident NONE and local-spill LZW; not native Max-WSE rendering"});
+    crate::crs::advertise(&mut record);
+    record["crs_wkt"] =
+        json!("required with model.crs_geokeys: the group metadata crs_wkt, verbatim");
+    record
 }
 
 fn budget(what: &str, required: u64, allowed: u64) -> MapError {
@@ -125,11 +135,21 @@ fn pixels(job: &Job) -> Result<usize, MapError> {
 
 impl Request {
     pub fn validate(&self) -> Result<f32, MapError> {
-        if self.model.crs_geokeys.is_some() {
-            return Err(MapError::Unsupported(
-                "depth groups need an EPSG code; crs_geokeys is not supported here".into(),
-            ));
+        match (self.model.crs_geokeys.is_some(), &self.crs_wkt) {
+            (true, Some(wkt)) if !wkt.trim().is_empty() && wkt.len() <= 65_536 => {}
+            (true, _) => {
+                return Err(MapError::Invalid(
+                    "a depth-groups model with crs_geokeys needs crs_wkt (at most 64 KiB)".into(),
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(MapError::Invalid(
+                    "crs_wkt belongs to crs_geokeys models only".into(),
+                ));
+            }
+            (false, None) => {}
         }
+        crate::crs::OutputCrs::resolve(self.model.epsg, self.model.crs_geokeys.as_ref())?;
         if self.schema != SCHEMA
             || self.jobs.is_empty()
             || self.source_indices.is_empty()
@@ -532,10 +552,16 @@ pub fn run_with_session(
             })?;
             // The TIFF reader can reconstruct approximate legacy WKT. Delivery
             // uses the canonical registry definition of the already validated EPSG.
-            let wkt = terrio::crs::SpatialRef::from_epsg(req.model.epsg)
-                .map_err(|e| MapError::Unsupported(format!("group CRS definition: {e}")))?
-                .to_wkt()
-                .ok_or_else(|| MapError::Invalid("group CRS has no WKT".into()))?;
+            let crs =
+                crate::crs::OutputCrs::resolve(req.model.epsg, req.model.crs_geokeys.as_ref())?;
+            let wkt = match &crs {
+                crate::crs::OutputCrs::Epsg(code) => terrio::crs::SpatialRef::from_epsg(*code)
+                    .map_err(|e| MapError::Unsupported(format!("group CRS definition: {e}")))?
+                    .to_wkt()
+                    .ok_or_else(|| MapError::Invalid("group CRS has no WKT".into()))?,
+                // A CRS without an EPSG code: the caller's WKT, verbatim.
+                crate::crs::OutputCrs::GeoKeys(_) => req.crs_wkt.clone().unwrap_or_default(),
+            };
             let mut accumulators = Vec::new();
             let mut slot = 0;
             for job in &req.jobs {
@@ -716,7 +742,7 @@ pub fn run_with_session(
                     "byte_length":mul(pixels(job)? as u64,4)?,"dtype":"<f4","nodata":"NaN",
                     "units":req.depth_units,"depth_cutoff_ft":req.depth_cutoff_ft,"effective_cutoff":threshold,
                     "affine":transform,"strict_extent":[transform[0],transform[3]+height as f64*gt[5],transform[0]+width as f64*gt[1],transform[3]],
-                    "crs_wkt":wkt,"epsg":req.model.epsg,
+                    "crs_wkt":wkt,"epsg":crs.epsg(),
                     "crs_wkt_fnv1a64":format!("{:016x}",crate::sink::fnv1a64(wkt.as_bytes())),
                     "lattice":{"terrain_transform":gt,"terrain_shape":[terrain.height,terrain.width],
                         "source_window":job.window,"terrain_identity":terrain_identity,"parent_identity":parent_identity,"terrain_file_bytes":fs::metadata(model::resolve(base,&req.model.terrain))?.len(),
@@ -724,6 +750,10 @@ pub fn run_with_session(
                     "source_indices":group.timesteps,"frames":ordered,
                     "engine":report["engine"],"timings":{"hydraulic_seconds":hydraulic_seconds,"compute_seconds":compute_seconds,
                         "reduce_seconds":group_reduce_seconds[slot]}});
+                    if let Some(keys) = crs.geokeys() {
+                        metadata["output_crs"] = crs.echo();
+                        metadata["crs_geokeys"] = json!(keys);
+                    }
                     let mut writer = if req.sink == Sink::Geotiff {
                         let dir = out.join(&job.job_id);
                         if !dir.exists() {
@@ -732,12 +762,12 @@ pub fn run_with_session(
                         let path = dir.join(format!("{}.tif.partial", group.group_id));
                         delivered.push(path.clone());
                         Some(session.install(|| {
-                            crate::geotiff::create(
+                            crate::geotiff::create_then_finish_crs(
                                 &path,
                                 width,
                                 height,
                                 transform,
-                                &crate::crs::OutputCrs::Epsg(req.model.epsg),
+                                &crs,
                                 req.compression,
                             )
                         })?)
@@ -778,6 +808,7 @@ pub fn run_with_session(
                         // Finalization can reach terrio's pool: off the worker.
                         crate::terrio_pool::call(|| writer.finish())?
                             .map_err(|e| MapError::Io(format!("group GeoTIFF finish: {e}")))?;
+                        crate::geotiff::finish_crs(delivered.last().unwrap(), &crs)?;
                         let final_path = out
                             .join(&job.job_id)
                             .join(format!("{}.tif", group.group_id));
