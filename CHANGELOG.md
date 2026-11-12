@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+- **Terrain CRS without an EPSG code, identified by its parameters.** HEC-RAS
+  writes some terrains (HCFCD's South Belt and Brays Bayou among them) with a
+  user-defined projected CRS: ProjectedCSTypeGeoKey 32767 with the projection,
+  its parameters and the linear unit on an EPSG geographic CRS. terrio reads
+  these as GDAL does, without an EPSG code, so `crs_identity: epsg` refused
+  them ("terrio does not identify an EPSG code for this terrain"), in the
+  boundary session and every other terrain path. Such a terrain is now
+  accepted when it is the request's EPSG CRS node for node, by rule
+  `fast-map-projected-epsg-parameter-match/1` (`crs_match`): the same EPSG
+  geographic CRS and datum, ellipsoid, prime meridian and angular unit; the
+  same projection method and parameter set, angles within 1e-9 degree, false
+  easting/northing within 1 mm, scale factors within 1e-10; the linear unit
+  within 1e-12 relative and the same unit code where both declare one. The two
+  standard parallels of Lambert Conformal Conic 2SP and Albers, whose formulas
+  are symmetric in them, may come in either order (Brays Bayou's terrain gives
+  them swapped); the order is recorded as `standard_parallels_swapped`. Only the
+  request's EPSG is tested (no registry search), a datum is never inferred
+  from its ellipsoid, and any other node is refused. NAD83 / Texas South
+  Central (ftUS) terrains are identified as EPSG:2278; the same parameters in
+  international feet, on NAD83(HARN) or NAD83(2011), or in another zone are
+  refused. Reports record `crs_identity: "parameter_matched_epsg"` with the
+  compared values under `crs_epsg_match` (session and step05 `terrain`,
+  boundary `terrain_crs`). Terrains terrio identifies, and
+  `caller_verified_wkt` pins, are unchanged.
+
 ## 0.19.0 - 2026-11-12
 
 - **Staged cell subsets** (opt-in, capability `staged_cells`,

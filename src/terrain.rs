@@ -30,6 +30,9 @@ pub struct NativeTerrain {
     pub epsg: u32,
     pub crs_identity: &'static str,
     pub crs_wkt_fnv1a64: Option<String>,
+    /// How a CRS terrio reads without an EPSG code was identified as `epsg`
+    /// (`crs_identity` `parameter_matched_epsg`); `None` otherwise.
+    pub crs_epsg_match: Option<crate::crs_match::EpsgParameterMatch>,
     pub query: QueryConvention,
     pub policy: NodataPolicy,
     /// Bytes of one full decoded block (checked at open).
@@ -164,6 +167,7 @@ impl NativeTerrain {
             )));
         }
         let crs = r.crs();
+        let mut crs_epsg_match = None;
         let crs_identity = match (crs.epsg, identity) {
             (Some(e), _) if e != expected_epsg => {
                 return Err(MapError::Unsupported(format!(
@@ -176,10 +180,22 @@ impl NativeTerrain {
                 check_wkt_pin(path, &crs, fnv1a64)?;
                 "terrio_identified_epsg_and_caller_verified_wkt_fnv1a64"
             }
+            // A user-defined projected CRS (HEC-RAS writes ProjectedCSTypeGeoKey 32767 with the
+            // projection, parameters and unit on an EPSG geographic CRS) is accepted only when it
+            // is, node for node and parameter for parameter, the session's EPSG CRS.
             (None, CrsIdentity::Epsg) => {
-                return Err(MapError::Unsupported(format!(
-                    "{path}: terrio does not identify an EPSG code for this terrain; use crs_identity caller_verified_wkt after independent verification"
-                )));
+                let matched = crs
+                    .wkt
+                    .as_deref()
+                    .ok_or_else(|| "terrio gives no WKT".to_string())
+                    .and_then(|wkt| crate::crs_match::match_projected_epsg(wkt, expected_epsg))
+                    .map_err(|reason| {
+                        MapError::Unsupported(format!(
+                            "{path}: terrio does not identify an EPSG code for this terrain and it does not match EPSG:{expected_epsg} parameter for parameter ({reason}); use crs_identity caller_verified_wkt after independent verification"
+                        ))
+                    })?;
+                crs_epsg_match = Some(matched);
+                "parameter_matched_epsg"
             }
             (None, CrsIdentity::CallerVerifiedWkt { fnv1a64 }) => {
                 check_wkt_pin(path, &crs, fnv1a64)?;
@@ -219,6 +235,7 @@ impl NativeTerrain {
             epsg: expected_epsg,
             crs_identity,
             crs_wkt_fnv1a64: wkt_fnv(&crs),
+            crs_epsg_match,
             query,
             policy,
             block_bytes,

@@ -280,6 +280,27 @@ existing `native-geotiff/1` framing. Inspect `native_row_streaming` and the
 before enabling this option. Commander callers must explicitly stage the wire
 option; it is not enabled by the existing `product_writer="native"` default.
 
+#### Terrain CRS identity
+
+`crs_identity: {"kind":"epsg"}` requires the terrain CRS to be the request's
+EPSG CRS; nothing is reprojected. terrio identifies most terrains' EPSG code
+itself. HEC-RAS writes some terrains with a user-defined projected CRS
+(ProjectedCSTypeGeoKey 32767: the projection, its parameters and the linear
+unit on an EPSG geographic CRS), which terrio reads, as GDAL does, without an
+EPSG code. Such a terrain is accepted only when it matches terrio's definition
+of the request EPSG node for node (`fast-map-projected-epsg-parameter-match/1`):
+the same EPSG geographic CRS and datum, ellipsoid, prime meridian and units,
+the same projection method and parameter set, angles within 1e-9 degree,
+false easting/northing within 1 mm and the linear unit within 1e-12 relative
+(the US survey foot is not the international foot). The standard parallels of
+the two-parallel conics (LCC 2SP, Albers) may come in either order; the order
+is recorded. No registry search is
+made and no datum is inferred from an ellipsoid; anything else is refused and
+can still be pinned with `caller_verified_wkt`. Reports record
+`crs_identity: "parameter_matched_epsg"` and the compared values under
+`crs_epsg_match` (`terrain` in session reports, `terrain_crs` in boundary
+reports).
+
 #### Final delivery format (`final_format`)
 
 Private opt-in `final_format`, selected together with `"compression": "DEFLATE"`,

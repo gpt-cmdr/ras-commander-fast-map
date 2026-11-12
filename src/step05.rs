@@ -1586,7 +1586,7 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
                 "estimated_aggregate_bound_bytes": top_k + req.budgets.max_cache_bytes + req.budgets.max_lookup_cache_bytes,
                 "note": "planned estimates of this implementation's arrays plus configured cache budgets; not a measured or enforced RSS cap"
             },
-            "terrain": {"path": s.terrain.path, "stats": s.terrain.stats(), "crs_identity": s.terrain.crs_identity},
+            "terrain": {"path": s.terrain.path, "stats": s.terrain.stats(), "crs_identity": s.terrain.crs_identity, "crs_epsg_match": s.terrain.crs_epsg_match},
             "warp_env": {"src_srs_wkt_fnv1a64": format!("{:016x}", crate::sink::fnv1a64(s.env.src_srs_wkt.as_bytes())),
                          "dst_srs_wkt_fnv1a64": format!("{:016x}", crate::sink::fnv1a64(s.env.dst_srs_wkt.as_bytes()))},
             "lookup_cache": {"budget_bytes": lc.budget, "resident_bytes": lc.resident_bytes,
