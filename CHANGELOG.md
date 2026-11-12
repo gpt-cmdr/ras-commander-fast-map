@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Shape-Z polygons without boundary elevations (elevations from vertex Z) are
+  now refused, as `method_record` and Commander's `read_layers` already state;
+  the engine previously applied them although the form is not qualified.
+
 Terrain modifications are no longer parked: `ras2fim-batch method` advertises
 `effective_terrain` as `rasmapper-effective-terrain/2` (request schemas 1 and
 2), with the qualified modification forms and every refused form under

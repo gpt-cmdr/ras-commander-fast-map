@@ -409,6 +409,14 @@ pub fn validate(layers: &[Layer]) -> Result<(), MapError> {
                     {
                         return Err(invalid(format!("polygon layer {name:?}: invalid polygon")));
                     }
+                    if f.use_shape_z && !f.generate_boundary {
+                        // Elevations from the polygon's own vertex Z: how RAS
+                        // Mapper stores and reads vertex Z has not been
+                        // measured. Refused here, before any write.
+                        return Err(MapError::Unsupported(format!(
+                            "polygon layer {name:?}: shape-Z polygons (elevations from vertex Z) are not qualified"
+                        )));
+                    }
                 }
             }
             Layer::Ellipse { features, name, .. } => {
@@ -2814,6 +2822,28 @@ mod tests {
 
     fn cp(x: f64, y: f64, elevation: f64) -> ControlPoint {
         ControlPoint { x, y, elevation }
+    }
+
+    #[test]
+    fn shape_z_polygon_without_boundary_elevations_is_refused() {
+        let ring = vec![[20.0, 20.0], [80.0, 20.0], [80.0, 80.0], [20.0, 80.0]];
+        // A valid constant polygon comes first in the same layer: nothing may
+        // be written before the shape-Z feature is refused.
+        let ok = poly(
+            vec![[5.0, 5.0], [15.0, 5.0], [15.0, 15.0], [5.0, 15.0]],
+            ElevationType::SetValue,
+            7.0,
+        );
+        let mut f = poly(ring, ElevationType::SetValue, 10.0);
+        f.use_shape_z = true;
+        f.vertex_z = vec![1.0, 2.0, 3.0, 4.0];
+        let mut v = vec![0.0_f32; 100 * 100];
+        let err = apply(&[poly_layer(vec![ok, f], Vec::new())], &grid(), &mut v).unwrap_err();
+        assert!(matches!(err, MapError::Unsupported(_)), "{err:?}");
+        assert!(
+            v.iter().all(|z| *z == 0.0),
+            "nothing written before refusing"
+        );
     }
 
     #[test]
