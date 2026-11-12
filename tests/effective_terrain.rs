@@ -749,3 +749,21 @@ fn method_record_advertises_the_bases() {
     assert_eq!(r["default_basis"], "export");
     assert_eq!(r["stored_map"]["rule_id"], "rasmapper-stored-map-terrain/1");
 }
+
+/// The stored-map basis plans no export TIN, so a budget the export TIN
+/// would refuse still admits it.
+#[test]
+fn stored_map_basis_needs_no_export_tin_budget() {
+    let dir = scratch();
+    let g = grid(0.0, 100.0, 10.0, 10, 10);
+    write_source(&dir, "a.tif", g, plane(&g));
+    write_mask(&dir, "a.u1", 10, 10, |_, _| true);
+    let srcs = json!([{"path": "a.tif", "mask": mask("a.u1", 10, 10)}]);
+    let tight = json!({"max_working_bytes": 4096});
+    let export = effective_terrain::compute(&request(srcs.clone(), tight.clone()), &dir);
+    assert_eq!(export.err().unwrap().kind(), "budget");
+    let mut extra = tight;
+    extra["basis"] = "stored_map".into();
+    let out = effective_terrain::compute(&request(srcs, extra), &dir).unwrap();
+    assert_eq!(out.report["valid_pixels"], 100);
+}

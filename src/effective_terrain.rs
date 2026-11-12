@@ -858,6 +858,26 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
             grid.width, grid.height, req.max_working_bytes
         )));
     }
+    if basis == Basis::StoredMap {
+        // No export TIN on this basis: only the output grid and the source
+        // block cache (max_working_bytes / 4) are planned.
+        if out_bytes
+            > req
+                .max_working_bytes
+                .saturating_sub(req.max_working_bytes / 4)
+        {
+            return Err(MapError::Budget(format!(
+                "output grid {}x{} needs {out_bytes} bytes beyond the source cache; max_working_bytes is {}",
+                grid.width, grid.height, req.max_working_bytes
+            )));
+        }
+        let values = vec![NODATA; grid.width * grid.height];
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(req.threads)
+            .build()
+            .map_err(|e| MapError::Internal(format!("thread pool: {e}")))?;
+        return stored_map(req, &sources, grid, values, &pool, started);
+    }
     let threads = req.threads as u64;
     let remaining = req
         .max_working_bytes
@@ -891,9 +911,6 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
         .num_threads(req.threads)
         .build()
         .map_err(|e| MapError::Internal(format!("thread pool: {e}")))?;
-    if basis == Basis::StoredMap {
-        return stored_map(req, &sources, grid, values, &pool, started);
-    }
     for s in sources.iter_mut() {
         s.edges = pool.install(|| s.scan_edges())?;
     }
