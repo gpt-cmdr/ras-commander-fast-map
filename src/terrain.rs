@@ -1,12 +1,13 @@
-//! Native same-CRS north-up GeoTIFF terrain through terrio 0.4.2 lazy reads.
+//! Native same-CRS north-up GeoTIFF terrain through terrio lazy reads.
 //!
 //! Serial decode guarantee: every terrio `read_window` call requests exactly one TIFF block
-//! (tile or strip) clipped to the image. terrio's `decode_in_threads` spawns
-//! `rayon::current_num_threads().min(chunks)` scoped threads; with one chunk that is one, so the
-//! chunk is decoded on the calling worker thread and the outer pool is never multiplied. This
-//! holds regardless of `RAYON_NUM_THREADS` or the calling pool size. Evidence is the pinned
-//! terrio `=0.4.2` source guard (`decode_in_threads` spawns only when `workers > 1`); re-verify it
-//! on any terrio upgrade. The `debug_assert` in `block_window` only checks this crate's own grid.
+//! (tile or strip) clipped to the image. terrio 0.8 decodes chunks on
+//! `min(terrio pool threads, chunks)` scoped threads (`geotiff::decode_in_threads`, which spawns
+//! only when that is above one); with one chunk the block is decoded on the calling worker, so
+//! the request pool is never multiplied, whatever the size of terrio's own pool (one thread
+//! under the engine's contract, see `terrio_pool`). terrio's block cache is turned off at open
+//! (`terrio_pool::prepare`). Re-verify the guard in terrio's source on any terrio upgrade. The
+//! `debug_assert` in `block_window` only checks this crate's own grid.
 //!
 //! Size arithmetic is checked: block bytes are computed once at open with checked
 //! multiplication and absurd layouts fail with a typed `unsupported` error instead of panicking.

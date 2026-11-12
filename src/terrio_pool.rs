@@ -30,6 +30,7 @@
 //! example before starting threads); [`status`] reports the size terrio's pool
 //! was given when the engine first used it. Without it, terrio's pool has one
 //! thread per core and a call can add that many busy threads.
+use crate::MapError;
 use serde_json::{Value, json};
 use std::sync::OnceLock;
 
@@ -94,23 +95,24 @@ const HELPER_STACK: usize = 16 << 20;
 /// Runs `f`, a call into terrio that may use terrio's pool, on a helper thread
 /// while the calling thread blocks in `join`. On a request-pool worker this is
 /// the point: an OS wait takes no other jobs, where a rayon wait on terrio's
-/// pool would keep running the request's. Results and panics are those of `f`.
-pub(crate) fn call<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+/// pool would keep running the request's. Panics are those of `f`. If no helper
+/// thread can be started, `f` does not run and the call fails: running it on the
+/// calling worker would let that worker take other jobs while terrio works.
+pub(crate) fn call<R: Send>(f: impl FnOnce() -> R + Send) -> Result<R, MapError> {
     prepare();
-    let mut f = Some(f);
-    let slot = &mut f;
     let outcome = std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name("fast-map-terrio".into())
             .stack_size(HELPER_STACK)
-            .spawn_scoped(scope, move || (slot.take().expect("call runs once"))())
+            .spawn_scoped(scope, f)
             .map(|handle| handle.join())
     });
     match outcome {
-        Ok(Ok(value)) => value,
+        Ok(Ok(value)) => Ok(value),
         Ok(Err(panic)) => std::panic::resume_unwind(panic),
-        // No thread could be started: run here (the closure did not run).
-        Err(_) => (f.take().expect("call did not run"))(),
+        Err(e) => Err(MapError::Budget(format!(
+            "terrio helper thread could not start: {e}"
+        ))),
     }
 }
 

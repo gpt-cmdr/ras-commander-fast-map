@@ -106,7 +106,7 @@ pub fn burn(layer: Layer, grid: Grid) -> Result<Vec<u32>, MapError> {
         data_type: Some(DataType::U32),
         ..Default::default()
     };
-    let result = crate::terrio_pool::call(|| rasterize(&[layer], &options))
+    let result = crate::terrio_pool::call(|| rasterize(&[layer], &options))?
         .map_err(|e| MapError::Invalid(e.to_string()))?;
     match result.raster.data {
         RasterData::U32(values) => Ok(values),

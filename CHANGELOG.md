@@ -213,7 +213,13 @@ busy at once. The engine now keeps the budget structurally (`terrio_pool`):
   rasterize) instead of by a one-pixel terrain read.
 - `ras2fim-batch method` reports `engine.thread_budget`. Library callers that do
   not run the executable must set `RAYON_NUM_THREADS=1` before terrio is first
-  used; otherwise terrio's pool has one thread per core.
+  used (crate docs); otherwise terrio's pool has one thread per core. The
+  `one_d_session`, `storage_session` and `effective_terrain` reports add
+  `terrio_pool` (`terrio_pool::status()`): the pool size configured when the
+  engine first used terrio, `bounded` (false above one thread) and the block
+  cache size.
+- A terrio call fails with a budget error when its helper thread cannot be
+  started, instead of running on the request worker.
 - `run` and `step05` report `os_threads.max_running_observed` (Linux) and an
   `expected_max` of `2 * threads + 3` OS threads (request pool, helpers of its
   blocked workers, main, monitor, terrio's thread). New tests sample the
@@ -232,7 +238,11 @@ budget). Outputs are unchanged.
 single-band Float32 GeoTIFF) as an alternative to a caller-staged
 `terrain_file`. Admission reads the TIFF header only (no pixel block is decoded
 before the budget check), refuses blocks (tiles or strips) over 16 MiB and
-plans three block-sized buffers per worker, since terrio decodes whole blocks.
+plans three block-sized buffers per worker, since terrio decodes whole blocks:
+`(tile_cols * block_rows * 12 + 1 MiB) * threads` bytes. Rust API:
+`one_d_terrain::Source::planned_bytes(window_width, threads)` became
+`planned_bytes(threads)`, and `one_d_terrain::inspect` no longer refuses blocks
+taller than 4,096 rows; the 16 MiB block bound replaces that limit.
 The engine checks size and geotransform, decodes block-row
 stripes with terrio on the request pool and maps GDAL Float32 nodata
 (`ARE_REAL_EQUAL`) to NaN, exactly as a masked GDAL read; method records

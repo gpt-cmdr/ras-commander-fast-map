@@ -871,6 +871,8 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
     } else {
         last_report
     };
+    let mut report = report;
+    report["terrio_pool"] = crate::terrio_pool::status();
     fs::write(
         output.join("report.json"),
         serde_json::to_vec_pretty(&report).map_err(|e| MapError::Internal(e.to_string()))?,

@@ -133,7 +133,8 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         "planned_bytes": planned, "threads": req.threads,
         "storage_owned_pixels": pixels.pixels.len(), "valid_pixels": valid,
         "depth_file": "depth.bin", "wse_file": "wse.bin", "owners_file": "owners.bin",
-        "dtype": "little-endian float32", "owners_dtype": "little-endian uint32", "nodata": "NaN"});
+        "dtype": "little-endian float32", "owners_dtype": "little-endian uint32", "nodata": "NaN",
+        "terrio_pool": crate::terrio_pool::status()});
     fs::create_dir(output)?;
     let result = (|| {
         crate::horizontal::write_values(&output.join("depth.bin"), &depth)?;

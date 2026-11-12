@@ -989,7 +989,7 @@ pub fn write_geotiff(path: &Path, effective: Effective, epsg: u32) -> Result<(),
     let path = path
         .to_str()
         .ok_or_else(|| invalid("output path is not UTF-8"))?;
-    crate::terrio_pool::call(|| terrio::write_raster_dataset(&dataset, path, &options))
+    crate::terrio_pool::call(|| terrio::write_raster_dataset(&dataset, path, &options))?
         .map_err(|e| invalid(format!("effective terrain GeoTIFF write: {e}")))
 }
 
@@ -1006,6 +1006,7 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
     report["status"] = "complete".into();
     report["output"] = tif.display().to_string().into();
     report["write_seconds"] = write_started.elapsed().as_secs_f64().into();
+    report["terrio_pool"] = crate::terrio_pool::status();
     crate::sink::write_json(&out.join("report.json"), &report)?;
     Ok(report)
 }

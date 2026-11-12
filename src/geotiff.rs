@@ -143,7 +143,7 @@ impl RowWriter {
             return Err(MapError::Invalid("native GeoTIFF incomplete rows".into()));
         }
         let writer = self.writer;
-        crate::terrio_pool::call(|| writer.finish())
+        crate::terrio_pool::call(|| writer.finish())?
             .map_err(|e| MapError::Io(format!("native GeoTIFF finish: {e}")))
     }
 }

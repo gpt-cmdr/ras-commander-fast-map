@@ -701,6 +701,12 @@ fn inherited_rayon_num_threads_does_not_widen_terrio_pool() {
     if t.samples > 0 {
         assert!(t.terrio_threads <= 1, "{t:?}");
     }
+    // The library report records the pool the engine found.
+    let report: Value =
+        serde_json::from_slice(&fs::read(dir.0.join("inherited/report.json")).unwrap()).unwrap();
+    assert_eq!(report["terrio_pool"]["terrio_pool_threads"], 1, "{report}");
+    assert_eq!(report["terrio_pool"]["bounded"], true, "{report}");
+    assert_eq!(report["terrio_pool"]["block_cache_bytes"], 0, "{report}");
     let output = Command::new(bin()).arg("method").output().unwrap();
     let record: Value = serde_json::from_slice(&output.stdout).unwrap();
     let contract = &record["engine"]["thread_budget"];
@@ -726,7 +732,7 @@ fn concurrent_burn_workload() {
     let threads: usize = std::env::var(CHILD).unwrap().parse().unwrap();
     let dir = scratch("burn-child");
     // Many small cells: most of a burn is terrio drawing them, in stripes.
-    let (w, k) = (2048usize, 48usize);
+    let (w, k) = (2048usize, 128usize);
     let side = w as f64 / k as f64;
     let mut cells = Vec::new();
     for a in 0..k {
@@ -798,9 +804,9 @@ fn burn_child(threads: usize, terrio_threads: usize) -> Trace {
 
 /// Request workers that call terrio while the others compute stay within the
 /// request's threads when terrio's pool has one thread (the executable's setting).
-/// The control run gives terrio's pool as many threads as the request (the
-/// previous behaviour, here even with the helper threads): the sampler must see
-/// more busy threads than the request has, which shows the check can fail.
+/// Two control runs give terrio's pool more threads than the request has: one
+/// worker with a pool of two (asserted on hosts with 2 or more CPUs, so on every
+/// CI runner) and three workers with a pool of three (asserted with 6 or more).
 #[test]
 fn terrio_calls_from_busy_request_workers_stay_within_budget() {
     let _serial = serial();
@@ -811,21 +817,33 @@ fn terrio_calls_from_busy_request_workers_stay_within_budget() {
         }
         assert_budget(&format!("concurrent burns t{threads}"), &t, threads);
     }
-    let control = burn_child(3, 3);
-    if control.samples == 0 {
-        return;
-    }
-    assert!(control.terrio_threads == 3, "{control:?}");
-    // Over-subscription can only show as CPU when the host gives this process
-    // more CPUs than the budget (up to 6 threads run here).
+    // Controls: terrio's pool deliberately larger than the request (the previous
+    // behaviour, here even with helper threads). The sampler must see the excess,
+    // which shows the checks above can fail. Excess shows as CPU only when the
+    // host gives this process more CPUs than the budget.
     let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
     eprintln!("CPUs available to this process: {cpus}");
-    if cpus < 6 {
-        eprintln!("control not asserted: {cpus} CPUs available");
+    // One worker, terrio's pool of two: fits a 2-CPU runner.
+    let small = burn_child(1, 2);
+    if small.samples == 0 {
         return;
     }
-    assert!(
-        cfg!(debug_assertions) || control.max_busy > 3.0 + TOLERANCE,
-        "the sampler must see terrio's extra threads busy: {control:?}"
-    );
+    assert!(small.terrio_threads == 2, "{small:?}");
+    if cpus >= 2 && !cfg!(debug_assertions) {
+        assert!(
+            small.max_busy > 1.0 + TOLERANCE,
+            "the sampler must see terrio's second thread busy: {small:?}"
+        );
+    }
+    // Three workers, terrio's pool of three: up to six busy threads.
+    let large = burn_child(3, 3);
+    assert!(large.terrio_threads == 3, "{large:?}");
+    if cpus >= 6 && !cfg!(debug_assertions) {
+        assert!(
+            large.max_busy > 3.0 + TOLERANCE,
+            "the sampler must see terrio's extra threads busy: {large:?}"
+        );
+    } else {
+        eprintln!("three-thread control not asserted: {cpus} CPUs available");
+    }
 }
