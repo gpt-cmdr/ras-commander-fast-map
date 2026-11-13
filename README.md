@@ -704,9 +704,10 @@ Per method, for a CRS without an EPSG code:
 `crs_wkt` should be GDAL's (or PROJ's) WKT of the terrain CRS, as rasterio
 reads it. RFC 7946 GeoJSON has no `crs` member; the legacy member carries the
 WKT, which GDAL/OGR and pyproj read. EPSG requests keep `EPSG:<code>`, and their
-outputs are byte-identical to 0.18.0. An effective-terrain request with `epsg: 0` and no keys is now
-refused: older engines wrote `ProjectedCSTypeGeoKey 0`, which GDAL reads as a
-local CRS in metres.
+outputs are byte-identical to 0.18.0. An effective-terrain request with `epsg: 0`
+and no keys is still accepted as in 0.19.0, with the same output bytes: it is
+labelled `ProjectedCSTypeGeoKey 0`, which GDAL reads as a local CRS in metres,
+and the report carries `crs_warning`. Give `crs_geokeys` for a correct label.
 
 Round trip (rasterio 1.5.2, GDAL 3.12.2, pyproj 3.8.0, Windows, this engine's
 effective terrain from a 40 x 40 GDAL-written source): the output CRS equals the

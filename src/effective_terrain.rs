@@ -237,12 +237,10 @@ impl Request {
         if self.sources.is_empty() {
             return Err(invalid("at least one source is required"));
         }
-        if self.output_crs()? == crate::crs::OutputCrs::Epsg(0) {
-            // ProjectedCSTypeGeoKey 0 reads as a local CRS in metres: never a label.
-            return Err(invalid(
-                "epsg must be a CRS code; for a CRS without one give crs_geokeys",
-            ));
-        }
+        // Validates crs_geokeys. `epsg: 0` without keys keeps the 0.19.0
+        // behaviour (same output bytes, labelled ProjectedCSTypeGeoKey 0, which
+        // GDAL reads as a local CRS); `run` reports it as `crs_warning`.
+        self.output_crs()?;
         if self.threads == 0 || self.max_working_bytes == 0 {
             return Err(invalid("threads and max_working_bytes must be positive"));
         }
@@ -982,6 +980,9 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
     })
 }
 
+/// Report note for `epsg: 0` without `crs_geokeys` (accepted as in 0.19.0).
+pub const EPSG_ZERO_WARNING: &str = "epsg 0 without crs_geokeys: the output is labelled ProjectedCSTypeGeoKey 0, which GDAL reads as a local CRS in metres; give crs_geokeys (any CRS) or a real EPSG code for a correct label";
+
 /// Write `effective` as a tiled float32 GeoTIFF with nodata -9999.
 pub fn write_geotiff(path: &Path, effective: Effective, epsg: u32) -> Result<(), MapError> {
     write_geotiff_crs(path, effective, &crate::crs::OutputCrs::Epsg(epsg))
@@ -1044,6 +1045,9 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
     std::fs::rename(&partial, &tif)?;
     if crs.geokeys().is_some() {
         report["output_crs"] = crs.echo();
+    }
+    if crs == crate::crs::OutputCrs::Epsg(0) {
+        report["crs_warning"] = EPSG_ZERO_WARNING.into();
     }
     report["status"] = "complete".into();
     report["output"] = tif.display().to_string().into();

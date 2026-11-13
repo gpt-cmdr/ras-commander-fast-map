@@ -259,6 +259,29 @@ fn effective_terrain_round_trips_untagged_and_tagged_sources() {
     // The effective terrain is the same grid whatever the label.
     assert_eq!(pixels(&out("untagged")), pixels(&out("epsg")));
     assert_eq!(pixels(&out("tagged")), pixels(&out("epsg")));
+    // epsg 0 without keys on a CRS without a code (pinned by its WKT hash):
+    // accepted as in 0.19.0,
+    // same pixels, labelled ProjectedCSTypeGeoKey 0, with a report warning.
+    let pin = terrain::NativeTerrain::open_crs(
+        dir.0.join("tagged.tif").to_str().unwrap(),
+        &OutputCrs::GeoKeys(alabama_west().into()),
+        &serde_json::from_value(json!({"kind": "geokeys"})).unwrap(),
+        ras_commander_fast_map::model::QueryConvention::PixelCenter,
+        ras_commander_fast_map::model::NodataPolicy::Dry,
+        1 << 20,
+    )
+    .unwrap()
+    .crs_wkt_fnv1a64
+    .unwrap();
+    let zero = run(
+        "tagged.tif",
+        json!({"epsg": 0, "crs_identity": {"kind": "caller_verified_wkt", "fnv1a64": pin}}),
+        "zero",
+    )
+    .unwrap();
+    assert_eq!(zero["crs_warning"], effective_terrain::EPSG_ZERO_WARNING);
+    assert!(epsg.get("crs_warning").is_none());
+    assert_eq!(pixels(&out("zero")), pixels(&out("epsg")));
 }
 
 #[test]
@@ -321,12 +344,10 @@ fn crs_refusals_happen_before_outputs() {
         )
         .contains("not both")
     );
-    assert!(
-        refused(
-            "untagged.tif",
-            json!({"epsg": 0, "crs_identity": {"kind": "epsg"}})
-        )
-        .contains("crs_geokeys")
+    // epsg 0 cannot be an epsg identity (the terrain has no code to match).
+    refused(
+        "untagged.tif",
+        json!({"epsg": 0, "crs_identity": {"kind": "epsg"}}),
     );
     refused(
         "untagged.tif",

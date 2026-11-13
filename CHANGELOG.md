@@ -40,9 +40,10 @@
   storage, 1D and coupled methods advertise `crs_any`. PixelIsPoint keys are
   accepted (written PixelIsArea; CRS keys unchanged) and keys stored in the
   directory are copied with it.
-- **Effective terrain refuses `epsg: 0` without `crs_geokeys`.** Earlier
-  engines accepted it and labelled the output `ProjectedCSTypeGeoKey 0`, which
-  GDAL reads as a local CRS in metres.
+- **Effective terrain `epsg: 0` without `crs_geokeys` is unchanged** (same
+  bytes as 0.19.0, labelled `ProjectedCSTypeGeoKey 0`, which GDAL reads as a
+  local CRS in metres); its report now carries `crs_warning`. Give
+  `crs_geokeys` for a correct label.
 
 ## 0.19.0 - 2026-11-12
 
