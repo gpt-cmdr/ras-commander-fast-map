@@ -73,14 +73,18 @@ fn duration_is_qualified_and_needs_no_opt_in() {
 }
 
 #[test]
-fn duration_with_storage_areas_is_refused_before_reads() {
-    // Level-pool pixels have no cell position for the recession search.
+fn duration_with_storage_areas_is_accepted() {
+    // Level-pool pixels take the pool series' recession; the request now
+    // reaches its (missing) inputs instead of being refused.
     let mut v = request();
     v["products"] = json!(["arrival_time", "duration"]);
     v["horizontal"]["storage_areas_file"] = "areas.wkb".into();
     v["horizontal"]["storage_area_count"] = 1.into();
     let err = rejected(v);
-    assert!(err.contains("duration with storage-area surfaces"), "{err}");
+    assert!(
+        !err.contains("duration with storage-area surfaces"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -89,7 +93,7 @@ fn capability_is_advertised() {
     assert_eq!(record["method_id"], "native-whole-simulation-horizontal/1");
     assert_eq!(
         record["storage_area_products"],
-        json!(["arrival_time", "percent_inundated"])
+        json!(["arrival_time", "duration", "percent_inundated"])
     );
     assert_eq!(record["storage_area_requires_2d"], true);
     assert_eq!(
