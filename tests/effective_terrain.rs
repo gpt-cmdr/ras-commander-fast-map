@@ -759,11 +759,17 @@ fn stored_map_basis_needs_no_export_tin_budget() {
     write_source(&dir, "a.tif", g, plane(&g));
     write_mask(&dir, "a.u1", 10, 10, |_, _| true);
     let srcs = json!([{"path": "a.tif", "mask": mask("a.u1", 10, 10)}]);
-    let tight = json!({"max_working_bytes": 4096});
+    // The output (400 bytes) plus the source cache's 1 MiB floor: enough for
+    // the stored-map basis, short of one export-TIN tile share.
+    let tight = json!({"max_working_bytes": (1u64 << 20) + 400});
     let export = effective_terrain::compute(&request(srcs.clone(), tight.clone()), &dir);
     assert_eq!(export.err().unwrap().kind(), "budget");
     let mut extra = tight;
     extra["basis"] = "stored_map".into();
-    let out = effective_terrain::compute(&request(srcs, extra), &dir).unwrap();
+    let out = effective_terrain::compute(&request(srcs.clone(), extra), &dir).unwrap();
     assert_eq!(out.report["valid_pixels"], 100);
+    // Below the floor the source cache alone could exceed the budget: refused.
+    let small = json!({"max_working_bytes": 4096, "basis": "stored_map"});
+    let refused = effective_terrain::compute(&request(srcs, small), &dir);
+    assert_eq!(refused.err().unwrap().kind(), "budget");
 }

@@ -860,12 +860,10 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
     }
     if basis == Basis::StoredMap {
         // No export TIN on this basis: only the output grid and the source
-        // block cache (max_working_bytes / 4) are planned.
-        if out_bytes
-            > req
-                .max_working_bytes
-                .saturating_sub(req.max_working_bytes / 4)
-        {
+        // block cache are planned. The cache is the one the source was
+        // opened with (max_working_bytes / 4, at least 1 MiB), so a small
+        // budget reserves the 1 MiB floor too.
+        if out_bytes > req.max_working_bytes.saturating_sub(cache) {
             return Err(MapError::Budget(format!(
                 "output grid {}x{} needs {out_bytes} bytes beyond the source cache; max_working_bytes is {}",
                 grid.width, grid.height, req.max_working_bytes
