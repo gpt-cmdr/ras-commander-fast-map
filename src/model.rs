@@ -17,7 +17,13 @@ pub const MAX_THREADS: usize = 64;
 pub struct SessionRequest {
     pub schema: String,
     /// Declared CRS of every grid, sample and AOI bound. No reprojection is ever performed.
+    /// 0 or absent with `crs_geokeys`.
+    #[serde(default)]
     pub crs_epsg: u32,
+    /// The declared CRS as verbatim GeoKey tags, for a CRS without an EPSG code
+    /// (see [`crate::crs`]). Outputs are raw arrays; reports echo `output_crs`.
+    #[serde(default)]
+    pub crs_geokeys: Option<crate::crs::GeoKeys>,
     pub terrain: TerrainSpec,
     pub budgets: Budgets,
     pub products: Vec<Product>,
@@ -50,6 +56,13 @@ pub enum CrsIdentity {
     /// terrio's exact WKT by FNV-1a 64 hash (printed by `terrain-info`). A terrio-identified EPSG
     /// that differs still fails.
     CallerVerifiedWkt { fnv1a64: String },
+    /// The terrain's own GeoKey tags equal the request's `crs_geokeys` exactly (methods that
+    /// advertise `crs_any`). The CRS needs no EPSG code; see [`crate::crs`].
+    Geokeys,
+    /// The terrain TIFF carries no CRS at all (no GeoKey tags, none terrio reads), as RAS
+    /// Mapper writes terrain sources whose CRS has no EPSG code; the request's `crs_geokeys`
+    /// declares it (methods that advertise `crs_any`).
+    Untagged,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,6 +342,11 @@ impl SessionRequest {
             return Err(MapError::Invalid(
                 "max_session_bytes must be positive when given".into(),
             ));
+        }
+        // Both terrain modes: the same CRS contract (epsg or crs_geokeys,
+        // never both; well-formed keys) before any read or report.
+        if let Some(keys) = &self.crs_geokeys {
+            crate::crs::OutputCrs::resolve(self.crs_epsg, Some(keys))?;
         }
         let out_bytes = self.output_buffer_bound()?;
         if out_bytes > 16 * 1024 * 1024 * 1024 {

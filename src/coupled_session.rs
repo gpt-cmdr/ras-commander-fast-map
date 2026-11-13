@@ -51,6 +51,9 @@ pub struct Request {
     pub final_format: Option<crate::native_output::FinalFormat>,
     #[serde(default)]
     pub epsg: Option<u32>,
+    /// Verbatim GeoKey tags instead of `epsg` (see `one_d_delivery`).
+    #[serde(default)]
+    pub crs_geokeys: Option<crate::crs::GeoKeys>,
     #[serde(default)]
     pub aoi_mask_file: Option<PathBuf>,
     #[serde(default)]
@@ -150,6 +153,7 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
     let options = crate::one_d_delivery::Options {
         final_format: req.final_format.clone(),
         epsg: req.epsg,
+        crs_geokeys: req.crs_geokeys.clone(),
         aoi_mask_file: req.aoi_mask_file.clone(),
         flooded_depth_range: req.flooded_depth_range,
     };

@@ -812,7 +812,7 @@ fn build_report(
         .max()
         .unwrap_or(0);
     let tstats = st.terrain.as_ref().map(|t| t.stats());
-    Ok(serde_json::json!({
+    let mut report = serde_json::json!({
         "schema": "ras2fim-batch-report/1",
         "method": method_record(),
         "status": status,
@@ -880,7 +880,14 @@ fn build_report(
             "evaluate_and_sink_wall_seconds": st.eval_wall,
             "sink_seconds": st.sink_seconds,
         },
-    }))
+    });
+    if let Some(keys) = &req.crs_geokeys {
+        // The keys as written (PixelIsPoint becomes PixelIsArea), as every
+        // other report fingerprints them.
+        report["output_crs"] =
+            serde_json::json!({"kind": "geokeys", "fnv1a64": keys.written().fnv1a64()});
+    }
+    Ok(report)
 }
 
 /// Writes evaluated tiles of one chunk; returns (first sink error, seconds).
@@ -941,9 +948,9 @@ fn run_inner(
             let p = p
                 .to_str()
                 .ok_or_else(|| MapError::Invalid("terrain path is not UTF-8".into()))?;
-            Some(Arc::new(NativeTerrain::open(
+            Some(Arc::new(NativeTerrain::open_crs(
                 p,
-                req.crs_epsg,
+                &crate::crs::OutputCrs::resolve(req.crs_epsg, req.crs_geokeys.as_ref())?,
                 crs_identity,
                 *query,
                 *nodata_policy,

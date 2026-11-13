@@ -18,6 +18,32 @@
 - Qualified per release (2026-11-12): HEC-RAS 6.6, 6.7 Beta 4/5, 7.0, 7.0.1
   and 7.0.2 exports, 0 mask and 0 value differences on every layer each rule
   accepts; see `modifications.qualified`.
+- **Any CRS (verbatim GeoKeys).** `effective_terrain`, `sloping` (both
+  schemas), `horizontal` and 1D/coupled `final_format` delivery accept a CRS
+  without an EPSG code, such as ESRI:102630 (US survey feet). The new optional
+  `crs_geokeys` request field holds the GeoKey tags of a GeoTIFF in that CRS,
+  and every engine-written GeoTIFF stores them unchanged. New `crs_identity`
+  kinds: `geokeys` (the terrain's own tags must equal them) and `untagged`
+  (RAS Mapper terrain sources that carry no CRS). These methods advertise
+  `crs_any: true`, `crs_identity_kinds` and `output_crs_kinds`.
+  `terrain-info` prints `geokeys` and `geokeys_fnv1a64`; `doubles` are
+  exact decimal strings (JSON numbers are refused, as serde_json's default
+  parser can be one unit in the last place off). Request schemas and
+  method IDs are unchanged; EPSG requests write the same bytes. New library
+  API: `crs` module, `NativeTerrain::open_crs`,
+  `effective_terrain::write_geotiff_crs`, `final_tiff::{write_crs, check_crs,
+  Writer::create_crs}`.
+- **Any CRS on every method.** Depth groups (GeoTIFF keys; buffer metadata
+  `crs_wkt` from the request), boundaries (GeoJSON `crs` name = request
+  `crs_wkt`), the batch session (`crs_geokeys`), Step05 (terrain
+  `crs_geokeys`, `source_crs` `wkt`, `nudge.dst_wkt`), whole simulation,
+  storage, 1D and coupled methods advertise `crs_any`. PixelIsPoint keys are
+  accepted (written PixelIsArea; CRS keys unchanged) and keys stored in the
+  directory are copied with it.
+- **Effective terrain `epsg: 0` without `crs_geokeys` is unchanged** (same
+  bytes as 0.19.0, labelled `ProjectedCSTypeGeoKey 0`, which GDAL reads as a
+  local CRS in metres); its report now carries `crs_warning`. Give
+  `crs_geokeys` for a correct label.
 
 ## 0.19.0 - 2026-11-12
 

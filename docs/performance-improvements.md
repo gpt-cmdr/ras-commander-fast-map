@@ -194,7 +194,8 @@ Commander staging `final_format`.
 - Only Float32 Depth/WSE of sloping requests; `depth-groups` refuses `DEFLATE`.
 - Overview factors are consecutive powers of two; only GDAL 3.10.3 behavior
   has been compared. Predictor 2/3, strips and other resamplings are absent.
-- The CRS is written as an EPSG code (below 65536) in three GeoKeys.
+- The CRS is written as an EPSG code (below 65536) in three GeoKeys, or as a
+  request's verbatim `crs_geokeys` tags (see README, Any CRS).
 - Edge-tile padding is nodata; GDAL readers ignore it.
 - A failed write leaves the partial file, as the LZW route does.
 - The writer lives in this crate; terrio (0.4.2 when this was qualified,

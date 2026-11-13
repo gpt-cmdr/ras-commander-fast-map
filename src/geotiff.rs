@@ -1,15 +1,19 @@
 //! Lossless native product delivery. Pixel arithmetic is completed before encoding.
 use crate::MapError;
-use std::path::Path;
+use crate::crs::{GeoKeys, OutputCrs};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use wbraster::{DataType, Raster, crs_info::CrsInfo, raster::RasterData};
 
-/// Bounded row writer. The header contains no pixel allocation.
-pub(crate) fn create(
+/// Bounded row writer (no pixel allocation in the header), any CRS. With
+/// GeoKeys the caller must call [`finish_crs`] after terrio closes the file;
+/// [`RowWriter`] does.
+pub(crate) fn create_then_finish_crs(
     path: &Path,
     width: usize,
     height: usize,
     transform: [f64; 6],
-    epsg: u32,
+    crs: &OutputCrs,
     compression: crate::native_output::Compression,
 ) -> Result<terrio::GeoTiffWriter, MapError> {
     create_with_strip_rows(
@@ -17,7 +21,7 @@ pub(crate) fn create(
         width,
         height,
         transform,
-        epsg,
+        crs,
         compression,
         strip_rows(width),
     )
@@ -28,7 +32,7 @@ fn create_with_strip_rows(
     width: usize,
     height: usize,
     transform: [f64; 6],
-    epsg: u32,
+    crs: &OutputCrs,
     compression: crate::native_output::Compression,
     rows: usize,
 ) -> Result<terrio::GeoTiffWriter, MapError> {
@@ -43,7 +47,7 @@ fn create_with_strip_rows(
         cell_size_y: -transform[5],
         nodata: f64::NAN,
         data_type: DataType::F32,
-        crs: CrsInfo::from_epsg(epsg),
+        crs: crs_info(crs),
         metadata: Vec::new(),
         data: RasterData::F32(Vec::new()),
     };
@@ -61,6 +65,24 @@ fn create_with_strip_rows(
         },
     )
     .map_err(|e| MapError::Io(format!("native GeoTIFF create: {e}")))
+}
+
+/// terrio's CRS for `crs`: the EPSG code, or none for GeoKeys, which
+/// [`finish_crs`] adds verbatim once terrio has closed the file.
+pub(crate) fn crs_info(crs: &OutputCrs) -> CrsInfo {
+    match crs {
+        OutputCrs::Epsg(code) => CrsInfo::from_epsg(*code),
+        OutputCrs::GeoKeys(_) => CrsInfo::default(),
+    }
+}
+
+/// Complete a file written through terrio with `crs`: nothing for an EPSG
+/// code; the verbatim GeoKey tags otherwise.
+pub(crate) fn finish_crs(path: &Path, crs: &OutputCrs) -> Result<(), MapError> {
+    match crs {
+        OutputCrs::Epsg(_) => Ok(()),
+        OutputCrs::GeoKeys(keys) => crate::crs::insert_geokeys(path, keys),
+    }
 }
 
 pub(crate) fn strip_rows(width: usize) -> usize {
@@ -90,6 +112,8 @@ pub(crate) struct RowWriter {
     width: usize,
     height: usize,
     written: usize,
+    /// Path and GeoKeys to add after terrio closes the file.
+    geokeys: Option<(PathBuf, Arc<GeoKeys>)>,
 }
 
 impl RowWriter {
@@ -98,14 +122,26 @@ impl RowWriter {
         width: usize,
         height: usize,
         transform: [f64; 6],
-        epsg: u32,
+        crs: &OutputCrs,
         compression: crate::native_output::Compression,
     ) -> Result<Self, MapError> {
         Ok(Self {
-            writer: create(path, width, height, transform, epsg, compression)?,
+            writer: create_with_strip_rows(
+                path,
+                width,
+                height,
+                transform,
+                crs,
+                compression,
+                strip_rows(width),
+            )?,
             width,
             height,
             written: 0,
+            geokeys: match crs {
+                OutputCrs::Epsg(_) => None,
+                OutputCrs::GeoKeys(keys) => Some((path.to_path_buf(), keys.clone())),
+            },
         })
     }
 
@@ -144,7 +180,11 @@ impl RowWriter {
         }
         let writer = self.writer;
         crate::terrio_pool::call(|| writer.finish())?
-            .map_err(|e| MapError::Io(format!("native GeoTIFF finish: {e}")))
+            .map_err(|e| MapError::Io(format!("native GeoTIFF finish: {e}")))?;
+        match self.geokeys {
+            Some((path, keys)) => crate::crs::insert_geokeys(&path, &keys),
+            None => Ok(()),
+        }
     }
 }
 
@@ -161,20 +201,20 @@ impl ProductWriter {
         width: usize,
         height: usize,
         transform: [f64; 6],
-        epsg: u32,
+        crs: &OutputCrs,
         compression: crate::native_output::Compression,
         layout: Option<&crate::final_tiff::Layout>,
     ) -> Result<Self, MapError> {
         Ok(match layout {
-            Some(layout) => Self::Final(Box::new(crate::final_tiff::Writer::create(
-                path, layout, epsg,
+            Some(layout) => Self::Final(Box::new(crate::final_tiff::Writer::create_crs(
+                path, layout, crs,
             )?)),
             None => Self::Strips(Box::new(RowWriter::create(
                 path,
                 width,
                 height,
                 transform,
-                epsg,
+                crs,
                 compression,
             )?)),
         })
@@ -205,7 +245,7 @@ pub(crate) fn write(
     width: usize,
     height: usize,
     transform: [f64; 6],
-    epsg: u32,
+    crs: &OutputCrs,
     compression: crate::native_output::Compression,
 ) -> Result<(), MapError> {
     let bytes = validate_shape(width, height)?;
@@ -214,7 +254,7 @@ pub(crate) fn write(
             "native GeoTIFF buffer dimensions mismatch".into(),
         ));
     }
-    let mut writer = RowWriter::create(path, width, height, transform, epsg, compression)?;
+    let mut writer = RowWriter::create(path, width, height, transform, crs, compression)?;
     writer.write_rows(&values)?;
     writer.finish()
 }
@@ -296,7 +336,7 @@ mod tests {
                 width,
                 height,
                 [3., 10., 0., 1000., 0., -10.],
-                3433,
+                &OutputCrs::Epsg(3433),
                 compression,
             )
             .unwrap();
@@ -317,7 +357,7 @@ mod tests {
             2,
             2,
             [0., 1., 0., 2., 0., -1.],
-            3433,
+            &OutputCrs::Epsg(3433),
             crate::native_output::Compression::None,
         )
         .unwrap();
@@ -357,7 +397,7 @@ mod tests {
                     width,
                     height,
                     [0., 10., 0., 2560., 0., -10.],
-                    3433,
+                    &OutputCrs::Epsg(3433),
                     crate::native_output::Compression::Lzw,
                     rows,
                 )

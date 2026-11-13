@@ -24,7 +24,13 @@ pub const SCHEMA: &str = "ras2fim-horizontal-request/1";
 pub struct Request {
     pub schema: String,
     pub terrain: String,
+    /// EPSG code of the terrain; 0 or absent with `crs_geokeys`.
+    #[serde(default)]
     pub epsg: u32,
+    /// Terrain CRS as verbatim GeoKey tags (see [`crate::crs`]). Outputs are raw
+    /// Float32 on the terrain grid, labelled by the caller.
+    #[serde(default)]
+    pub crs_geokeys: Option<crate::crs::GeoKeys>,
     pub crs_identity: CrsIdentity,
     pub terrain_transform: [f64; 6],
     pub window: [usize; 4], // col, row, width, height
@@ -79,7 +85,7 @@ pub(crate) fn validate_storage_fields<'a>(
 }
 
 pub fn method_record() -> Value {
-    json!({"method_id":"horizontal-cell-constant/2", "backend":"rust", "stream_outputs":true,
+    let mut record = json!({"method_id":"horizontal-cell-constant/2", "backend":"rust", "stream_outputs":true,
         "arithmetic":"native float32 WSE >= terrain + plot tolerance; float32 subtraction; optional strict positive depth cutoff",
         "native_plot_tolerance":0.001_f32,
         "ownership":"terrio pixel-centre polygons or supplied u32 labels; 0 dry; cell position + 1",
@@ -88,7 +94,9 @@ pub fn method_record() -> Value {
         "reuse":"terrain and ownership shared across all profiles; pixel parallelism inside bounded Rayon pool",
         "terrain_scope":crate::terrain_scope::METHOD_ID,
         "storage_area_surfaces":crate::storage_area::METHOD_ID,
-        "scope":"2D horizontal cells; optional storage-area level pools; no native sloping, 1D or structure renderer"})
+        "scope":"2D horizontal cells; optional storage-area level pools; no native sloping, 1D or structure renderer"});
+    crate::crs::advertise(&mut record);
+    record
 }
 fn bytes(count: usize, width: usize) -> Result<u64, MapError> {
     count
@@ -245,10 +253,11 @@ pub(crate) fn run_with(
     mut consumer: Option<&mut dyn Consumer>,
 ) -> Result<Value, MapError> {
     let started = Instant::now();
+    let crs = crate::crs::OutputCrs::resolve(req.epsg, req.crs_geokeys.as_ref())?;
     if req.schema != SCHEMA
         || !(1..=64).contains(&req.threads)
         || req.profiles.is_empty()
-        || req.epsg == 0
+        || crs == crate::crs::OutputCrs::Epsg(0)
         || req.cell_count == 0
         || req.cell_count >= u32::MAX as usize
         || !req.min_depth.is_finite()
@@ -302,11 +311,11 @@ pub(crate) fn run_with(
         ));
     }
     let terrain_path = model::resolve(base, &req.terrain);
-    let terrain = NativeTerrain::open(
+    let terrain = NativeTerrain::open_crs(
         terrain_path
             .to_str()
             .ok_or_else(|| MapError::Invalid("terrain path not UTF-8".into()))?,
-        req.epsg,
+        &crs,
         &req.crs_identity,
         QueryConvention::PixelCenter,
         NodataPolicy::Dry,
@@ -391,6 +400,10 @@ pub(crate) fn run_with(
     let mut report = json!({"schema":"ras2fim-horizontal-report/1", "status":"in_progress",
         "method":method_record(), "window":req.window, "planned_bytes":admitted,
         "threads":req.threads, "profiles":[]});
+    if crs.geokeys().is_some() {
+        // Raw Float32 outputs carry no CRS; the report names it.
+        report["output_crs"] = crs.echo();
+    }
     sink::write_json(&out.join("report.json"), &report)?;
     let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || -> Result<(), MapError> {

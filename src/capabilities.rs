@@ -32,6 +32,50 @@ pub fn engine_method_record() -> serde_json::Value {
         "whole_simulation": crate::whole_simulation::method_record(),
         "effective_terrain": crate::effective_terrain::method_record()
     });
+    // Methods whose own outputs are CRS-free raw arrays or whose terrain and
+    // delivery fields already take crs_geokeys: the caller's CRS (any) is
+    // carried unchanged (see `crs`).
+    for key in [
+        "storage",
+        "coupled_diagnostic",
+        "coupled_native_grid_diagnostic",
+        "coupled_storage_diagnostic",
+        "one_d_diagnostic",
+        "one_d_native_diagnostic",
+        "one_d_clipped_diagnostic",
+        "one_d_clipped_native_grid_diagnostic",
+        "whole_simulation",
+    ] {
+        if registry[key].is_object() {
+            crate::crs::advertise(&mut registry[key]);
+        }
+    }
+    // Where these take the CRS: the shared contract names a top-level field.
+    if registry["storage"].is_object() {
+        registry["storage"]["crs_geokeys"]["request_field"] = serde_json::json!(
+            "none: storage requests carry no CRS (raw terrain records in, raw arrays out); the caller labels the outputs"
+        );
+    }
+    if registry["whole_simulation"].is_object() {
+        registry["whole_simulation"]["crs_geokeys"]["request_field"] = serde_json::json!(
+            "horizontal.crs_geokeys {directory, doubles, ascii}, with horizontal.epsg 0 or absent; doubles are decimal strings, parsed exactly"
+        );
+    }
+    for key in [
+        "coupled_diagnostic",
+        "coupled_native_grid_diagnostic",
+        "coupled_storage_diagnostic",
+        "one_d_diagnostic",
+        "one_d_native_diagnostic",
+        "one_d_clipped_diagnostic",
+        "one_d_clipped_native_grid_diagnostic",
+    ] {
+        if registry[key].is_object() {
+            registry[key]["crs_geokeys"]["request_field"] = serde_json::json!(
+                "crs_geokeys {directory, doubles, ascii} with final_format only (epsg absent); raw-array requests refuse it; doubles are decimal strings, parsed exactly"
+            );
+        }
+    }
     let specifications = [
         (
             "sloping_native_grid",

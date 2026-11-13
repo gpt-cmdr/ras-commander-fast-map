@@ -167,7 +167,13 @@ pub struct Request {
     #[serde(default)]
     pub options: sloping::Options,
     pub terrain: String,
+    /// EPSG code of the terrain and products; 0 or absent with `crs_geokeys`.
+    #[serde(default)]
     pub epsg: u32,
+    /// Terrain and product CRS as verbatim GeoKey tags, for a CRS without an
+    /// EPSG code (see [`crate::crs`]).
+    #[serde(default)]
+    pub crs_geokeys: Option<crate::crs::GeoKeys>,
     pub crs_identity: CrsIdentity,
     pub terrain_transform: [f64; 6],
     pub window: [usize; 4],
@@ -837,11 +843,12 @@ pub fn method_record() -> Value {
         "scope":"2D cells; plain cell-corner sloping; optional storage-area level pools; no 1D, slopingPretty or additional rendering options",
         "reuse":"geometry, terrio ownership and terrain prepared once; bounded Rayon pixel and reconstruction workers"});
     record["staged_cells"] = crate::sloping_binary::STAGED_METHOD.into();
+    crate::crs::advertise(&mut record);
     record
 }
 
 pub fn native_grid_method_record() -> Value {
-    json!({"method_id":"rasmapper-plain-sloping/2","backend":"rust","experimental":true,
+    let mut record = json!({"method_id":"rasmapper-plain-sloping/2","backend":"rust","experimental":true,
         "native_parity_qualified":false,"grid_contracts":[crate::stored_grid::ID],
         "stream_outputs":true,"export_physical_ownership":true,"native_ownership":true,
         "aoi_mask":crate::aoi::METHOD,"bounded_profile_concurrency":true,
@@ -852,7 +859,9 @@ pub fn native_grid_method_record() -> Value {
             "render_mode":"sloping","products":["depth","wse"],
             "unsupported":["slopingPretty","velocity","storage","reduce_max","consumer"],
             "retained_full_window_buffers":["ownership","terrain"]},
-        "native_plot_tolerance":0.001_f32,"scope":"explicit original single-source 256-tile plain corner Depth/WSE; no terrain scope, storage or velocity"})
+        "native_plot_tolerance":0.001_f32,"scope":"explicit original single-source 256-tile plain corner Depth/WSE; no terrain scope, storage or velocity"});
+    crate::crs::advertise(&mut record);
+    record
 }
 
 fn selected_method(options: sloping::Options) -> Value {
@@ -1105,14 +1114,15 @@ fn run_internal(
                 .into(),
         ));
     }
+    let crs = crate::crs::OutputCrs::resolve(req.epsg, req.crs_geokeys.as_ref())?;
     if final_layout.is_some() {
         // Same refusal as final_tiff::Writer::create, before any read.
-        crate::final_tiff::check_epsg(req.epsg)?;
+        crate::final_tiff::check_crs(&crs)?;
     }
     if !matches!(req.schema.as_str(), SCHEMA | NATIVE_GRID_SCHEMA)
         || !(1..=64).contains(&req.threads)
         || !(1..=64).contains(&req.max_inflight_profiles)
-        || req.epsg == 0
+        || crs == crate::crs::OutputCrs::Epsg(0)
         || req.mesh_files.is_empty()
         || req.owner_cells.is_empty()
         || req.owner_cells.len() >= u32::MAX as usize
@@ -1324,7 +1334,10 @@ fn run_internal(
         format!(
             "{}:{}:{}",
             identity(&terrain_path)?,
-            req.epsg,
+            match &crs {
+                crate::crs::OutputCrs::Epsg(code) => code.to_string(),
+                crate::crs::OutputCrs::GeoKeys(keys) => format!("geokeys-{}", keys.fnv1a64()),
+            },
             serde_json::to_string(&req.crs_identity)
                 .map_err(|e| MapError::Invalid(e.to_string()))?
         )
@@ -1379,11 +1392,11 @@ fn run_internal(
             .clone()
     } else {
         Arc::new(pool.install(|| {
-            NativeTerrain::open(
+            NativeTerrain::open_crs(
                 model::resolve(base, &req.terrain)
                     .to_str()
                     .ok_or_else(|| MapError::Invalid("terrain path is not UTF8".into()))?,
-                req.epsg,
+                &crs,
                 &req.crs_identity,
                 QueryConvention::PixelCenter,
                 NodataPolicy::Dry,
@@ -1528,6 +1541,9 @@ fn run_internal(
         "threads":req.threads,"window":req.window,"planned_bytes":admitted,
         "requested_inflight_profiles":req.max_inflight_profiles,"effective_inflight_profiles":effective,
         "additional_profile_planned_bytes":additional,"profiles":[]});
+    if crs.geokeys().is_some() {
+        report["output_crs"] = crs.echo();
+    }
     if let Some(layout) = native_grid {
         report["grid_contract"] = json!(req.grid_contract);
         report["source_geo_transform"] = json!(terrain.gt);
@@ -1879,11 +1895,14 @@ fn run_internal(
                     "kind":"physical_2d", "dtype":"<u4", "count":count,
                     "path":"owners.bin", "bytes":count as u64 * 4,
                     "width":width, "height":height, "window":req.window,
-                    "geo_transform":transform, "epsg":req.epsg,
+                    "geo_transform":transform, "epsg":crs.epsg(),
                     "crs_identity":req.crs_identity,
                     "owner_cell_count":req.owner_cells.len(),
                     "owned_pixels":data.owner.iter().filter(|&&label| label != 0).count(),
                 });
+                if crs.geokeys().is_some() {
+                    report["physical_ownership"]["output_crs"] = crs.echo();
+                }
             }
             let window_base_bytes = count as u64 * (8 + u64::from(req.terrain_scope.is_some()))
                 + (2 * std::mem::size_of::<(WindowKey, Arc<WindowData>, u64)>()
@@ -2032,7 +2051,7 @@ fn run_internal(
                                 final_layout.as_ref(),
                                 &dir,
                                 transform,
-                                req.epsg,
+                                &crs,
                             )
                         })?;
                         sink::write_json(&dir.join("unit.json"), &unit)?;
@@ -2132,8 +2151,8 @@ fn run_internal(
                                 let path = dir.join(format!("{name}.tif"));
                                 match &final_layout {
                                     Some(layout) => {
-                                        let summary = crate::final_tiff::write(
-                                            &path, &values, layout, req.epsg, &pool,
+                                        let summary = crate::final_tiff::write_crs(
+                                            &path, &values, layout, &crs, &pool,
                                         )?;
                                         header[format!("{name}_final")] = json!({
                                             "valid_pixels":summary.valid_pixels,"tiles":summary.tiles,
@@ -2150,7 +2169,7 @@ fn run_internal(
                                             width,
                                             height,
                                             transform,
-                                            req.epsg,
+                                            &crs,
                                             selected.compression,
                                         )
                                     })?,
@@ -2461,7 +2480,7 @@ fn render_native_rows(
     final_layout: Option<&crate::final_tiff::Layout>,
     dir: &Path,
     transform: [f64; 6],
-    epsg: u32,
+    crs: &crate::crs::OutputCrs,
 ) -> Result<Value, MapError> {
     let tick = Instant::now();
     let mut prepared = Vec::new();
@@ -2489,7 +2508,7 @@ fn render_native_rows(
                     window.width,
                     window.height,
                     transform,
-                    epsg,
+                    crs,
                     output.compression,
                     final_layout,
                 )

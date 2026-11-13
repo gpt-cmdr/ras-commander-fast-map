@@ -54,6 +54,7 @@ pub mod cache;
 mod capabilities;
 pub mod coupled;
 pub mod coupled_session;
+pub mod crs;
 pub mod depth_groups;
 pub mod effective_terrain;
 mod export_tin;
@@ -149,7 +150,7 @@ impl MapError {
 
 /// Static description of the implemented semantics, emitted in every report.
 pub fn method_record() -> serde_json::Value {
-    serde_json::json!({
+    let mut record = serde_json::json!({
         "method_version": METHOD_VERSION,
         "interpolation": {
             "topology": "caller-supplied global SciPy/Qhull simplices only; no native or per-AOI triangulation",
@@ -171,7 +172,7 @@ pub fn method_record() -> serde_json::Value {
                 "nodata_policy": "explicit per session: dry (declared-nodata sentinel -> dry) or raw_value (sentinel subtracted as a number, upstream-like raw subtraction; not qualified)",
                 "outside_extent": "dry",
                 "nan_value": "dry",
-                "reprojection": "never; terrain EPSG must equal the declared session EPSG",
+                "reprojection": "never; terrain EPSG must equal the declared session EPSG, or the terrain must match the session's crs_geokeys (crs_identity geokeys or untagged)",
                 "not_qualified": "GDAL Warp nearest-neighbour, Step05 inverted-bounds lattice, nudge, upstream raw-sentinel behaviour; rasterio rowcol uses a linear solve and may differ at exact pixel-boundary ties (counted as terrain_near_boundary_samples)"
             }
         },
@@ -190,5 +191,7 @@ pub fn method_record() -> serde_json::Value {
             "admission_estimates": "per-profile load+prepare peak from request content / file lengths before any read (binary/inline: buffer sizes plus an assumed one-copy R-tree bulk-load; legacy JSON: 64 x file length heuristic) checked against max_profile_bytes; optional max_session_bytes packs batches over accounted static terms + batch load peaks + plan metadata",
             "not_bounded": "decoder transients (estimated only), allocator fragmentation, thread stacks, codec state, JSON transients; no hard total memory bound is claimed"
         }
-    })
+    });
+    crate::crs::advertise(&mut record);
+    record
 }
