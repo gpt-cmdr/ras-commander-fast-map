@@ -144,11 +144,15 @@ impl Extrema {
         self.previous = value;
         (self.points.capacity() - before) * std::mem::size_of::<(u32, f32)>()
     }
-    fn close(&mut self, last: u32) {
-        // The closing end is one of the two per-series ends the plan's floor
-        // admits (16 bytes); grow by exactly one point, never by doubling.
+    /// Appends the closing end; returns the bytes its growth used beyond the
+    /// per-series floor (two ends, 16 bytes), which the plan reserves outside
+    /// `extrema_budget`. `profile` charges every earlier growth.
+    fn close(&mut self, last: u32) -> u64 {
+        let before = self.points.capacity();
         self.points.reserve_exact(1);
         self.points.push((last, self.previous));
+        let grown = (self.points.capacity() - before) * std::mem::size_of::<(u32, f32)>();
+        (grown as u64).saturating_sub(16)
     }
 }
 
@@ -553,11 +557,16 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
     let tick = Instant::now();
     if let Some(extrema) = &mut accumulator.extrema {
         let last = (n - 1) as u32;
-        extrema.par_iter_mut().for_each(|e| e.close(last));
-        accumulator
-            .storage_extrema
-            .iter_mut()
-            .for_each(|e| e.close(last));
+        let excess: u64 = extrema.par_iter_mut().map(|e| e.close(last)).sum::<u64>()
+            + accumulator
+                .storage_extrema
+                .iter_mut()
+                .map(|e| e.close(last))
+                .sum::<u64>();
+        accumulator.extrema_budget = accumulator
+            .extrema_budget
+            .checked_sub(excess)
+            .ok_or_else(|| MapError::Budget("duration extrema exceed max_working_bytes".into()))?;
     }
     let recession_inputs = accumulator.extrema.as_deref().map(|extrema| Recession {
         extrema,
@@ -645,8 +654,12 @@ mod tests {
     fn finish_all(a: &mut Accumulator, window: usize, times: &[f64]) -> Accumulated {
         let last = (times.len() - 1) as u32;
         let extrema = a.extrema.as_mut().unwrap();
-        extrema.iter_mut().for_each(|e| e.close(last));
-        a.storage_extrema.iter_mut().for_each(|e| e.close(last));
+        let excess: u64 = extrema.iter_mut().map(|e| e.close(last)).sum::<u64>()
+            + a.storage_extrema
+                .iter_mut()
+                .map(|e| e.close(last))
+                .sum::<u64>();
+        a.extrema_budget = a.extrema_budget.checked_sub(excess).unwrap();
         let r = Recession {
             extrema: a.extrema.as_deref().unwrap(),
             source: &a.source,
