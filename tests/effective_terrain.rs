@@ -891,6 +891,76 @@ fn stored_map_basis_composes_aligned_sources() {
     assert!(changed > 0);
 }
 
+/// A source a whole number of rows below the others, and a NaN cell (invalid,
+/// like nodata): the composition follows the reference on both axes.
+#[test]
+fn stored_map_basis_composes_a_vertically_offset_source() {
+    let dir = scratch();
+    let (cell, w) = (10.0, 12);
+    let ga = grid(1000.0, 5000.0, cell, w, 280);
+    let gb = grid(1000.0, 5000.0 - 260.0 * cell, cell, w, 40);
+    let mut va: Vec<f32> = plane(&ga).into_iter().map(|x| x + 0.003).collect();
+    va[100 * w + 5] = f32::NAN;
+    let vb: Vec<f32> = plane(&gb).into_iter().map(|x| x + 0.253).collect();
+    write_source(&dir, "a.tif", ga, va.clone());
+    write_source(&dir, "b.tif", gb, vb.clone());
+    write_mask(&dir, "a.u1", w, 280, |_, _| true);
+    write_mask(&dir, "b.u1", w, 40, |_, _| true);
+    let srcs = json!([{"path": "a.tif", "mask": mask("a.u1", w, 280)},
+                      {"path": "b.tif", "mask": mask("b.u1", w, 40)}]);
+    let out =
+        effective_terrain::compute(&request(srcs, json!({"basis": "stored_map"})), &dir).unwrap();
+    assert_eq!(out.grid, grid(1000.0, 5000.0, cell, w, 300));
+    assert_eq!(out.report["sources"][1]["lattice_offset"], json!([0, 260]));
+    let mut a_ref = va.clone();
+    for v in a_ref.iter_mut() {
+        if v.is_nan() {
+            *v = NODATA;
+        }
+    }
+    let want = compose_reference(&[(0, 0, w, 280, &a_ref), (0, 260, w, 40, &vb)], w, 300);
+    for (i, (v, x)) in out.values.iter().zip(&want).enumerate() {
+        assert_eq!(v.to_bits(), x.to_bits(), "pixel ({}, {})", i / w, i % w);
+    }
+    // B shows on A's last row (an edge ring cell, B interior there) and below A.
+    assert_eq!(out.values[279 * w + 5], vb[19 * w + 5]);
+    assert_eq!(out.values[290 * w + 5], vb[30 * w + 5]);
+    assert_eq!(out.values[278 * w + 5], va[278 * w + 5]);
+    assert_eq!(out.values[100 * w + 5], NODATA);
+}
+
+/// Several sources reserve one block cache each.
+#[test]
+fn stored_map_composition_reserves_every_source_cache() {
+    let dir = scratch();
+    let g = grid(1000.0, 5000.0, 10.0, 64, 64);
+    for n in ["a", "b", "c"] {
+        write_source(&dir, &format!("{n}.tif"), g, plane(&g));
+        write_mask(&dir, &format!("{n}.u1"), 64, 64, |_, _| true);
+    }
+    let srcs = json!([{"path": "a.tif", "mask": mask("a.u1", 64, 64)},
+                      {"path": "b.tif", "mask": mask("b.u1", 64, 64)},
+                      {"path": "c.tif", "mask": mask("c.u1", 64, 64)}]);
+    // Each cache gets the 1 MiB floor; output and composition flags are small.
+    let fits = (3u64 << 20) + 64 * 64 * 4 + 2 * 64 * 64 + 1;
+    let ok = effective_terrain::compute(
+        &request(
+            srcs.clone(),
+            json!({"basis": "stored_map", "max_working_bytes": fits}),
+        ),
+        &dir,
+    );
+    assert!(ok.is_ok(), "{:?}", ok.err());
+    let short = effective_terrain::compute(
+        &request(
+            srcs,
+            json!({"basis": "stored_map", "max_working_bytes": (2u64 << 20) + 64 * 64 * 8}),
+        ),
+        &dir,
+    );
+    assert_eq!(short.err().unwrap().kind(), "budget");
+}
+
 /// The stored-map basis plans no export TIN, so a budget the export TIN
 /// would refuse still admits it.
 #[test]

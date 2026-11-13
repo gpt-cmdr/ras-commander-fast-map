@@ -885,7 +885,10 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
         } else {
             0
         };
-        if out_bytes.saturating_add(composition) > req.max_working_bytes.saturating_sub(cache) {
+        // Each source holds its own block cache while it is drawn and keeps
+        // it: several sources reserve one cache each.
+        let caches = cache.saturating_mul(sources.len() as u64);
+        if out_bytes.saturating_add(composition) > req.max_working_bytes.saturating_sub(caches) {
             return Err(MapError::Budget(format!(
                 "output grid {}x{} needs {} bytes beyond the source cache; max_working_bytes is {}",
                 grid.width,
