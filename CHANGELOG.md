@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.20.0 - 2026-11-12
+
+Release summary: any CRS (`crs_geokeys`), HEC-RAS release labels with the 6.7
+rule, and the opt-in stored-map effective-terrain basis. Requests that 0.19.0
+accepts keep their output bytes, with the one exception below. Checked: the 119
+staged effective-terrain corpus requests on CLB-08 against 0.19.0 (116 float32-
+and file-identical, 3 identical refusals; reports gain only `basis`,
+`modifications.hecras_version`/`hecras_rule` and, for `epsg: 0`, `crs_warning`);
+Commander's FIM and staged-cells tests run under both engines (every engine
+output byte-identical); EPSG products of the `crs_any` methods (#44).
+The exception:
+
+- A schema 1 (unmodified) effective-terrain request that carries an
+  unqualified `hecras_version` (for example `6.5`) is now refused before any
+  read, as schema 2 always was. Requests without the field are unchanged.
 
 - **`hecras_version` takes HEC-RAS release labels.** `effective-terrain`
   accepts `6.6`, `6.7`, `6.7 Beta 4`, `6.7 Beta 5`, `7.0`, `7.0.0`, `7.0.1`
