@@ -16,6 +16,12 @@
     owner sets themselves: an FNV-1a64 collision loads instead of reusing
     another subset. Compact-mesh vectors are allocated at their final length.
   - Retained hydraulic state is keyed on the geometry key as well.
+  - The staged load also counts a grouped profile's pinned hydraulic state and
+    a same-key geometry over other owner sets.
+  - A staged request whose owner cell names a mesh beyond `mesh_files` or a
+    cell id above `u32` is refused when its key is built (before: at the load),
+    with "sloping ownership requires physical mesh cells" or "staged cells
+    must include every owner cell".
   - `tests/thread_budget.rs`: a per-thread CPU control asserted on every host
     (each terrio pool thread of a two-, three- and five-thread control pool is
     seen using CPU; this one is asserted on the 2-CPU Linux runner too), and

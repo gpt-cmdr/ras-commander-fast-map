@@ -855,6 +855,12 @@ fn terrio_calls_from_busy_request_workers_stay_within_budget() {
             return;
         }
         assert_budget(&format!("concurrent burns t{threads}"), &t, threads);
+        // Per thread, on any host: only terrio's one pool thread uses CPU (the
+        // controls below show the sampler sees every pool thread that does).
+        assert!(
+            t.terrio_cpu_threads <= 1,
+            "concurrent burns t{threads}: terrio threads using CPU: {t:?}"
+        );
     }
     // Controls: terrio's pool deliberately larger than the request (the previous
     // behaviour, here even with helper threads). The sampler must see the excess,

@@ -1266,17 +1266,32 @@ fn run_internal(
             // hydraulic caches (this request's budgets, or more while caches
             // from an earlier, larger request are still held: they shrink to
             // these budgets only after the load) and any current geometry it
-            // may replace.
-            let (retained_windows, retained_hydraulics) = session.as_ref().map_or((0, 0), |s| {
-                (s.windows.bytes(), s.hydraulics.lock().unwrap().bytes())
-            });
+            // may replace (a different key, or the same key over other owner
+            // sets), and a grouped profile's pinned hydraulic state.
+            let (retained_windows, retained_hydraulics, pinned) =
+                session.as_ref().map_or((0, 0, 0), |s| {
+                    (
+                        s.windows.bytes(),
+                        s.hydraulics.lock().unwrap().bytes(),
+                        s.pinned_hydraulics
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .map_or(0, |(_, p)| p.iter().map(|p| p.retained_bytes()).sum()),
+                    )
+                });
             let old = session
                 .as_ref()
-                .filter(|s| s.geometry.as_ref().is_some_and(|(k, _)| k != &key))
+                .filter(|s| {
+                    s.geometry.as_ref().is_some_and(|(k, g)| {
+                        k != &key || g.2.as_ref().is_some_and(|g| g.owners != owners)
+                    })
+                })
                 .map_or(0, |s| s.geometry_resident);
             let resident = cache
                 .checked_add(persistent_bytes.max(retained_windows))
                 .and_then(|v| v.checked_add(hydraulic_bytes.max(retained_hydraulics)))
+                .and_then(|v| v.checked_add(pinned))
                 .and_then(|v| v.checked_add(old))
                 .ok_or_else(|| MapError::Budget("staged geometry plan overflow".into()))?;
             Some(staged_geometry(
