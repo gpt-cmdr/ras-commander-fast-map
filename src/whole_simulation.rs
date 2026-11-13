@@ -90,7 +90,7 @@ pub fn method_record() -> Value {
         "qualified": "native HEC-RAS 7.0.1 horizontal and sloping stored maps, Davis p02 (217 times) and BaldEagleCrkMulti2D bridges p05 (433 times), threshold 0.5 ft; arrival_time, duration and percent_inundated",
         "unqualified_refused": ["irregular_intervals"],
         "reported": ["initially_wet_pixels", "multiple_period_pixels", "threshold_equal_samples"],
-        "duration_memory": "per cell: its local extrema (8 bytes each), admitted against max_working_bytes as they are found",
+        "duration_memory": "per cell and per storage area: its local extrema (8 bytes each), admitted against max_working_bytes as they are found",
         "not_implemented": "sloping rendering; recession product; subinterval interpolation; storage-only models"
     })
 }
@@ -212,7 +212,8 @@ fn recession(
     Ok(None)
 }
 
-/// Per mapped pixel: cell and ground, for the duration recession search.
+/// Per mapped pixel: cell (or storage area) and ground, for the duration
+/// recession search.
 struct Recession<'a> {
     extrema: &'a [Extrema],
     source: &'a [u32],
