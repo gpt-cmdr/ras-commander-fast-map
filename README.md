@@ -718,6 +718,44 @@ feet), Lambert conformal (Clarke 1866), Albers (US survey feet, towgs84) and
 oblique Mercator; a geographic CRS on a custom sphere; and EPSG:2277. The
 installed-wheel smoke repeats it for ESRI:102630 sloping products.
 
+## Effective terrain: export and stored-map bases
+
+`ras2fim-batch effective-terrain` writes RAS Mapper's terrain **export**
+(`rasmapper-effective-terrain/2`, the default). RAS Mapper's **stored maps**
+do not read that terrain:
+
+- the export samples render blocks (quads between four source cell
+  centres), so the last cell row and column of every source, whose centres
+  are the far edges of the last blocks, stay nodata; a single-source terrain
+  loses `width + height - 1` cells this way;
+- the export rounds every value to 1/32 once, after the modifications.
+
+RAS Mapper writes stored maps per terrain source, on that source's own grid,
+from the source's own cells and with the modifications unrounded. Requests
+that add `"basis": "stored_map"` (advertised in `effective_terrain.bases`;
+rule `rasmapper-stored-map-terrain/1`) get that terrain for a single-source
+terrain: the source's cells on its GeoTIFF grid (source nodata or NaN is
+nodata; no render blocks, no export TIN), then the modifications rasterized
+and combined as for the export, on the export lattice, and no rounding.
+Without modifications this is the source TIFF bit for bit. The report names
+`basis`, `basis_rule_id` and the `modification_lattice`. Multi-source
+terrains and requests with `grid` or `extent` are refused on this basis.
+
+Qualification (Helena: one source, 4877 x 4877; Middle Cahaba p01 Max,
+sloping; two channel ground lines, SetIfLower):
+
+| Terrain | Export basis vs stored maps | Stored-map basis vs stored maps |
+|---|---|---|
+| Modified, HEC-RAS 7.0.1 stored maps | 2,341 wet pixels nodata (all in the last row and column); Depth != float32(WSE - terrain) on 1,460 modified pixels (up to 1/64 ft) | Depth == float32(WSE - terrain) on all 7,506,407 wet pixels |
+| Modified, HEC-RAS 6.6 stored maps | same | same |
+| Unmodified | 2,341 wet pixels nodata | the source TIFF, bit for bit |
+
+Fast-map Depth/WSE mapped on the modified stored-map terrain (sloping, 7.0.1)
+differ from RAS Mapper's stored maps in 0 mask pixels and 1 value
+(3.05e-5 ft, the pixel that also differs on the unmodified source-TIFF route);
+on the export terrain they differed in 2,341 mask pixels and 1,461 Depth
+values.
+
 ## Storage-area surfaces
 
 Sloping requests can export physical 2D coverage with
