@@ -27,6 +27,19 @@
     seen using CPU; this one is asserted on the 2-CPU Linux runner too), and
     concurrency controls on a child that only computes: two spinners above the
     threads=1 bound (3 CPUs) and four above the threads=3 bound (5 CPUs).
+- **Duration with storage-area level pools.** `whole-simulation` refused
+  `duration` with `storage_areas_file`. Level-pool pixels now take the cells'
+  recession rule (`rasmapper-backward-window-recession/1`) over the storage
+  area's own water-surface series, without the cell gate; the pixels' wet test
+  is unchanged. `storage_area_products` now lists `duration`. Bald Eagle
+  dam-break p02 (HEC-RAS 7.0.1, 865 output times, threshold 0, horizontal,
+  storage area "Reservoir Pool") against RAS Mapper 7.0.1 stored maps: duration
+  equal on 463,882 of 464,445 pool pixels; the other 563 differ by one output
+  interval (5 min), 379 of them inherited from arrival time. RAS Mapper treats a
+  pool pixel as wet only at float32 depth >= 0.001 ft, where the engine's
+  existing pool plot test passes `wse >= ground + 0.001` in float32 (about
+  0.000977 ft at 660 ft); that test is kept so arrival time and percent
+  inundated stay bit-identical (checked against 0.19.0 on the same request).
 
 ## 0.20.0 - 2026-11-12
 

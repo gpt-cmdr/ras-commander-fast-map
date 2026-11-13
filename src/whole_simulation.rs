@@ -73,7 +73,8 @@ pub fn method_record() -> Value {
         "method_id": METHOD_ID,
         "render": "horizontal-cell-constant/2 per stored output time; physical 2D cells and optional storage-area level pools",
         "storage_area_surfaces": crate::storage_area::METHOD_ID,
-        "storage_area_products": ["arrival_time", "percent_inundated"],
+        "storage_area_products": ["arrival_time", "duration", "percent_inundated"],
+        "storage_area_duration": "the cells' recession rule over the storage area's level-pool series (the area's water surface per output time), without the cell gate",
         "storage_area_requires_2d": true,
         "storage_area_wet": "rendered pool depth > threshold (float32, strict); no cell gate",
         "wet": "rendered depth valid and depth > threshold (float32, strict)",
@@ -90,7 +91,7 @@ pub fn method_record() -> Value {
         "unqualified_refused": ["irregular_intervals"],
         "reported": ["initially_wet_pixels", "multiple_period_pixels", "threshold_equal_samples"],
         "duration_memory": "per cell: its local extrema (8 bytes each), admitted against max_working_bytes as they are found",
-        "not_implemented": "sloping rendering; recession product; subinterval interpolation; duration with storage areas; storage-only models"
+        "not_implemented": "sloping rendering; recession product; subinterval interpolation; storage-only models"
     })
 }
 
@@ -218,6 +219,10 @@ struct Recession<'a> {
     ground: &'a [f32],
     gate: &'a [f32],
     threshold: f32,
+    /// Per storage area: its water-surface extrema; pixels at or after
+    /// `storage_start` are level-pool pixels whose source is the area.
+    storage_extrema: &'a [Extrema],
+    storage_start: usize,
 }
 
 /// Scatters compact accumulators (window pixel `index[k]`) to window products.
@@ -247,15 +252,20 @@ fn finish(
         let first = times[a.first as usize] as f32;
         out.arrival[i] = first;
         if let Some(r) = duration {
-            let cell = r.source[k] as usize;
-            let (ground, gate, threshold) = (r.ground[k], r.gate[cell], r.threshold);
+            let source = r.source[k] as usize;
+            let (ground, threshold) = (r.ground[k], r.threshold);
+            // A level pool has no cell gate: the pixel is wet exactly when its
+            // rendered pool depth exceeds the threshold, as in `profile`.
+            let (points, gate) = if k >= r.storage_start {
+                (&r.storage_extrema[source].points, f32::NEG_INFINITY)
+            } else {
+                (&r.extrema[source].points, r.gate[source])
+            };
             let wet_at = |value: f32| {
                 value > gate
                     && matches!(horizontal::plot(value, ground), Ok(Some(d)) if d > threshold)
             };
-            if let Some(end) =
-                recession(&r.extrema[cell].points, a.last, ground, threshold, wet_at)?
-            {
+            if let Some(end) = recession(points, a.last, ground, threshold, wet_at)? {
                 out.duration[i] = times[end as usize] as f32 - first;
             }
         }
@@ -298,6 +308,8 @@ struct Accumulator {
     equal: u64,
     /// Per 2D cell water-surface extrema, kept only for duration.
     extrema: Option<Vec<Extrema>>,
+    /// Per storage area water-surface extrema, kept only for duration.
+    storage_extrema: Vec<Extrema>,
     /// Bytes the extrema may still use (duration only).
     extrema_budget: u64,
 }
@@ -366,12 +378,26 @@ impl horizontal::Consumer for Accumulator {
                 .zip(values.par_iter())
                 .map(|(e, &v)| e.push(position, v))
                 .sum();
-            self.extrema_budget =
-                self.extrema_budget
-                    .checked_sub(added as u64)
-                    .ok_or_else(|| {
-                        MapError::Budget("duration extrema exceed max_working_bytes".into())
-                    })?;
+            // Storage areas' level-pool series, by the same rule.
+            let added_storage: usize = match storage {
+                Some(levels) if !self.storage_extrema.is_empty() => {
+                    if levels.len() != self.storage_extrema.len() {
+                        return Err(MapError::Internal("extrema storage-area count".into()));
+                    }
+                    self.storage_extrema
+                        .iter_mut()
+                        .zip(levels)
+                        .map(|(e, &v)| e.push(position, v))
+                        .sum()
+                }
+                _ => 0,
+            };
+            self.extrema_budget = self
+                .extrema_budget
+                .checked_sub((added + added_storage) as u64)
+                .ok_or_else(|| {
+                    MapError::Budget("duration extrema exceed max_working_bytes".into())
+                })?;
         }
         self.equal += self
             .acc
@@ -443,13 +469,6 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
         ));
     }
     let duration = products.iter().any(|p| p == "duration");
-    // The recession search indexes cells; level-pool pixels carry storage-area
-    // labels, not cell positions, so duration is not defined for them yet.
-    if duration && h.storage_areas_file.is_some() {
-        return Err(MapError::Invalid(
-            "duration with storage-area surfaces is not implemented".into(),
-        ));
-    }
     let [_, _, width, height] = h.window;
     let count = width
         .checked_mul(height)
@@ -482,12 +501,16 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
     // the two ends); they are admitted out of the same budget as they grow.
     // Reserve: the worst case (every time an extremum), capped at half the
     // remaining budget; the per-cell floor (two ends) must fit.
+    // Storage areas (duration with level pools) keep one series each, too.
+    let series = (h.cell_count as u64)
+        .checked_add(h.storage_area_count as u64)
+        .ok_or_else(|| MapError::Budget("whole-simulation plan overflow".into()))?;
     let (reserve, extrema_budget) = if duration {
         let per_cell = std::mem::size_of::<Extrema>() as u64;
-        let floor = (h.cell_count as u64)
+        let floor = series
             .checked_mul(per_cell + 16)
             .ok_or_else(|| MapError::Budget("whole-simulation plan overflow".into()))?;
-        let worst = (h.cell_count as u64)
+        let worst = series
             .checked_mul(per_cell + 8 * n as u64)
             .ok_or_else(|| MapError::Budget("whole-simulation plan overflow".into()))?;
         let reserve = worst.min(budget / 2);
@@ -506,6 +529,11 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
         threshold: req.threshold,
         gate: minimum.iter().map(|m| m + req.threshold).collect(),
         extrema: duration.then(|| vec![Extrema::default(); h.cell_count]),
+        storage_extrema: if duration {
+            vec![Extrema::default(); h.storage_area_count]
+        } else {
+            Vec::new()
+        },
         extrema_budget,
         ..Default::default()
     };
@@ -522,6 +550,10 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
     if let Some(extrema) = &mut accumulator.extrema {
         let last = (n - 1) as u32;
         extrema.par_iter_mut().for_each(|e| e.close(last));
+        accumulator
+            .storage_extrema
+            .iter_mut()
+            .for_each(|e| e.close(last));
     }
     let recession_inputs = accumulator.extrema.as_deref().map(|extrema| Recession {
         extrema,
@@ -529,6 +561,8 @@ pub fn run(req: &Request, base: &Path, out: &Path) -> Result<Value, MapError> {
         ground: &accumulator.ground,
         gate: &accumulator.gate,
         threshold: accumulator.threshold,
+        storage_extrema: &accumulator.storage_extrema,
+        storage_start: accumulator.storage_start,
     });
     let result = finish(
         &accumulator.acc,
@@ -608,12 +642,15 @@ mod tests {
         let last = (times.len() - 1) as u32;
         let extrema = a.extrema.as_mut().unwrap();
         extrema.iter_mut().for_each(|e| e.close(last));
+        a.storage_extrema.iter_mut().for_each(|e| e.close(last));
         let r = Recession {
             extrema: a.extrema.as_deref().unwrap(),
             source: &a.source,
             ground: &a.ground,
             gate: &a.gate,
             threshold: a.threshold,
+            storage_extrema: &a.storage_extrema,
+            storage_start: a.storage_start,
         };
         finish(&a.acc, &a.index, window, times, Some(&r)).unwrap()
     }
@@ -625,6 +662,54 @@ mod tests {
         }
         e.close((series.len() - 1) as u32);
         e.points
+    }
+
+    /// Level-pool pixels: duration from the storage area's own series by the
+    /// cells' recession rule, without the cell gate; arrival unchanged. Two 2D
+    /// cells carrying the same series on the same grounds (ungated) get the
+    /// qualified cell results, which the pool pixels must equal bit for bit.
+    #[test]
+    fn storage_area_pixels_take_duration_from_the_pool_series() {
+        // Window pixels 0, 1: cells 0, 1; pixels 2, 3: pool pixels of area 0.
+        // Grounds 1.0 and 3.0. The pool rises to 5.0 and drains to 0.5.
+        let pool = [0.5_f32, 2.0, 4.0, 5.0, 4.5, 3.5, 2.5, 1.5, 0.5];
+        let times: Vec<f64> = (0..pool.len()).map(|k| k as f64 * 0.5).collect();
+        let storage = crate::storage_area::StorageAreaPixels {
+            pixels: vec![2, 3],
+            labels: vec![0, 0],
+            ground: vec![1.0, 3.0],
+            count: 1,
+        };
+        let mut a = Accumulator {
+            threshold: 0.0,
+            gate: vec![f32::NEG_INFINITY; 2],
+            extrema: Some(vec![Extrema::default(); 2]),
+            storage_extrema: vec![Extrema::default(); 1],
+            extrema_budget: u64::MAX,
+            ..Default::default()
+        };
+        a.prepare(&[1, 2, 0, 0], &[1.0, 3.0, 0.0, 0.0], Some(&storage))
+            .unwrap();
+        for (k, &v) in pool.iter().enumerate() {
+            a.profile(k, &[v, v], Some(&[v])).unwrap();
+        }
+        let r = finish_all(&mut a, 4, &times);
+        for (cell, pixel) in [(0, 2), (1, 3)] {
+            assert_eq!(r.arrival[pixel].to_bits(), r.arrival[cell].to_bits());
+            assert_eq!(r.duration[pixel].to_bits(), r.duration[cell].to_bits());
+            assert_eq!(r.percent[pixel].to_bits(), r.percent[cell].to_bits());
+        }
+        // Ground 1.0: wet 0.5 h to 3.5 h, which is the step before the falling
+        // window's end, so the recession is that last wet time (3.0 h).
+        assert_eq!((r.arrival[2], r.duration[2]), (0.5, 3.0));
+        // Ground 3.0: wet 1.0 h to 2.5 h inside the falling window: the
+        // bisection finds the first dry time, 3.0 h.
+        assert_eq!((r.arrival[3], r.duration[3]), (1.0, 2.0));
+        // The pool series has its own extrema: start, the peak and the end.
+        assert_eq!(
+            a.storage_extrema[0].points,
+            vec![(0, 0.5), (3, 5.0), (8, 0.5)]
+        );
     }
 
     #[test]
@@ -816,6 +901,8 @@ mod tests {
             ground: &[0.0],
             gate: &[f32::NEG_INFINITY],
             threshold: 0.5,
+            storage_extrema: &[],
+            storage_start: 1,
         };
         let r = finish(&acc, &[0], 1, &times, Some(&input(&falling))).unwrap();
         assert_eq!(
