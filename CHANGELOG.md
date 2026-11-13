@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- **`hecras_version` takes HEC-RAS release labels.** `effective-terrain`
+  accepts `6.6`, `6.7`, `6.7 Beta 4`, `6.7 Beta 5`, `7.0`, `7.0.0`, `7.0.1`
+  and `7.0.2` (case and repeated blanks ignored) and maps each to a rule:
+  7.0.x to the 7.0.1 rule, 6.6 to the 6.6 rule, and 6.7 to a new **6.7 rule**
+  (the 6.6 rule, except that boundary elevations without a perimeter control
+  point come from the stored profile, as HEC-RAS 6.7 renders them). Any other
+  label, including 6.5 and earlier and anything after 7.0.2, is refused under
+  either request schema before any read. `ras2fim-batch method` advertises the
+  table as `effective_terrain.hecras_versions` (`{label: rule}`), and the
+  report records `modifications.hecras_version` (the label) and
+  `modifications.hecras_rule`. Requests that omit `hecras_version` or send
+  `7.0.1` or `6.6` give bit-identical rasters (158 of the qualification's
+  requests re-run: identical files).
+- Qualified per release (2026-11-12): HEC-RAS 6.6, 6.7 Beta 4/5, 7.0, 7.0.1
+  and 7.0.2 exports, 0 mask and 0 value differences on every layer each rule
+  accepts; see `modifications.qualified`.
+
 ## 0.19.0 - 2026-11-12
 
 - **Staged cell subsets** (opt-in, capability `staged_cells`,

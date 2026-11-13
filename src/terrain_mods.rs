@@ -117,11 +117,16 @@
 //! caller rounds every value to 1/32 once, after all modifications, as RAS
 //! Mapper's TIFF writer does.
 //!
-//! `hecras_version` 6.6 (measured on HEC-RAS 6.6 exports): ground lines
+//! `hecras_version` names the HEC-RAS release ([`HECRAS_VERSIONS`]); each
+//! release selects one rule. 7.0, 7.0.1 and 7.0.2 take the 7.0.1 rule (the
+//! default). The 6.6 rule (measured on HEC-RAS 6.6 exports): ground lines
 //! whose Max Reach is not wider than one cell of the output tile are not
 //! drawn; named ground lines (6.6 builds systems differently) and boundary
 //! elevations without perimeter control points (6.6 samples the terrain) are
-//! refused; everything else follows the 7.0.1 rules.
+//! refused; everything else follows the 7.0.1 rule. The 6.7 rule (HEC-RAS
+//! 6.7 Beta 4 and Beta 5 exports) is the 6.6 rule, except that boundary
+//! elevations without perimeter control points come from the stored profile
+//! as under 7.0.1. Any other release is refused.
 use crate::{
     MapError,
     effective_terrain::{Grid, OutputLattice},
@@ -324,7 +329,7 @@ pub fn method_record() -> Value {
         "ellipse_rule": "per output-tile pixel centre: circle (equal radii) distance <= radius; otherwise (c dx + s dy)^2/rx^2 + (s dx - c dy)^2/ry^2 <= 1 with c, s = cos, sin(-rotation degrees), so a positive rotation turns the RadiusX axis clockwise in map view (y up), as in HEC-RAS 6.6 and 7.0.1 exports",
         "combine": "binary32 on the unrounded terrain (the mosaic and export TIN hold binary32 values; 1/32 rounding once after all modifications): a nodata terrain pixel takes the modification value; SetValue replaces; Add adds; SetIfHigher/SetIfLower replace when strictly higher/lower; layers stable-sorted by ascending Priority and applied in reverse (Priority 0 last, so it wins), features in stored order",
         "rounding": "binary32 throughout, then nearest 1/32 (ties to even) once at the end",
-        "hecras_version": "7.0.1 (default) or 6.6. 6.6 (measured on HEC-RAS 6.6 exports of the synthetic cases): ground lines with Max Reach not wider than one output-tile cell are not drawn; named ground lines and boundary elevations without perimeter control points are refused (6.6 builds systems differently and samples the terrain); all else as 7.0.1",
+        "hecras_version": "a HEC-RAS release label from effective_terrain.hecras_versions (omitted: the 7.0.1 rule); any other label is refused before any read. Rules: 7.0.1 (7.0, 7.0.0, 7.0.1, 7.0.2); 6.6 (measured on HEC-RAS 6.6 exports): ground lines with Max Reach not wider than one output-tile cell are not drawn, named ground lines and boundary elevations without perimeter control points are refused (6.6 builds systems differently and samples the terrain), all else as 7.0.1; 6.7 (6.7, 6.7 Beta 4, 6.7 Beta 5): the 6.6 rule, except that boundary elevations without perimeter control points come from the stored profile as under 7.0.1 (a polygon with neither is still refused). Releases before 6.6 and after 7.0.2 are not qualified",
         "qualified": {
             "scope": "fast-map 0.16.0 working tree, ras2fim-batch effective-terrain, request schema 2, HEC-RAS 7.0.1 exports with rasterize_modifications=True, downsample_factor=1, whole terrain",
             "real terrains A and B1-B4 (pixels where two exports differ excluded; unnamed ground lines, constant polygons, circles)": "no difference inside any modification footprint: B1 0 values (was 3 at 1/32 ft), B2 0 values (was 443, max 1.47 ft), B3 and B4 0; the remaining pixels (A 322 values, max 0.53 ft; B1, B2 and B3 2 mask pixels each) lie outside every footprint, in export-TIN gap fills",
@@ -332,6 +337,7 @@ pub fn method_record() -> Value {
             "synthetic T2 terrain, 20 ft (one export each)": "named writer cases (22.5 km channel, 21.2 km levee, channel + polygon + levee): 0 modified pixels differ (2 edge pixels differ in the base export); three joined channels with differing templates and profiles, a 20 ft junction gap and Transition Percent 0 / 0.5, a lone channel with NaN Transition Percent and an unnamed channel: 1 of 7,118 pixels at 1/32 ft; levee systems split by elevation type (Transition Percent 1, a profile starting at station 10, SetValue members): 0 of 2,494; a SetValue channel system in scrambled feature order: 0 of 4,567; blank-name cases (sharp bends, short segments, SetValue, Max Reach <= Top Width, ellipses) as before",
             "control points, boundary elevations, Add, NaN templates": "real terrain C, all 13 layers (2 ft, 379.0M px): 0 mask, 4 values at 1/32 ft; real terrain E without its terrain-sampled polygon layer (3 ft, 1.14G px; a 14-feature levee layer with 2,862 control points): 0 mask, 3 values at 1/32 ft; real terrain D without its terrain-sampled polygon layer (228 layers, 924.6M px; 202 boundary-elevation polygon layers with perimeter control points, 20 channel layers with control points): 0 mask, 3 values at 1/32 ft; synthetic polygons (interior points, stored profile, perimeter points, one point, Add): 2 of 12,805 px at 1/32 ft; synthetic ground lines with control points and Add: 1 of 2,499 px at 1/32 ft; NaN and negative templates: exact",
             "hecras_version 6.6": "HEC-RAS 6.6 exports of the synthetic cases: narrow ground lines 474 of 474 px, bends, short segments, SetValue, narrow templates, ellipses, control points, NaN templates, constant polygons: at most 2 px at 1/32 ft per case",
+            "hecras_versions (per-release qualification, 2026-11-12; this engine, ras2fim-batch effective-terrain, request schema 2, layers staged by the ras-commander reader with the release's rule; RAS Mapper exports with rasterize_modifications=True, downsample_factor=1, two repeats per release, identical)": "HEC-RAS 6.6, 6.7 Beta 4, 6.7 Beta 5, 7.0, 7.0.1 and 7.0.2 on a 20 ft single-source terrain (28 forms, 2 fixture-invalid excluded; 9 perimeter-control-point and control-point-line forms; 5 writer-authored perimeter-control-point polygons; the same 28 forms in a window whose minimum-Y edge cuts 8 ellipses and 5 polygons), Bald Eagle Terrain50 windows (8 rotated ellipses; 4 notebook-321 layers) and Helena 1 m (2 channel lines): every layer the release's rule accepts has 0 mask and 0 value differences against both exports (6.6 rule 18 of the 26 synthetic forms, 6.7 rule 23 including 5 stored-profile boundary polygons, 7.0.1 rule 26), and the base terrain is exact. Each release label gives the same bits as its rule. HEC-RAS 6.5 and earlier match neither rule (ground lines with control points, base interpolation at non-integer cell sizes) and are refused",
             "ellipse rotation and multi-part polygons (Bald Eagle Creek copy, 20 ft, 300 x 300 px extent exports, HEC-RAS 6.6 and 7.0.1, two repeats agree)": "ellipses 420 x 110 ft at rotations 0, 30, 90, -30, 45, 150, 120, -63.5: 0 mask and 0 value differences in both versions (a counter-clockwise reading would differ by 444-487 px at every rotation but 0 and 90). Multi-part constant polygons (holes in all four windings, disjoint parts, overlapping parts, hole ring first, hole with an island): even-odd fill differed by 70-467 px per case; the exports fill holes and islands, join overlaps and draw triangulation artefacts for disjoint parts and a leading hole ring, identically in 6.6 and 7.0.1; refused"
         },
         "known_differences": "RasMapperLib's binary64 powers (.NET Framework Math.Pow, e.g. distances as Pow(x, 0.5)) are not correctly rounded; this engine uses correctly rounded square roots and products. On terrain C's 3-feature system this moves 4 stream-line points by up to 6e-5 ft; no pixel changed in the measured cases",
@@ -2376,7 +2382,7 @@ fn polygon_tin(
     cps: &[ControlPoint],
     units: LengthUnits,
     name: &str,
-    v66: bool,
+    samples_boundaries: bool,
 ) -> Result<Option<CleanTin>, MapError> {
     if f.rings.len() != 1 {
         return Err(MapError::Unsupported(format!(
@@ -2434,7 +2440,7 @@ fn polygon_tin(
             }
         }
     } else if f.generate_boundary && on_perimeter == 0 {
-        if v66 {
+        if samples_boundaries {
             return Err(MapError::Unsupported(format!(
                 "polygon layer {name:?}: HEC-RAS 6.6 samples boundary elevations from the terrain (not qualified)"
             )));
@@ -2555,23 +2561,84 @@ fn bbox_of(points: impl Iterator<Item = (f64, f64)>) -> [f64; 4] {
     b
 }
 
-/// The HEC-RAS version whose modification rules apply.
+/// The HEC-RAS modification rule set applied (one per family of releases
+/// whose exports render modifications identically).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RasVersion {
+    /// HEC-RAS 7.0, 7.0.1 and 7.0.2 (the default).
     V7_0_1,
+    /// HEC-RAS 6.6.
     V6_6,
+    /// HEC-RAS 6.7 (Beta 4 and Beta 5): the 6.6 rule, except that boundary
+    /// elevations without a perimeter control point come from the stored
+    /// profile, as under the 7.0.1 rule.
+    V6_7,
 }
 
+/// HEC-RAS release labels accepted as `hecras_version`, and the rule each
+/// selects. Matching ignores case and repeated blanks. Any other label is
+/// refused: a release is added only after its exports are qualified.
+pub const HECRAS_VERSIONS: [(&str, RasVersion); 8] = [
+    ("6.6", RasVersion::V6_6),
+    ("6.7", RasVersion::V6_7),
+    ("6.7 Beta 4", RasVersion::V6_7),
+    ("6.7 Beta 5", RasVersion::V6_7),
+    ("7.0", RasVersion::V7_0_1),
+    ("7.0.0", RasVersion::V7_0_1),
+    ("7.0.1", RasVersion::V7_0_1),
+    ("7.0.2", RasVersion::V7_0_1),
+];
+
 impl RasVersion {
-    pub fn parse(v: Option<&str>) -> Result<Self, MapError> {
-        match v.map(str::trim) {
-            None | Some("7.0.1") => Ok(RasVersion::V7_0_1),
-            Some("6.6") => Ok(RasVersion::V6_6),
-            Some(o) => Err(MapError::Unsupported(format!(
-                "hecras_version {o:?}: only 7.0.1 and 6.6 are qualified"
-            ))),
+    /// The rule's name, as advertised in `hecras_versions`.
+    pub fn rule(self) -> &'static str {
+        match self {
+            RasVersion::V7_0_1 => "7.0.1",
+            RasVersion::V6_6 => "6.6",
+            RasVersion::V6_7 => "6.7",
         }
     }
+
+    /// The rule for a request's `hecras_version` (omitted: 7.0.1).
+    pub fn parse(v: Option<&str>) -> Result<Self, MapError> {
+        let Some(label) = v else {
+            return Ok(RasVersion::V7_0_1);
+        };
+        let key = label.split_whitespace().collect::<Vec<_>>().join(" ");
+        HECRAS_VERSIONS
+            .iter()
+            .find(|(l, _)| l.eq_ignore_ascii_case(&key))
+            .map(|(_, r)| *r)
+            .ok_or_else(|| {
+                let accepted: Vec<&str> = HECRAS_VERSIONS.iter().map(|(l, _)| *l).collect();
+                MapError::Unsupported(format!(
+                    "hecras_version {label:?} is not a qualified HEC-RAS release (accepted: {});                      use the RAS Mapper export",
+                    accepted.join(", ")
+                ))
+            })
+    }
+
+    /// 6.6 and 6.7 draw no ground line whose Max Reach is not wider than one
+    /// output-tile cell, and build named systems differently (refused).
+    fn v6_ground_lines(self) -> bool {
+        matches!(self, RasVersion::V6_6 | RasVersion::V6_7)
+    }
+
+    /// 6.6 samples the terrain for boundary elevations without a perimeter
+    /// control point, even when a profile is stored (refused).
+    fn samples_boundaries(self) -> bool {
+        self == RasVersion::V6_6
+    }
+}
+
+/// `{label: rule}` for every accepted `hecras_version` label.
+pub fn hecras_versions_record() -> Value {
+    Value::Object(
+        HECRAS_VERSIONS
+            .iter()
+            .map(|(l, r)| (l.to_string(), Value::from(r.rule())))
+            .collect(),
+    )
 }
 
 /// Per-layer counts of changed pixels (HEC-RAS 7.0.1 rules).
@@ -2587,14 +2654,15 @@ pub fn apply_version(
     version: RasVersion,
 ) -> Result<Value, MapError> {
     validate(layers)?;
-    let v66 = version == RasVersion::V6_6;
-    if v66 {
+    let v6_lines = version.v6_ground_lines();
+    if v6_lines {
         for l in layers {
             if let Layer::GroundLine { features, name, .. } = l
                 && features.iter().any(|f| !f.system_name.trim().is_empty())
             {
                 return Err(MapError::Unsupported(format!(
-                    "ground line layer {name:?}: named ground lines under HEC-RAS 6.6 are not qualified (its system path differs)"
+                    "ground line layer {name:?}: named ground lines under HEC-RAS {} are not qualified (its system path differs)",
+                    version.rule()
                 )));
             }
         }
@@ -2652,9 +2720,9 @@ pub fn apply_version(
                             .fold(f32::NAN, f32::max),
                     };
                     for (l, m, tg, rows, cols) in tiles.over(b) {
-                        // HEC-RAS 6.6 does not draw ground lines whose Max
-                        // Reach is not wider than one cell of the tile.
-                        if v66 && reach as f64 / tg.cs <= 1.0 {
+                        // HEC-RAS 6.6 and 6.7 do not draw ground lines whose
+                        // Max Reach is not wider than one cell of the tile.
+                        if v6_lines && reach as f64 / tg.cs <= 1.0 {
                             continue;
                         }
                         buf.fill(f32::NAN);
@@ -2679,7 +2747,13 @@ pub fn apply_version(
             } => {
                 for f in features {
                     if polygon_needs_tin(f, control_points) {
-                        let Some(tin) = polygon_tin(f, control_points, *length_units, name, v66)?
+                        let Some(tin) = polygon_tin(
+                            f,
+                            control_points,
+                            *length_units,
+                            name,
+                            version.samples_boundaries(),
+                        )?
                         else {
                             skipped += 1;
                             continue;
@@ -3401,6 +3475,101 @@ mod tests {
         assert!(v.iter().all(|z| *z == 0.0));
         apply(&layers, &grid(), &mut v).unwrap();
         assert!(v.contains(&20.0));
+    }
+
+    #[test]
+    fn hecras_release_labels_select_their_rule() {
+        for (label, rule) in [
+            ("6.6", RasVersion::V6_6),
+            ("6.7", RasVersion::V6_7),
+            ("6.7 Beta 4", RasVersion::V6_7),
+            ("6.7 beta  5", RasVersion::V6_7),
+            ("7.0", RasVersion::V7_0_1),
+            ("7.0.0", RasVersion::V7_0_1),
+            (" 7.0.1 ", RasVersion::V7_0_1),
+            ("7.0.2", RasVersion::V7_0_1),
+        ] {
+            assert_eq!(RasVersion::parse(Some(label)).unwrap(), rule, "{label}");
+        }
+        assert_eq!(RasVersion::parse(None).unwrap(), RasVersion::V7_0_1);
+        for label in [
+            "",
+            "6.5",
+            "6.4.1",
+            "6.6.1",
+            "6.60",
+            "6.70",
+            "6.7 Beta 3",
+            "7",
+            "7.0.3",
+            "7.1",
+            "7.10",
+        ] {
+            let err = RasVersion::parse(Some(label)).unwrap_err();
+            assert!(matches!(err, MapError::Unsupported(_)), "{label}: {err:?}");
+            assert!(format!("{err:?}").contains("7.0.2"), "{err:?}");
+        }
+        let record = hecras_versions_record();
+        assert_eq!(record["6.7 Beta 5"], "6.7");
+        assert_eq!(record["7.0.2"], "7.0.1");
+        assert_eq!(record.as_object().unwrap().len(), HECRAS_VERSIONS.len());
+    }
+
+    #[test]
+    fn hecras_6_7_draws_ground_lines_as_6_6() {
+        let mut f = levee(
+            vec![[10.0, 50.5], [90.0, 50.5]],
+            vec![[0.0, 20.0], [80.0, 20.0]],
+        );
+        f.top_width = 0.5;
+        f.max_reach = 1.0; // one cell
+        let layers = [gl_layer(GroundLineSubtype::Levee, vec![f.clone()])];
+        let mut v = vec![0.0_f32; 100 * 100];
+        apply_version(&layers, &grid(), &mut v, RasVersion::V6_7).unwrap();
+        assert!(v.iter().all(|z| *z == 0.0));
+        f.system_name = "sys".into();
+        let layers = [gl_layer(GroundLineSubtype::Levee, vec![f])];
+        for version in [RasVersion::V6_6, RasVersion::V6_7] {
+            let err = apply_version(&layers, &grid(), &mut v, version).unwrap_err();
+            assert!(matches!(err, MapError::Unsupported(_)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn hecras_6_7_uses_the_stored_boundary_profile() {
+        let ring = vec![
+            [20.0, 20.0],
+            [80.0, 20.0],
+            [80.0, 80.0],
+            [20.0, 80.0],
+            [20.0, 20.0],
+        ];
+        let mut p = poly(ring, ElevationType::SetValue, 0.0);
+        p.generate_boundary = true;
+        p.profile = vec![[0.0, 0.0], [120.0, 60.0], [240.0, 0.0]];
+        // An interior control point is a mass point, not a perimeter point.
+        let layers = [poly_layer(vec![p.clone()], vec![cp(50.0, 50.0, 30.0)])];
+        let mut v701 = vec![-5.0_f32; 100 * 100];
+        apply_version(&layers, &grid(), &mut v701, RasVersion::V7_0_1).unwrap();
+        let mut v67 = vec![-5.0_f32; 100 * 100];
+        apply_version(&layers, &grid(), &mut v67, RasVersion::V6_7).unwrap();
+        assert!(
+            v701.iter()
+                .zip(&v67)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+        assert!(v67.iter().any(|z| *z != -5.0));
+        let mut v66 = vec![-5.0_f32; 100 * 100];
+        let err = apply_version(&layers, &grid(), &mut v66, RasVersion::V6_6).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("samples boundary elevations"),
+            "{err:?}"
+        );
+        // Neither a perimeter point nor a stored profile: refused under 6.7 too.
+        p.profile.clear();
+        let layers = [poly_layer(vec![p], vec![cp(50.0, 50.0, 30.0)])];
+        let err = apply_version(&layers, &grid(), &mut v67, RasVersion::V6_7).unwrap_err();
+        assert!(matches!(err, MapError::Unsupported(_)), "{err:?}");
     }
 
     #[test]

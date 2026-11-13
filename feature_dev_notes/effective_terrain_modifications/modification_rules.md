@@ -60,6 +60,29 @@ engine follows 6.6 for the narrow skip (per output tile, Max Reach / cell <= 1)
 and refuses the two other forms. Under 6.6 every accepted synthetic case
 matches (2 of 8,935 and 1 of 2,499 px at 1/32 ft, the rest exact).
 
+## Release labels and the 6.7 rule (per-release qualification, 2026-11-12)
+
+`hecras_version` names a HEC-RAS release; the engine maps it to a rule and
+refuses any release that is not listed (`effective_terrain.hecras_versions`).
+RAS Mapper exports of 6.6, 6.7 Beta 4/5, 7.0, 7.0.1 and 7.0.2 (two repeats
+each, identical) fall into three families, every modified export identical
+within a family:
+
+| Releases | Rule | Differs from the 7.0.1 rule |
+|---|---|---|
+| 7.0, 7.0.1, 7.0.2 | `7.0.1` | — |
+| 6.7 Beta 4, 6.7 Beta 5 | `6.7` | narrow ground lines not drawn (as 6.6); named systems refused (6.7's 3-member channel system differs by 281 px from 7.0+); boundary elevations without a perimeter control point use the stored profile (as 7.0+, unlike 6.6) |
+| 6.6 | `6.6` | as 6.7, and boundary elevations without a perimeter control point refused (6.6 samples the terrain) |
+
+Under each release's rule, every accepted layer of the synthetic, Bald Eagle
+and Helena cases matched both exports with 0 mask and 0 value differences
+(6.6: 18 of 26 synthetic forms; 6.7: 23, including the five stored-profile
+boundary polygons; 7.0.x: 26), including five polygons whose boundary comes
+only from perimeter control points written by ras-commander's writer.
+HEC-RAS 6.5 and earlier match neither rule (ground lines with control points
+from 6.5; base interpolation at non-integer cell sizes, named systems and
+ground lines below), so they are refused.
+
 ## Multi-part polygons and ellipse rotation (HEC-RAS 6.6 and 7.0.1)
 
 This check follows the ras-commander notebook 321 writer round trip, where RAS
