@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+- **Staged sessions (#50).** No Depth/WSE bit changes; request schemas and
+  `ras-commander-staged-cells/1` are unchanged.
+  - A staged load counts the window and hydraulic caches still held from an
+    earlier request with larger budgets, not only this request's budgets.
+  - A refusal after the staged load (terrain identity/grid/window mismatch, or
+    `sloping decoder plan exceeds budget`) no longer drops the previous model's
+    geometry: an incompatible geometry is released only once the request is
+    admitted.
+  - The owner-set key is hashed as a stream (same key text, no per-owner
+    buffers), and the per-mesh owner sets (4 bytes per owner cell, exact size)
+    are charged to the load and kept with the geometry, so a reuse compares the
+    owner sets themselves: an FNV-1a64 collision loads instead of reusing
+    another subset. Compact-mesh vectors are allocated at their final length.
+  - Retained hydraulic state is keyed on the geometry key as well.
+  - The staged load also counts a grouped profile's pinned hydraulic state and
+    a same-key geometry over other owner sets.
+  - A staged request whose owner cell names a mesh beyond `mesh_files` or a
+    cell id above `u32` is refused when its key is built (before: at the load),
+    with "sloping ownership requires physical mesh cells" or "staged cells
+    must include every owner cell".
+  - `tests/thread_budget.rs`: a per-thread CPU control asserted on every host
+    (each terrio pool thread of a two-, three- and five-thread control pool is
+    seen using CPU; this one is asserted on the 2-CPU Linux runner too), and
+    concurrency controls on a child that only computes: two spinners above the
+    threads=1 bound (3 CPUs) and four above the threads=3 bound (5 CPUs).
+
 ## 0.20.0 - 2026-11-12
 
 Release summary: any CRS (`crs_geokeys`), HEC-RAS release labels with the 6.7
