@@ -720,9 +720,22 @@ fn stored_map_basis_refusals() {
             .err()
             .map(|e| (e.kind(), format!("{e:?}")))
     };
-    let (k, msg) = kind(&two, json!({"basis": "stored_map"})).unwrap();
-    assert_eq!(k, "unsupported");
-    assert!(msg.contains("single-source"), "{msg}");
+    // Two sources on one lattice compose (see the composition test); a source
+    // on another cell size or off the lattice cannot share one raster.
+    assert!(kind(&two, json!({"basis": "stored_map"})).is_none());
+    let coarse = grid(1000.0, 2000.0, 20.0, 10, 6);
+    write_source(&dir, "c.tif", coarse, plane(&coarse));
+    write_mask(&dir, "c.u1", 10, 6, |_, _| true);
+    let shifted = grid(1005.0, 2000.0, 10.0, 20, 12);
+    write_source(&dir, "d.tif", shifted, plane(&shifted));
+    for other in ["c", "d"] {
+        let (w, h) = if other == "c" { (10, 6) } else { (20, 12) };
+        let srcs = json!([{"path": "a.tif", "mask": mask("a.u1", 20, 12)},
+                          {"path": format!("{other}.tif"), "mask": mask(if other == "c" {"c.u1"} else {"a.u1"}, w, h)}]);
+        let (k, msg) = kind(&srcs, json!({"basis": "stored_map"})).unwrap();
+        assert_eq!(k, "unsupported", "{other}");
+        assert!(msg.contains("its own grid"), "{other}: {msg}");
+    }
     let (k, _) = kind(
         &one,
         json!({"basis": "stored_map", "grid": {"origin_x": 1000.0, "origin_y": 2000.0,
@@ -748,6 +761,204 @@ fn method_record_advertises_the_bases() {
     assert_eq!(r["bases"], json!(["export", "stored_map"]));
     assert_eq!(r["default_basis"], "export");
     assert_eq!(r["stored_map"]["rule_id"], "rasmapper-stored-map-terrain/1");
+    assert_eq!(
+        r["stored_map"]["multi_source"]["composition_rule_id"],
+        "rasmapper-stored-map-composition/1"
+    );
+}
+
+/// The composition rule, written independently: priority order, a lower
+/// source hidden under a higher source's 8-connected interior, and on a
+/// higher source's edge ring unless interior itself.
+fn compose_reference(
+    sources: &[(usize, usize, usize, usize, &[f32])],
+    w: usize,
+    h: usize,
+) -> Vec<f32> {
+    let valid_at = |s: &(usize, usize, usize, usize, &[f32]), r: isize, c: isize| {
+        let (c0, r0, sw, sh, v) = *s;
+        let (lr, lc) = (r - r0 as isize, c - c0 as isize);
+        lr >= 0
+            && lc >= 0
+            && (lr as usize) < sh
+            && (lc as usize) < sw
+            && v[lr as usize * sw + lc as usize] != NODATA
+    };
+    let interior = |s: &(usize, usize, usize, usize, &[f32]), r: isize, c: isize| {
+        (-1..=1).all(|dr| (-1..=1).all(|dc| valid_at(s, r + dr, c + dc)))
+    };
+    let mut out = vec![NODATA; w * h];
+    for (k, s) in sources.iter().enumerate() {
+        for r in 0..h as isize {
+            for c in 0..w as isize {
+                if !valid_at(s, r, c) {
+                    continue;
+                }
+                let higher = &sources[..k];
+                if higher.iter().any(|t| interior(t, r, c)) {
+                    continue;
+                }
+                if higher.iter().any(|t| valid_at(t, r, c)) && !interior(s, r, c) {
+                    continue;
+                }
+                let (c0, r0, sw, _, v) = *s;
+                out[r as usize * w + c as usize] = v[(r as usize - r0) * sw + c as usize - c0];
+            }
+        }
+    }
+    out
+}
+
+/// Several sources on one lattice compose as RAS Mapper's stored maps do;
+/// one source keeps the single-source path; modifications apply on top.
+#[test]
+fn stored_map_basis_composes_aligned_sources() {
+    let dir = scratch();
+    // A: columns 0..15 with a nodata hole; B: columns 15..30, adjacent to A;
+    // C: columns 5..25 under the A/B seam and the hole. 300 rows span two
+    // block rows.
+    let (h, cell) = (300, 10.0);
+    let make = |c0: usize, w: usize, offset: f32, hole: bool| {
+        let g = grid(1000.0 + c0 as f64 * cell, 5000.0, cell, w, h);
+        let mut v: Vec<f32> = plane(&g).into_iter().map(|x| x + offset + 0.003).collect();
+        if hole {
+            for r in 100..110 {
+                for c in 8..12 {
+                    v[r * w + c] = NODATA;
+                }
+            }
+        }
+        (g, v)
+    };
+    let (ga, va) = make(0, 15, 0.0, true);
+    let (gb, vb) = make(15, 15, 0.25, false);
+    let (gc, vc) = make(5, 20, 0.5, false);
+    for (n, g, v) in [("a", ga, &va), ("b", gb, &vb), ("c", gc, &vc)] {
+        write_source(&dir, &format!("{n}.tif"), g, v.clone());
+        write_mask(&dir, &format!("{n}.u1"), g.width, h, |_, _| true);
+    }
+    let srcs = json!([{"path": "a.tif", "mask": mask("a.u1", 15, h)},
+                      {"path": "b.tif", "mask": mask("b.u1", 15, h)},
+                      {"path": "c.tif", "mask": mask("c.u1", 20, h)}]);
+    let out =
+        effective_terrain::compute(&request(srcs.clone(), json!({"basis": "stored_map"})), &dir)
+            .unwrap();
+    assert_eq!(out.grid, grid(1000.0, 5000.0, cell, 30, h));
+    let want = compose_reference(
+        &[(0, 0, 15, h, &va), (15, 0, 15, h, &vb), (5, 0, 20, h, &vc)],
+        30,
+        h,
+    );
+    for (i, (v, w)) in out.values.iter().zip(&want).enumerate() {
+        assert_eq!(v.to_bits(), w.to_bits(), "pixel ({}, {})", i / 30, i % 30);
+    }
+    assert_eq!(
+        out.report["composition"]["rule_id"],
+        "rasmapper-stored-map-composition/1"
+    );
+    // C shows through on the seam (A's last and B's first column) away from
+    // the raster's top and bottom rows, and on the hole's ring; never in A's
+    // or B's interior.
+    let at = |r: usize, c: usize| out.values[r * 30 + c];
+    assert_eq!(at(50, 14), vc[50 * 20 + 9]);
+    assert_eq!(at(50, 15), vc[50 * 20 + 10]);
+    assert_eq!(at(0, 14), va[14]);
+    assert_eq!(at(105, 9), vc[105 * 20 + 4]);
+    assert_eq!(at(99, 8), vc[99 * 20 + 3]);
+    assert_eq!(at(98, 8), va[98 * 15 + 8]);
+    assert_eq!(at(50, 20), vb[50 * 15 + 5]);
+    let sources = out.report["sources"].as_array().unwrap();
+    assert_eq!(sources[0]["hidden_by_higher_priority"], 0);
+    assert!(sources[2]["hidden_by_higher_priority"].as_u64().unwrap() > 0);
+    // Modifications on the composed lattice, unrounded.
+    let ring = json!([[
+        [1100.0, 4500.0],
+        [1200.0, 4500.0],
+        [1200.0, 4600.0],
+        [1100.0, 4600.0]
+    ]]);
+    let mods = json!({"schema": "ras-commander-effective-terrain-request/2", "basis": "stored_map", "modifications": 1,
+        "modification_layers": [{"kind": "polygon", "name": "cut", "priority": 0,
+            "features": [{"elevation_type": "SetValue", "elevation": 40.01, "rings": ring}]}]});
+    let modified = effective_terrain::compute(&request(srcs, mods), &dir).unwrap();
+    let mut changed = 0;
+    for (i, (m, o)) in modified.values.iter().zip(&out.values).enumerate() {
+        if m != o {
+            assert_eq!(*m, 40.01_f32, "pixel {i}");
+            changed += 1;
+        }
+    }
+    assert!(changed > 0);
+}
+
+/// A source a whole number of rows below the others, and a NaN cell (invalid,
+/// like nodata): the composition follows the reference on both axes.
+#[test]
+fn stored_map_basis_composes_a_vertically_offset_source() {
+    let dir = scratch();
+    let (cell, w) = (10.0, 12);
+    let ga = grid(1000.0, 5000.0, cell, w, 280);
+    let gb = grid(1000.0, 5000.0 - 260.0 * cell, cell, w, 40);
+    let mut va: Vec<f32> = plane(&ga).into_iter().map(|x| x + 0.003).collect();
+    va[100 * w + 5] = f32::NAN;
+    let vb: Vec<f32> = plane(&gb).into_iter().map(|x| x + 0.253).collect();
+    write_source(&dir, "a.tif", ga, va.clone());
+    write_source(&dir, "b.tif", gb, vb.clone());
+    write_mask(&dir, "a.u1", w, 280, |_, _| true);
+    write_mask(&dir, "b.u1", w, 40, |_, _| true);
+    let srcs = json!([{"path": "a.tif", "mask": mask("a.u1", w, 280)},
+                      {"path": "b.tif", "mask": mask("b.u1", w, 40)}]);
+    let out =
+        effective_terrain::compute(&request(srcs, json!({"basis": "stored_map"})), &dir).unwrap();
+    assert_eq!(out.grid, grid(1000.0, 5000.0, cell, w, 300));
+    assert_eq!(out.report["sources"][1]["lattice_offset"], json!([0, 260]));
+    let mut a_ref = va.clone();
+    for v in a_ref.iter_mut() {
+        if v.is_nan() {
+            *v = NODATA;
+        }
+    }
+    let want = compose_reference(&[(0, 0, w, 280, &a_ref), (0, 260, w, 40, &vb)], w, 300);
+    for (i, (v, x)) in out.values.iter().zip(&want).enumerate() {
+        assert_eq!(v.to_bits(), x.to_bits(), "pixel ({}, {})", i / w, i % w);
+    }
+    // B shows on A's last row (an edge ring cell, B interior there) and below A.
+    assert_eq!(out.values[279 * w + 5], vb[19 * w + 5]);
+    assert_eq!(out.values[290 * w + 5], vb[30 * w + 5]);
+    assert_eq!(out.values[278 * w + 5], va[278 * w + 5]);
+    assert_eq!(out.values[100 * w + 5], NODATA);
+}
+
+/// Several sources reserve one block cache each.
+#[test]
+fn stored_map_composition_reserves_every_source_cache() {
+    let dir = scratch();
+    let g = grid(1000.0, 5000.0, 10.0, 64, 64);
+    for n in ["a", "b", "c"] {
+        write_source(&dir, &format!("{n}.tif"), g, plane(&g));
+        write_mask(&dir, &format!("{n}.u1"), 64, 64, |_, _| true);
+    }
+    let srcs = json!([{"path": "a.tif", "mask": mask("a.u1", 64, 64)},
+                      {"path": "b.tif", "mask": mask("b.u1", 64, 64)},
+                      {"path": "c.tif", "mask": mask("c.u1", 64, 64)}]);
+    // Each cache gets the 1 MiB floor; output and composition flags are small.
+    let fits = (3u64 << 20) + 64 * 64 * 4 + 2 * 64 * 64 + 1;
+    let ok = effective_terrain::compute(
+        &request(
+            srcs.clone(),
+            json!({"basis": "stored_map", "max_working_bytes": fits}),
+        ),
+        &dir,
+    );
+    assert!(ok.is_ok(), "{:?}", ok.err());
+    let short = effective_terrain::compute(
+        &request(
+            srcs,
+            json!({"basis": "stored_map", "max_working_bytes": (2u64 << 20) + 64 * 64 * 8}),
+        ),
+        &dir,
+    );
+    assert_eq!(short.err().unwrap().kind(), "budget");
 }
 
 /// The stored-map basis plans no export TIN, so a budget the export TIN

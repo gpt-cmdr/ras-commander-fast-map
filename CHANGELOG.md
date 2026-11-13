@@ -40,6 +40,23 @@
   existing pool plot test passes `wse >= ground + 0.001` in float32 (about
   0.000977 ft at 660 ft); that test is kept so arrival time and percent
   inundated stay bit-identical (checked against 0.19.0 on the same request).
+- **Stored-map basis for several sources on one lattice** (advertised as
+  `effective_terrain.stored_map.multi_source`, composition rule
+  `rasmapper-stored-map-composition/1`, reported as `composition`). Sources
+  with the same cell size and origins whole cells apart compose on the export
+  lattice as RAS Mapper's stored maps do: in priority order, each over the
+  ones before it; a lower source is hidden under any higher source's
+  8-connected interior, and on a higher source's edge ring unless the cell is
+  in its own interior. Then the modifications, unrounded. Measured on Helena
+  split into two and three aligned sources by HEC-RAS 7.0.1 CreateTerrain
+  (one with a nodata hole; Middle Cahaba p01 Max; RAS Mapper 7.0.1 stored maps
+  and their VRT): Depth equals float32(WSE - terrain) on all but 27 and 68 of
+  6,865,021 wet pixels, all on source seams (92 of the 95 where RAS Mapper's
+  VRT shows a higher source's depth because the lower source is dry there,
+  which one terrain cannot hold), and on all 832 modified pixels. Sources on
+  different cell sizes or origins off the lattice are still refused (RAS
+  Mapper writes each source's map on its own grid). Single-source requests
+  and the export basis are unchanged.
 
 ## 0.20.0 - 2026-11-12
 

@@ -65,9 +65,11 @@
 //!
 //! Without modifications this is the source TIFF bit for bit, i.e. the
 //! terrain that the qualified source-TIFF mapping route already uses.
-//! Multi-source terrains, an explicit `grid` or `extent`, and a lattice that
-//! does not cover the source cell for cell are refused: per-source stored
-//! maps of overlapping sources are not qualified.
+//! Several sources on one lattice (same cell size, origins whole cells apart)
+//! compose as RAS Mapper's stored maps do (`rasmapper-stored-map-composition/1`,
+//! see `stored_map_multi`). Sources on different lattices, an explicit `grid`
+//! or `extent`, and a single source the lattice does not cover cell for cell
+//! are refused.
 use crate::{
     MapError,
     export_tin::{self, BlockLattice, BlockSource, TileGrid},
@@ -264,7 +266,14 @@ pub fn method_record() -> Value {
             "rule": "the single source's own cells on its GeoTIFF grid (source nodata or NaN is nodata; no render blocks, no export TIN); then the modifications rasterized and combined exactly as for the export, on the export lattice, which covers the source cell for cell; no 1/32 rounding",
             "why": "the export never answers a source's last cell row and column (no render block lies below or right of their centres) and rounds every value to 1/32; RAS Mapper's stored maps use those cells and the unrounded modification values",
             "unmodified": "bit-identical to the source TIFF (the source-TIFF mapping route's terrain)",
-            "refused": "more than one source, an explicit grid or extent, a lattice that does not match the source's cell count and origin",
+            "refused": "an explicit grid or extent; one source: a lattice that does not match the source's cell count and origin; several sources: a source whose cell size or origin is not on the lattice (RAS Mapper writes each source's map on its own grid)",
+            "multi_source": {
+                "composition_rule_id": STORED_MAP_COMPOSITION_ID,
+                "rule": "sources on one lattice (same cell size, origins whole cells apart) drawn in priority order, each over the ones before it; a lower source's cell is hidden under the 8-connected interior of any higher-priority source, and on a higher source's edge ring unless the cell is in the lower source's own interior (cells outside a source count as invalid); then the modifications on the lattice, unrounded",
+                "known_differences": "RAS Mapper composes per-source depth maps: on a seam cell where the lower source is dry and the higher wet, its VRT shows the higher source's depth, which one terrain cannot hold (66 + 26 pixels in the qualification, all on seams); 3 seam-corner cells where RAS Mapper shows the lower source",
+                "qualified": "Helena split into three aligned sources (3,000 + 1,877 + 3,000 columns, one with a nodata hole; HEC-RAS 7.0.1 CreateTerrain; Middle Cahaba p01 Max, horizontal; RAS Mapper 7.0.1 stored maps and their VRT): see the release notes",
+                "refused": "sources with different cell sizes or origins off the lattice"
+            },
             "qualified": {
                 "Helena (1 source, 4877 x 4877 at 3.28 ft, ESRI:102630; Middle Cahaba p01 Max, sloping; RAS Mapper stored maps)": "HEC-RAS 7.0.1 and 6.6, two channel ground lines (SetIfLower): stored-map Depth equals float32(WSE - terrain) on all 7,506,407 wet pixels (the export basis: 2,341 wet pixels nodata, all in the source's last row and column, and 1,460 Depth mismatches up to 1/64 ft, all modified pixels); unmodified: bit-identical to the source TIFF; fast-map Depth/WSE mapped on it: 0 mask differences, 1 WSE/Depth value at 3.05e-5 ft (as on the source-TIFF route)"
             }
@@ -863,10 +872,29 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
         // block cache are planned. The cache is the one the source was
         // opened with (max_working_bytes / 4, at least 1 MiB), so a small
         // budget reserves the 1 MiB floor too.
-        if out_bytes > req.max_working_bytes.saturating_sub(cache) {
+        // Several sources also hold the covered-interior flags (one byte per
+        // lattice cell) and one source's valid flags at a time.
+        let composition = if sources.len() > 1 {
+            (grid.width as u64 * grid.height as u64).saturating_add(
+                sources
+                    .iter()
+                    .map(|s| s.terrain.width as u64 * s.terrain.height as u64)
+                    .max()
+                    .unwrap_or(0),
+            )
+        } else {
+            0
+        };
+        // Each source holds its own block cache while it is drawn and keeps
+        // it: several sources reserve one cache each.
+        let caches = cache.saturating_mul(sources.len() as u64);
+        if out_bytes.saturating_add(composition) > req.max_working_bytes.saturating_sub(caches) {
             return Err(MapError::Budget(format!(
-                "output grid {}x{} needs {out_bytes} bytes beyond the source cache; max_working_bytes is {}",
-                grid.width, grid.height, req.max_working_bytes
+                "output grid {}x{} needs {} bytes beyond the source cache; max_working_bytes is {}",
+                grid.width,
+                grid.height,
+                out_bytes.saturating_add(composition),
+                req.max_working_bytes
             )));
         }
         let values = vec![NODATA; grid.width * grid.height];
@@ -874,6 +902,9 @@ pub fn compute(req: &Request, base: &Path) -> Result<Effective, MapError> {
             .num_threads(req.threads)
             .build()
             .map_err(|e| MapError::Internal(format!("thread pool: {e}")))?;
+        if sources.len() > 1 {
+            return stored_map_multi(req, &sources, grid, values, &pool, started);
+        }
         return stored_map(req, &sources, grid, values, &pool, started);
     }
     let threads = req.threads as u64;
@@ -1088,16 +1119,20 @@ fn stored_map_lattice(req: &Request, sources: &[SourceData], grid: &Grid) -> Res
             "basis {BASIS_STORED_MAP:?}: {why}"
         )))
     };
-    if sources.len() != 1 {
-        return refuse(format!(
-            "qualified for single-source terrains only; this terrain has {} sources (RAS Mapper's per-source stored maps of overlapping sources are not qualified)",
-            sources.len()
-        ));
-    }
     if req.grid.is_some() || req.extent.is_some() {
         return refuse(
             "stored maps are written on the source's own grid; omit grid and extent".into(),
         );
+    }
+    if sources.len() > 1 {
+        // Several sources compose on the export lattice only when every
+        // source lies on it cell for cell (`stored_map_multi`).
+        for s in sources {
+            if let Err(why) = lattice_offset(&s.terrain, grid) {
+                return refuse(why);
+            }
+        }
+        return Ok(());
     }
     let t = &sources[0].terrain;
     if grid.width != t.width
@@ -1118,6 +1153,183 @@ fn stored_map_lattice(req: &Request, sources: &[SourceData], grid: &Grid) -> Res
         ));
     }
     Ok(())
+}
+
+/// Rule identifier of the multi-source composition on the stored-map basis.
+pub const STORED_MAP_COMPOSITION_ID: &str = "rasmapper-stored-map-composition/1";
+
+/// Cell offset of a source on the stored-map lattice, or why it is not on it.
+fn lattice_offset(t: &NativeTerrain, grid: &Grid) -> Result<(usize, usize), String> {
+    let cell = grid.cell_size;
+    if (t.gt[1] - cell).abs() > cell * 1e-12 {
+        return Err(format!(
+            "{}: cell size {} differs from the lattice's {cell}; RAS Mapper writes each source's stored map on its own grid, which one raster cannot hold",
+            t.path, t.gt[1]
+        ));
+    }
+    let col = near_integer((t.gt[0] - grid.origin_x) / cell);
+    let row = near_integer((grid.origin_y - t.gt[3]) / cell);
+    if col.fract() != 0.0 || row.fract() != 0.0 || col < 0.0 || row < 0.0 {
+        return Err(format!(
+            "{}: origin is not a whole number of cells from the lattice origin; RAS Mapper writes each source's stored map on its own grid, which one raster cannot hold",
+            t.path
+        ));
+    }
+    let (col, row) = (col as usize, row as usize);
+    if col + t.width > grid.width || row + t.height > grid.height {
+        return Err(format!("{}: source extends beyond the lattice", t.path));
+    }
+    Ok((col, row))
+}
+
+/// The stored-map basis for several sources on one lattice
+/// (`rasmapper-stored-map-composition/1`, measured on RAS Mapper 7.0.1 stored
+/// maps): sources are drawn in priority order, each over the ones before it.
+/// A lower source draws its own valid cells except (a) under the 8-connected
+/// interior of a higher-priority source and (b) on a higher source's edge
+/// ring (valid there, not interior) unless the cell is in the lower source's
+/// own interior; cells outside a source's raster count as invalid. RAS
+/// Mapper's per-source stored map of a lower source is masked this way, and
+/// the composed map (its VRT, sources in priority order) shows the later
+/// source on the ring. Then the modifications on the lattice, no rounding.
+///
+/// RAS Mapper composes depth maps, not terrains: on a ring cell where the
+/// lower source is dry and the higher one wet, its VRT shows the higher
+/// source's depth. One terrain cannot hold both; this composition gives the
+/// lower source's terrain there (measured: 92 of 95 residual pixels in two
+/// 6.87M-pixel experiments).
+fn stored_map_multi(
+    req: &Request,
+    sources: &[SourceData],
+    grid: Grid,
+    mut values: Vec<f32>,
+    pool: &rayon::ThreadPool,
+    started: Instant,
+) -> Result<Effective, MapError> {
+    let width = grid.width;
+    // Per lattice cell: COVERED (inside the 8-connected interior of a source
+    // drawn so far) and FOOTPRINT (valid in a source drawn so far).
+    const COVERED: u8 = 1;
+    const FOOTPRINT: u8 = 2;
+    let mut drawn_by = vec![0_u8; grid.width * grid.height];
+    let mut records = Vec::with_capacity(sources.len());
+    for (index, source) in sources.iter().enumerate() {
+        let t = &source.terrain;
+        let (col0, row0) = lattice_offset(t, &grid).map_err(MapError::Unsupported)?;
+        let (bw, bh) = t.block;
+        let blocks_x = t.width.div_ceil(bw);
+        // The source's valid cells (one byte per cell), then its draw.
+        let mut valid = vec![false; t.width * t.height];
+        let results: Vec<Result<(), MapError>> = pool.install(|| {
+            valid
+                .par_chunks_mut(bh * t.width)
+                .enumerate()
+                .map(|(by, rows)| {
+                    for bx in 0..blocks_x {
+                        let win = t.block_window(bx, by);
+                        let block = t.get_block(bx, by)?;
+                        for r in 0..win.height {
+                            let src = &block[r * win.width..][..win.width];
+                            let dst = &mut rows[r * t.width + win.x..][..win.width];
+                            for (d, s) in dst.iter_mut().zip(src) {
+                                *d = t.classify(*s).is_some_and(|v| v.is_finite());
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+                .collect()
+        });
+        for r in results {
+            r?;
+        }
+        // Its 8-connected interior (cells outside the raster count as invalid).
+        let interior = |r: usize, c: usize| {
+            r > 0
+                && c > 0
+                && r + 1 < t.height
+                && c + 1 < t.width
+                && (r - 1..=r + 1).all(|rr| (c - 1..=c + 1).all(|cc| valid[rr * t.width + cc]))
+        };
+        let mut drawn = 0_u64;
+        let mut hidden = 0_u64;
+        for by in 0..t.height.div_ceil(bh) {
+            for bx in 0..blocks_x {
+                let win = t.block_window(bx, by);
+                let block = t.get_block(bx, by)?;
+                for r in 0..win.height {
+                    let sr = by * bh + r;
+                    let out = (row0 + sr) * width + col0;
+                    for c in 0..win.width {
+                        let sc = win.x + c;
+                        if !valid[sr * t.width + sc] {
+                            continue;
+                        }
+                        // Hidden under a higher source's interior, and on a
+                        // higher source's edge ring unless interior itself.
+                        let flags = drawn_by[out + sc];
+                        if flags & COVERED != 0 || (flags & FOOTPRINT != 0 && !interior(sr, sc)) {
+                            hidden += 1;
+                            continue;
+                        }
+                        values[out + sc] = block[r * win.width + c];
+                        drawn += 1;
+                    }
+                }
+            }
+        }
+        if index + 1 < sources.len() {
+            for r in 0..t.height {
+                for c in 0..t.width {
+                    if valid[r * t.width + c] {
+                        let cell = &mut drawn_by[(row0 + r) * width + col0 + c];
+                        *cell |= FOOTPRINT;
+                        if interior(r, c) {
+                            *cell |= COVERED;
+                        }
+                    }
+                }
+            }
+        }
+        records.push(json!({
+            "path": t.path, "geo_transform": t.gt, "width": t.width, "height": t.height,
+            "lattice_offset": [col0, row0], "pixels": drawn, "hidden_by_higher_priority": hidden,
+            "cache": t.stats().cache,
+        }));
+    }
+    drop(drawn_by);
+    let sample_seconds = started.elapsed().as_secs_f64();
+    let mods_started = Instant::now();
+    let version = crate::terrain_mods::RasVersion::parse(req.hecras_version.as_deref())?;
+    let mods =
+        crate::terrain_mods::apply_version(&req.modification_layers, &grid, &mut values, version)?;
+    let mods_seconds = mods_started.elapsed().as_secs_f64();
+    let valid = values.iter().filter(|v| **v != NODATA).count() as u64;
+    let report = json!({
+        "method_id": METHOD_ID,
+        "basis": BASIS_STORED_MAP,
+        "basis_rule_id": STORED_MAP_RULE_ID,
+        "composition": {"rule_id": STORED_MAP_COMPOSITION_ID, "order": "priority order, each source over the ones before it",
+                         "mask": "a lower source is hidden under any higher source's 8-connected interior, and on its edge ring unless interior itself"},
+        "grid": {"origin_x": grid.origin_x, "origin_y": grid.origin_y, "cell_size": grid.cell_size,
+                  "width": grid.width, "height": grid.height},
+        "modification_lattice": {"origin_x": grid.origin_x, "origin_y": grid.origin_y,
+                  "cell_size": grid.cell_size, "width": grid.width, "height": grid.height},
+        "sources": records,
+        "sample_seconds": sample_seconds,
+        "export_tin": null,
+        "stitch_tin": {"supplied": req.stitch_tin.is_some(), "used": false},
+        "modifications": {"layers": mods, "seconds": mods_seconds,
+                          "hecras_version": req.hecras_version, "hecras_rule": version.rule()},
+        "rounding": "none",
+        "valid_pixels": valid,
+        "seconds": started.elapsed().as_secs_f64(),
+    });
+    Ok(Effective {
+        grid,
+        values,
+        report,
+    })
 }
 
 /// The stored-map basis (module docs): the source's cells, the modifications
