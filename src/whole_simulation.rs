@@ -145,6 +145,9 @@ impl Extrema {
         (self.points.capacity() - before) * std::mem::size_of::<(u32, f32)>()
     }
     fn close(&mut self, last: u32) {
+        // The closing end is one of the two per-series ends the plan's floor
+        // admits (16 bytes); grow by exactly one point, never by doubling.
+        self.points.reserve_exact(1);
         self.points.push((last, self.previous));
     }
 }
