@@ -56,6 +56,8 @@ const TOLERANCE: f64 = 0.2;
 /// which on a loaded host can be milliseconds later. Names are re-read for this
 /// long after a thread is first seen, so an inherited name is never kept.
 const NAME_SETTLE: f64 = 0.25;
+/// CPU a thread must use over a run to count in `terrio_cpu_threads`.
+const CPU_SEEN_NS: f64 = 1e6;
 
 // ---------------------------------------------------------------- sampling
 
@@ -309,6 +311,9 @@ struct Trace {
     /// CPU used over the whole sampled run, in threads.
     mean_busy: f64,
     terrio_threads: usize,
+    /// terrio pool threads that used at least `CPU_SEEN` of CPU over the run:
+    /// the sampler attributes CPU to each of them whatever the host's CPUs.
+    terrio_cpu_threads: usize,
     terrio_running_max: usize,
     histogram: BTreeMap<usize, usize>,
     seconds: f64,
@@ -325,6 +330,8 @@ fn trace(child: &mut Child) -> Trace {
     // (seconds, cumulative CPU nanoseconds of threads seen in consecutive samples).
     let mut history: Vec<(f64, f64)> = Vec::new();
     let mut cumulative = 0.0;
+    // Thread id -> CPU nanoseconds over consecutive samples.
+    let mut per_thread: HashMap<u64, f64> = HashMap::new();
     let mut snapshots: Vec<HashMap<u64, f64>> = Vec::new();
     while child.try_wait().unwrap().is_none() {
         // The first milliseconds belong to process start (on Windows, the loader's
@@ -352,7 +359,9 @@ fn trace(child: &mut Child) -> Trace {
                 running += th.running as usize;
                 terrio_running += (th.running && name.starts_with("terrio-par")) as usize;
                 if let Some(before) = last.get(&th.tid) {
-                    cumulative += (th.cpu_ns - before).clamp(0.0, interval_ns);
+                    let used = (th.cpu_ns - before).clamp(0.0, interval_ns);
+                    cumulative += used;
+                    *per_thread.entry(th.tid).or_default() += used;
                 }
                 next.insert(th.tid, th.cpu_ns);
             }
@@ -408,6 +417,13 @@ fn trace(child: &mut Child) -> Trace {
     t.terrio_threads = names
         .values()
         .filter(|n| n.0.starts_with("terrio-par"))
+        .count();
+    t.terrio_cpu_threads = names
+        .iter()
+        .filter(|(tid, n)| {
+            n.0.starts_with("terrio-par")
+                && per_thread.get(tid).is_some_and(|&ns| ns >= CPU_SEEN_NS)
+        })
         .count();
     t.seconds = started.elapsed().as_secs_f64();
     t
@@ -812,12 +828,20 @@ fn burn_child(threads: usize, terrio_threads: usize) -> Trace {
 
 /// Request workers that call terrio while the others compute stay within the
 /// request's threads when terrio's pool has one thread (the executable's setting).
-/// Two control runs give terrio's pool more threads than the one-thread request:
-/// pools of two and of three. Each must exceed that budget, which shows the checks
-/// above can fail. The excess can only show when the host has CPUs for the child's
-/// busy threads and for this sampler, which polls /proc beside it: the controls are
-/// asserted with 3 and 4 or more CPUs (the Windows CI runner has 6); on the 2-CPU
-/// Linux runner they are reported, and the budget checks above are asserted.
+///
+/// Controls show the checks can fail. Two kinds:
+/// - per-thread CPU, asserted on every host: with terrio's pool of two and of
+///   three, the sampler attributes CPU to every pool thread (one-thread runs see
+///   at most one). This does not depend on free CPUs, so the 2-CPU Linux runner
+///   asserts it too.
+/// - concurrency, asserted only where the host has CPUs for the excess: one
+///   worker with pools of two and three must exceed one busy thread (3 and 4
+///   CPUs). The sampler's own concurrency measurement is checked on a child
+///   whose threads only compute: two spinners exceed the threads=1 bound (2
+///   CPUs, so the Linux runner asserts it) and four exceed the threads=3 bound
+///   (5 CPUs; the Windows runner has 6). Three workers with terrio's pool of
+///   five are reported: their excess over three needs burns to overlap.
+///
 /// (Earlier, three workers with a pool of three had to exceed 3.2 busy threads,
 /// which needs three burns to overlap by chance: 3.1-3.8 on an 8-CPU host.)
 #[test]
@@ -842,6 +866,10 @@ fn terrio_calls_from_busy_request_workers_stay_within_budget() {
         return;
     }
     assert!(small.terrio_threads == 2, "{small:?}");
+    assert!(
+        small.terrio_cpu_threads == 2,
+        "the sampler must attribute CPU to both terrio threads: {small:?}"
+    );
     if cpus >= 3 && !cfg!(debug_assertions) {
         assert!(
             small.max_busy > 1.0 + TOLERANCE,
@@ -857,6 +885,10 @@ fn terrio_calls_from_busy_request_workers_stay_within_budget() {
     // request's own budget of one thread, which it exceeds whenever a burn runs.
     let large = burn_child(1, 3);
     assert!(large.terrio_threads == 3, "{large:?}");
+    assert!(
+        large.terrio_cpu_threads == 3,
+        "the sampler must attribute CPU to all three terrio threads: {large:?}"
+    );
     if cpus >= 4 && !cfg!(debug_assertions) {
         assert!(
             large.max_busy > 1.0 + TOLERANCE,
@@ -867,4 +899,85 @@ fn terrio_calls_from_busy_request_workers_stay_within_budget() {
             "three-thread control not asserted: {cpus} CPUs for 3 busy threads and the sampler"
         );
     }
+    // The positive control of the threads=3 bound: three workers with terrio's
+    // pool of five. Two workers compute while a burn runs on five threads.
+    let wide = burn_child(3, 5);
+    assert!(wide.terrio_threads == 5, "{wide:?}");
+    assert!(
+        wide.terrio_cpu_threads == 5,
+        "the sampler must attribute CPU to all five terrio threads: {wide:?}"
+    );
+    eprintln!(
+        "three workers, terrio pool of five: {:.2} busy threads",
+        wide.max_busy
+    );
+    // The sampler's concurrency measurement itself: a child with n threads that
+    // only compute must show more than n - 1 + TOLERANCE busy threads. Four
+    // spinners exceed the threads=3 bound (5 CPUs: four and the sampler); two
+    // exceed the threads=1 bound, on every host with 2 CPUs.
+    for (spinners, needed) in [(2, 2), (4, 5)] {
+        let t = spin_child(spinners);
+        let bound = (spinners - 1) as f64 + TOLERANCE;
+        if cpus >= needed && !cfg!(debug_assertions) {
+            assert!(
+                t.max_busy > bound,
+                "the sampler must see {spinners} spinning threads above {bound}: {t:?}"
+            );
+        } else {
+            eprintln!("{spinners}-spinner control not asserted: {cpus} CPUs");
+        }
+    }
+}
+
+const SPIN: &str = "FAST_MAP_THREAD_BUDGET_SPIN";
+
+/// Child process of the spinner controls: n threads computing for 1 s.
+#[test]
+#[ignore = "child process of terrio_calls_from_busy_request_workers_stay_within_budget"]
+fn spin_workload() {
+    let Some(n) = std::env::var_os(SPIN) else {
+        return;
+    };
+    let n: usize = n.to_str().unwrap().parse().unwrap();
+    let workers: Vec<_> = (0..n)
+        .map(|k| {
+            std::thread::spawn(move || {
+                let tick = Instant::now();
+                let mut x = k as f64;
+                while tick.elapsed() < Duration::from_millis(1000) {
+                    for _ in 0..1000 {
+                        x = std::hint::black_box(x * 1.000001 + 0.5);
+                    }
+                }
+            })
+        })
+        .collect();
+    for w in workers {
+        w.join().unwrap();
+    }
+}
+
+fn spin_child(threads: usize) -> Trace {
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "spin_workload",
+            "--exact",
+            "--ignored",
+            "--test-threads",
+            "1",
+        ])
+        .env(SPIN, threads.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let t = trace(&mut child);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    eprintln!("spinners={threads}: {t:?}");
+    t
 }

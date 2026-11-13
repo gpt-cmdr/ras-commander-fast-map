@@ -797,6 +797,99 @@ fn one_session_switches_owner_sets_and_refusal_keeps_its_geometry() {
     assert_eq!(report["session"]["geometry_reused"], true, "{report}");
 }
 
+/// Refusals after the staged load (terrain identity, decoder budget) keep the
+/// previous model's geometry for the next compatible request (#50, item 2).
+#[test]
+fn refusals_after_the_load_keep_the_previous_geometry() {
+    let m = model([0, 1, 0, 1]);
+    let (a, b) = (boxed([1, 4, 1, 4]), boxed([5, 9, 3, 7]));
+    let mut both = a.clone();
+    both.extend(&b);
+    let staged = closure(&m.mesh, &both);
+    let base = no_aoi(m.request(Some(&staged), json!({})));
+    let request = m.with_owners(base.clone(), &a);
+    let other = m.with_owners(base.clone(), &b);
+    // The serial plan of the other owner set, from its own session.
+    let serial = m
+        .run_in(
+            &other,
+            "k-serial",
+            Some(&mut sloping_session::PreparedSession::default()),
+        )
+        .unwrap()
+        .0["planned_bytes"]
+        .as_u64()
+        .unwrap();
+    let mut session = sloping_session::PreparedSession::default();
+    m.run_in(&request, "k-a", Some(&mut session)).unwrap();
+    let mut terrain = other.clone();
+    terrain["terrain_transform"][0] = json!(0.5);
+    let mut decoder = other.clone();
+    decoder["max_working_bytes"] = json!(serial - 1);
+    for (step, refused, message) in [
+        ("terrain", terrain, "sloping terrain identity"),
+        ("decoder", decoder, "sloping decoder plan exceeds budget"),
+    ] {
+        let error = m
+            .run_in(&refused, &format!("k-{step}"), Some(&mut session))
+            .unwrap_err();
+        assert!(error.contains(message), "{step}: {error}");
+        let (report, _) = m
+            .run_in(&request, &format!("k-a-{step}"), Some(&mut session))
+            .unwrap();
+        assert_eq!(
+            report["session"]["geometry_reused"], true,
+            "{step}: {report}"
+        );
+    }
+}
+
+/// A staged load counts window and hydraulic caches still held from an earlier
+/// request with larger budgets, not only this request's budgets (#50, item 1).
+#[test]
+fn staged_load_counts_caches_retained_from_a_larger_request() {
+    let m = model([0, 1, 0, 1]);
+    let (a, b) = (boxed([1, 4, 1, 4]), boxed([5, 9, 3, 7]));
+    let mut both = a.clone();
+    both.extend(&b);
+    let staged = closure(&m.mesh, &both);
+    let base = no_aoi(m.request(Some(&staged), json!({})));
+    let resident = |caches: u64, tag: &str| -> (u64, u64) {
+        let mut session = sloping_session::PreparedSession::default();
+        let mut first = m.with_owners(base.clone(), &a);
+        first["window_cache_bytes"] = json!(caches);
+        first["hydraulic_cache_bytes"] = json!(caches);
+        let (report, _) = m
+            .run_in(&first, &format!("r-{tag}"), Some(&mut session))
+            .unwrap();
+        let retained = report["session"]["retained_window_bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            + report["session"]["retained_hydraulic_bytes"]
+                .as_u64()
+                .unwrap_or(0);
+        // The next request asks for no caches, under a budget below the
+        // terrain block cache alone: refused with the resident it counted.
+        let mut next = m.with_owners(base.clone(), &b);
+        next["max_working_bytes"] = json!(1u64 << 20);
+        let error = m
+            .run_in(&next, &format!("r-{tag}-next"), Some(&mut session))
+            .unwrap_err();
+        let need: u64 = error
+            .split("resident caches need ")
+            .nth(1)
+            .and_then(|t| t.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{error}"));
+        (need, retained)
+    };
+    let (without, none) = resident(0, "none");
+    assert_eq!(none, 0);
+    let (with, retained) = resident(64 << 20, "kept");
+    assert!(retained > 0, "the first request retained nothing");
+    assert_eq!(with - without, retained);
+}
+
 #[test]
 fn malformed_compact_dimensions_are_errors_not_panics() {
     for (key, rows_delta, width) in [

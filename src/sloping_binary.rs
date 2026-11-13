@@ -292,7 +292,7 @@ impl LoadBudget {
             peak: 0.into(),
         }
     }
-    fn charge(&self, bytes: u64, what: &str) -> Result<(), MapError> {
+    pub(crate) fn charge(&self, bytes: u64, what: &str) -> Result<(), MapError> {
         let used = self
             .used
             .get()
@@ -400,6 +400,20 @@ fn position(sorted: &[usize], value: usize) -> Result<usize, MapError> {
         .binary_search(&value)
         .map_err(|_| invalid("staged sloping closure index missing"))
 }
+/// Collect fallible items into a vector allocated at its known length once:
+/// `collect::<Result<Vec<_>, _>>()` cannot see the length and grows by
+/// doubling, which can exceed the charged size.
+fn exact<T>(
+    len: usize,
+    items: impl Iterator<Item = Result<T, MapError>>,
+) -> Result<Vec<T>, MapError> {
+    let mut out = Vec::with_capacity(len);
+    for item in items {
+        out.push(item?);
+    }
+    Ok(out)
+}
+
 fn bytes<T>(count: usize) -> u64 {
     (count as u64).saturating_mul(std::mem::size_of::<T>() as u64)
 }
@@ -412,7 +426,7 @@ fn bytes<T>(count: usize) -> u64 {
 pub(crate) fn load_compact(
     path: &Path,
     staged: Vec<u32>,
-    owners: &[usize],
+    owners: &[u32],
     budget: &LoadBudget,
 ) -> Result<Compact, MapError> {
     use crate::sloping::{self, Cell, CellStencil, Corner, Face, Mesh};
@@ -487,14 +501,14 @@ pub(crate) fn load_compact(
         "staged cell rows",
     )?;
     let staged_usize: Vec<usize> = staged.iter().map(|&c| c as usize).collect();
-    let owner_local = owners
-        .iter()
-        .map(|&c| {
+    let owner_local = exact(
+        owners.len(),
+        owners.iter().map(|&c| {
             staged_usize
-                .binary_search(&c)
+                .binary_search(&(c as usize))
                 .map_err(|_| invalid("staged cells must include every owner cell"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        }),
+    )?;
 
     // Cells: face counts (virtual flag), physical rank (minimum row) and owner rows.
     let info = raw("cell_info")?;
@@ -514,7 +528,10 @@ pub(crate) fn load_compact(
             physical += 1;
         }
     }
-    let owner_rows: Vec<[usize; 2]> = owners.iter().map(|&c| i32_pair(&info, c)).collect();
+    let owner_rows: Vec<[usize; 2]> = owners
+        .iter()
+        .map(|&c| i32_pair(&info, c as usize))
+        .collect();
     drop(info);
     if ![n_cells, physical].contains(&rows("cell_minimum")) {
         return Err(invalid("sloping binary cell dimensions mismatch"));
@@ -592,7 +609,8 @@ pub(crate) fn load_compact(
     let face_vertices = raw("face_vertices")?;
     let ends: Vec<[usize; 2]> = faces.iter().map(|&f| i32_pair(&face_vertices, f)).collect();
     drop(face_vertices);
-    let mut corners: Vec<usize> = ends.iter().flatten().copied().collect();
+    let mut corners: Vec<usize> = Vec::with_capacity(2 * ends.len());
+    corners.extend(ends.iter().flatten().copied());
     corners.sort_unstable();
     corners.dedup();
     if corners.last().is_some_and(|&v| v >= n_vertices) {
@@ -604,9 +622,9 @@ pub(crate) fn load_compact(
     let face_cells = raw("face_cells")?;
     let pairs: Vec<[usize; 2]> = faces.iter().map(|&f| i32_pair(&face_cells, f)).collect();
     drop(face_cells);
-    let local_pairs = pairs
-        .iter()
-        .map(|pair| -> Result<[usize; 2], MapError> {
+    let local_pairs = exact(
+        pairs.len(),
+        pairs.iter().map(|pair| -> Result<[usize; 2], MapError> {
             if pair.iter().any(|&c| c >= n_cells) {
                 return Err(invalid(
                     "sloping face index or polyline range out of bounds",
@@ -619,8 +637,8 @@ pub(crate) fn load_compact(
                 })?;
             }
             Ok(local)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        }),
+    )?;
     let face_info = raw("face_info")?;
     let spans: Vec<[usize; 2]> = faces.iter().map(|&f| i32_pair(&face_info, f)).collect();
     drop(face_info);
@@ -653,10 +671,9 @@ pub(crate) fn load_compact(
     let points: Vec<[f64; 2]> = corners.iter().map(|&v| f64_pair(&vertices, v)).collect();
     drop(vertices);
     let face_points = raw("face_points")?;
-    let polylines = ends
-        .iter()
-        .zip(&spans)
-        .map(
+    let polylines = exact(
+        ends.len(),
+        ends.iter().zip(&spans).map(
             |(ends, &[start, length])| -> Result<Vec<[f64; 2]>, MapError> {
                 let mut polyline = Vec::with_capacity(length + 2);
                 polyline.push(points[position(&corners, ends[0])?]);
@@ -664,8 +681,8 @@ pub(crate) fn load_compact(
                 polyline.push(points[position(&corners, ends[1])?]);
                 Ok(polyline)
             },
-        )
-        .collect::<Result<Vec<_>, _>>()?;
+        ),
+    )?;
     drop(face_points);
     let centers = raw("centers")?;
     let cell_points: Vec<[f64; 2]> = staged_usize
@@ -696,24 +713,26 @@ pub(crate) fn load_compact(
         None
     };
 
-    let compact_faces = local_pairs
-        .iter()
-        .zip(&ends)
-        .zip(&face_minima)
-        .zip(&polylines)
-        .map(|(((&cells_pair, ends), &minimum), polyline)| {
-            Ok(Face {
-                cells: cells_pair,
-                vertices: [position(&corners, ends[0])?, position(&corners, ends[1])?],
-                minimum,
-                perimeter: cells[cells_pair[1]].virtual_cell,
-                application: sloping::face_application(
-                    polyline,
-                    [cell_points[cells_pair[0]], cell_points[cells_pair[1]]],
-                )?,
-            })
-        })
-        .collect::<Result<Vec<_>, MapError>>()?;
+    let compact_faces = exact(
+        local_pairs.len(),
+        local_pairs
+            .iter()
+            .zip(&ends)
+            .zip(&face_minima)
+            .zip(&polylines)
+            .map(|(((&cells_pair, ends), &minimum), polyline)| {
+                Ok(Face {
+                    cells: cells_pair,
+                    vertices: [position(&corners, ends[0])?, position(&corners, ends[1])?],
+                    minimum,
+                    perimeter: cells[cells_pair[1]].virtual_cell,
+                    application: sloping::face_application(
+                        polyline,
+                        [cell_points[cells_pair[0]], cell_points[cells_pair[1]]],
+                    )?,
+                })
+            }),
+    )?;
     let mut compact_corners: Vec<Corner> = points
         .iter()
         .map(|&point| Corner {
@@ -726,10 +745,7 @@ pub(crate) fn load_compact(
     for (&vertex, ring) in ring_vertices.iter().zip(&rings) {
         let n = ring.len();
         let corner = &mut compact_corners[position(&corners, vertex)?];
-        corner.faces = ring
-            .iter()
-            .map(|&f| position(&faces, f))
-            .collect::<Result<_, _>>()?;
+        corner.faces = exact(n, ring.iter().map(|&f| position(&faces, f)))?;
         corner.ccw = (0..n).map(|i| (i + 1) % n).collect();
         corner.cw = (0..n).map(|i| (i + n - 1) % n).collect();
     }
@@ -762,10 +778,10 @@ pub(crate) fn load_compact(
         if mesh.cells[local].virtual_cell {
             continue;
         }
-        let ring = global_faces
-            .iter()
-            .map(|&f| position(&faces, f))
-            .collect::<Result<Vec<_>, _>>()?;
+        let ring = exact(
+            global_faces.len(),
+            global_faces.iter().map(|&f| position(&faces, f)),
+        )?;
         let mut stencil = sloping::prepare_stencil(&mesh, local, &ring)?;
         sloping::set_physical_ring(
             &mut stencil,

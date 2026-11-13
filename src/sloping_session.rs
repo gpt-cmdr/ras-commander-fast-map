@@ -31,6 +31,9 @@ type CachedGeometry = (
 struct StagedGeometry {
     /// Per mesh: staged global cell ids; compact cell i is staged[i].
     cells: Vec<Vec<u32>>,
+    /// Per mesh: the sorted unique owner cells it was loaded for. The session
+    /// key hashes them, so a reuse verifies them exactly.
+    owners: Vec<Vec<u32>>,
     equivalent_bytes: u64,
     record: Value,
 }
@@ -113,6 +116,47 @@ pub(crate) fn identity(path: &Path) -> Result<String, MapError> {
     ))
 }
 pub(crate) fn geometry_key(req: &Request, base: &Path) -> Result<String, MapError> {
+    let owners = match &req.staged_cells_files {
+        Some(_) => Some(staged_owner_sets(req)?),
+        None => None,
+    };
+    geometry_key_with(req, base, owners.as_deref())
+}
+
+/// Per mesh, the sorted unique owner cells of a staged request, allocated at
+/// their exact size (4 bytes per owner cell). A cell id beyond `u32` cannot be
+/// in a `<u4` staged list.
+fn staged_owner_sets(req: &Request) -> Result<Vec<Vec<u32>>, MapError> {
+    let mut counts = vec![0_usize; req.mesh_files.len()];
+    for &[mesh, _] in &req.owner_cells {
+        *counts.get_mut(mesh).ok_or_else(|| {
+            MapError::Invalid("sloping ownership requires physical mesh cells".into())
+        })? += 1;
+    }
+    let mut owners: Vec<Vec<u32>> = counts.iter().map(|&n| Vec::with_capacity(n)).collect();
+    for &[mesh, cell] in &req.owner_cells {
+        owners[mesh].push(
+            u32::try_from(cell).map_err(|_| {
+                MapError::Invalid("staged cells must include every owner cell".into())
+            })?,
+        );
+    }
+    for set in &mut owners {
+        set.sort_unstable();
+        set.dedup();
+    }
+    Ok(owners)
+}
+
+/// The session geometry key. For a staged subset it ends with the owner count
+/// and the FNV-1a64 of the sorted unique `(mesh, cell)` pairs as little-endian
+/// `u64`s, hashed as a stream: the same text as the former encoded buffer,
+/// with no per-owner allocation. A reuse checks the owner sets themselves.
+fn geometry_key_with(
+    req: &Request,
+    base: &Path,
+    owners: Option<&[Vec<u32>]>,
+) -> Result<String, MapError> {
     let mut key = String::new();
     for filename in &req.mesh_files {
         let path = model::resolve(base, filename);
@@ -129,28 +173,27 @@ pub(crate) fn geometry_key(req: &Request, base: &Path) -> Result<String, MapErro
     }
     // A staged subset is a different compact geometry, even over the same mesh,
     // and its stencils exist only for the owner cells it was loaded for.
-    if let Some(files) = &req.staged_cells_files {
+    if let (Some(files), Some(owners)) = (&req.staged_cells_files, owners) {
         for filename in files {
             key.push_str("|staged:");
             key.push_str(&identity(&model::resolve(base, filename))?);
         }
-        let mut owners = req.owner_cells.clone();
-        owners.sort_unstable();
-        owners.dedup();
-        let encoded: Vec<u8> = owners
-            .iter()
-            .flat_map(|&[m, c]| {
-                (m as u64)
+        let mut hash: u64 = 0xcbf29ce484222325;
+        let mut count = 0_usize;
+        for (mesh, set) in owners.iter().enumerate() {
+            for &cell in set {
+                for b in (mesh as u64)
                     .to_le_bytes()
                     .into_iter()
-                    .chain((c as u64).to_le_bytes())
-            })
-            .collect();
-        key.push_str(&format!(
-            "|owners:{}:{:016x}",
-            owners.len(),
-            crate::sink::fnv1a64(&encoded)
-        ));
+                    .chain((cell as u64).to_le_bytes())
+                {
+                    hash ^= b as u64;
+                    hash = hash.wrapping_mul(0x100000001b3);
+                }
+            }
+            count += set.len();
+        }
+        key.push_str(&format!("|owners:{count}:{hash:016x}"));
     }
     Ok(key)
 }
@@ -255,6 +298,24 @@ fn window_budget() -> u64 {
     64 << 20
 }
 
+/// Retained hydraulic state is keyed on the geometry it was prepared on, the
+/// options and every values file, so it is never reused across geometries.
+fn hydraulic_key(
+    geometry_key: &str,
+    options: sloping::Options,
+    base: &Path,
+    values_files: &[String],
+) -> Result<String, MapError> {
+    let mut key = format!(
+        "{}|geometry:{geometry_key}|",
+        serde_json::to_string(&options).map_err(|e| MapError::Invalid(e.to_string()))?
+    );
+    for file in values_files {
+        key.push_str(&identity(&model::resolve(base, file))?);
+    }
+    Ok(key)
+}
+
 fn admit_profiles(
     requested: usize,
     threads: usize,
@@ -317,16 +378,17 @@ fn render(
     products: &DerivedPlan<'_>,
     shear: Option<&ShearPlan>,
     source_shape: [usize; 2],
+    geometry_key: &str,
 ) -> Result<RenderedProfile, MapError> {
     let tick = Instant::now();
     let needs_cells = normals.is_some() || shear.is_some();
     let cache_key = if (hydraulic_cache.is_some() || pinned.is_some()) && !needs_cells {
-        let mut key =
-            serde_json::to_string(&options).map_err(|e| MapError::Invalid(e.to_string()))?;
-        for file in &profile.values_files {
-            key.push_str(&identity(&model::resolve(base, file))?);
-        }
-        Some(key)
+        Some(hydraulic_key(
+            geometry_key,
+            options,
+            base,
+            &profile.values_files,
+        )?)
     } else {
         None
     };
@@ -717,6 +779,7 @@ fn staged_geometry(
     base: &Path,
     session: Option<&PreparedSession>,
     key: &str,
+    owners: Vec<Vec<u32>>,
     resident: u64,
 ) -> Result<(Arc<CachedGeometry>, bool), MapError> {
     if files.len() != req.mesh_files.len() {
@@ -738,9 +801,12 @@ fn staged_geometry(
             "staged_cells is qualified for sloping depth/WSE without velocity, shear, storage areas, terrain scope, stored grid or ownership export".into(),
         ));
     }
+    // The key hashes the owner sets; a reuse also compares them, so a hash
+    // collision loads the requested subset instead of reusing another.
     if let Some(s) = session
         && let Some((old, geometry)) = &s.geometry
         && old == key
+        && geometry.2.as_ref().is_some_and(|g| g.owners == owners)
     {
         return Ok((geometry.clone(), false));
     }
@@ -751,28 +817,23 @@ fn staged_geometry(
         ))
     })?;
     let budget = crate::sloping_binary::LoadBudget::new(limit);
-    let mut owners = vec![Vec::new(); req.mesh_files.len()];
-    for &[mesh, cell] in &req.owner_cells {
-        owners
-            .get_mut(mesh)
-            .ok_or_else(|| {
-                MapError::Invalid("sloping ownership requires physical mesh cells".into())
-            })?
-            .push(cell);
-    }
-    let mut meshes = Vec::new();
-    let mut stencils = Vec::new();
-    let mut cells = Vec::new();
-    let mut records = Vec::new();
+    // The owner sets stay with the geometry for the reuse check.
+    budget.charge(
+        owners.iter().map(|o| o.capacity() as u64 * 4).sum::<u64>()
+            + (owners.capacity() * std::mem::size_of::<Vec<u32>>()) as u64,
+        "owner sets",
+    )?;
+    let mut meshes = Vec::with_capacity(req.mesh_files.len());
+    let mut stencils = Vec::with_capacity(req.mesh_files.len());
+    let mut cells = Vec::with_capacity(req.mesh_files.len());
+    let mut records = Vec::with_capacity(req.mesh_files.len());
     let mut equivalent_bytes = 0_u64;
-    for ((mesh, staged), mut owned) in req.mesh_files.iter().zip(files).zip(owners) {
-        owned.sort_unstable();
-        owned.dedup();
+    for ((mesh, staged), owned) in req.mesh_files.iter().zip(files).zip(&owners) {
         let staged = crate::sloping_binary::read_staged(&model::resolve(base, staged), &budget)?;
         let compact = crate::sloping_binary::load_compact(
             &model::resolve(base, mesh),
             staged,
-            &owned,
+            owned,
             &budget,
         )?;
         records.push(
@@ -797,6 +858,7 @@ fn staged_geometry(
             stencils,
             Some(StagedGeometry {
                 cells,
+                owners,
                 equivalent_bytes,
                 record,
             }),
@@ -1198,16 +1260,23 @@ fn run_internal(
                     "staged_cells_files needs one file per mesh".into(),
                 ));
             }
-            let key = geometry_key(req, base)?;
-            // Resident while it loads: the terrain block cache, the retained
-            // window/hydraulic budgets and any current geometry it may replace.
+            let owners = staged_owner_sets(req)?;
+            let key = geometry_key_with(req, base, Some(&owners))?;
+            // Resident while it loads: the terrain block cache, the window and
+            // hydraulic caches (this request's budgets, or more while caches
+            // from an earlier, larger request are still held: they shrink to
+            // these budgets only after the load) and any current geometry it
+            // may replace.
+            let (retained_windows, retained_hydraulics) = session.as_ref().map_or((0, 0), |s| {
+                (s.windows.bytes(), s.hydraulics.lock().unwrap().bytes())
+            });
             let old = session
                 .as_ref()
                 .filter(|s| s.geometry.as_ref().is_some_and(|(k, _)| k != &key))
                 .map_or(0, |s| s.geometry_resident);
             let resident = cache
-                .checked_add(persistent_bytes)
-                .and_then(|v| v.checked_add(hydraulic_bytes))
+                .checked_add(persistent_bytes.max(retained_windows))
+                .and_then(|v| v.checked_add(hydraulic_bytes.max(retained_hydraulics)))
                 .and_then(|v| v.checked_add(old))
                 .ok_or_else(|| MapError::Budget("staged geometry plan overflow".into()))?;
             Some(staged_geometry(
@@ -1216,6 +1285,7 @@ fn run_internal(
                 base,
                 session.as_deref(),
                 &key,
+                owners,
                 resident,
             )?)
         }
@@ -1316,19 +1386,16 @@ fn run_internal(
         return Err(MapError::Budget("sloping array plan exceeds budget".into()));
     }
     let key = if session.is_some() {
-        geometry_key(req, base)?
+        match &staged {
+            // Computed above with the owner sets, which the geometry now holds.
+            Some((geometry, _)) => {
+                geometry_key_with(req, base, geometry.2.as_ref().map(|g| g.owners.as_slice()))?
+            }
+            None => geometry_key(req, base)?,
+        }
     } else {
         String::new()
     };
-    // Release an incompatible previous model before opening/loading this one.
-    if let Some(s) = session.as_mut()
-        && s.geometry.as_ref().is_some_and(|(old, _)| old != &key)
-    {
-        s.geometry = None;
-        *s.pinned_hydraulics.lock().unwrap() = None;
-        s.hydraulics.lock().unwrap().clear();
-        s.windows.clear();
-    }
     let terrain_path = model::resolve(base, &req.terrain);
     let terrain_key = if session.is_some() {
         format!(
@@ -1522,6 +1589,21 @@ fn run_internal(
         admitted,
         additional,
     )?;
+    // Release an incompatible previous model only now that this request is
+    // admitted, so a terrain or budget refusal above keeps it for the next
+    // compatible request. A staged subset loaded under the same key (a hash
+    // collision of its owner sets) is incompatible too.
+    let staged_loaded = staged.as_ref().is_some_and(|(_, loaded)| *loaded);
+    if let Some(s) = session.as_mut()
+        && s.geometry
+            .as_ref()
+            .is_some_and(|(old, _)| old != &key || staged_loaded)
+    {
+        s.geometry = None;
+        *s.pinned_hydraulics.lock().unwrap() = None;
+        s.hydraulics.lock().unwrap().clear();
+        s.windows.clear();
+    }
     // A staged geometry prepared for this request joins the session only now
     // that the request is admitted; a refusal above leaves the session as it was.
     if let Some((geometry, true)) = &staged
@@ -2084,6 +2166,7 @@ fn run_internal(
                         &plan,
                         shear_plan.as_ref(),
                         [terrain.width, terrain.height],
+                        &key,
                     )
                 })?;
                 // Indexed collection and ordered emission preserve the pipe/report
@@ -2327,6 +2410,114 @@ mod tests {
         Barrier,
         atomic::{AtomicUsize, Ordering},
     };
+
+    fn staged_fixture(tag: &str) -> (std::path::PathBuf, Request) {
+        let dir = std::env::temp_dir().join(format!(
+            "fast-map-staged-key-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        for name in ["m0.json", "m1.json"] {
+            fs::write(dir.join(name), "{}").unwrap();
+        }
+        for name in ["s0.bin", "s1.bin"] {
+            fs::write(dir.join(name), 7_u32.to_le_bytes()).unwrap();
+        }
+        let req: Request = serde_json::from_value(json!({"schema":SCHEMA,
+            "terrain":"t.tif","epsg":3857,"crs_identity":{"kind":"epsg"},
+            "terrain_transform":[0.,1.,0.,0.,0.,-1.],"window":[0,0,1,1],
+            "geometry_file":"g.wkb","mesh_files":["m0.json","m1.json"],
+            "staged_cells_files":["s0.bin","s1.bin"],
+            "owner_cells":[[1,9],[0,7],[1,3],[0,7],[0,2]],
+            "profiles":[{"id":"p","values_files":["a","b"]}],
+            "threads":1,"max_working_bytes":1u64<<30}))
+        .unwrap();
+        (dir, req)
+    }
+
+    /// The staged key keeps its former text (FNV-1a64 of the sorted unique
+    /// pairs encoded as little-endian u64s), built without per-owner buffers;
+    /// the owner sets are exact-size.
+    #[test]
+    fn staged_owner_key_text_is_unchanged_and_sets_are_exact() {
+        let (dir, req) = staged_fixture("text");
+        let owners = staged_owner_sets(&req).unwrap();
+        assert_eq!(owners, vec![vec![2, 7], vec![3, 9]]);
+        let mut unique = req.owner_cells.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        let encoded: Vec<u8> = unique
+            .iter()
+            .flat_map(|&[m, c]| {
+                (m as u64)
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain((c as u64).to_le_bytes())
+            })
+            .collect();
+        let key = geometry_key(&req, &dir).unwrap();
+        assert!(
+            key.ends_with(&format!(
+                "|owners:4:{:016x}",
+                crate::sink::fnv1a64(&encoded)
+            )),
+            "{key}"
+        );
+        assert_eq!(key, geometry_key_with(&req, &dir, Some(&owners)).unwrap());
+        let mut bad = req.clone();
+        bad.owner_cells.push([2, 0]);
+        assert!(staged_owner_sets(&bad).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A session geometry under the same key is reused only for the same owner
+    /// sets: another set (a key collision) loads, here failing on the stub mesh.
+    #[test]
+    fn staged_reuse_verifies_owner_sets_not_only_the_key() {
+        let (dir, req) = staged_fixture("collide");
+        let owners = staged_owner_sets(&req).unwrap();
+        let key = geometry_key_with(&req, &dir, Some(&owners)).unwrap();
+        let held = Arc::new((
+            Vec::new(),
+            Vec::new(),
+            Some(StagedGeometry {
+                cells: Vec::new(),
+                owners: owners.clone(),
+                equivalent_bytes: 0,
+                record: Value::Null,
+            }),
+        ));
+        let mut session = PreparedSession {
+            geometry: Some((key.clone(), held.clone())),
+            ..Default::default()
+        };
+        let files = req.staged_cells_files.clone().unwrap();
+        let (got, loaded) =
+            staged_geometry(&req, &files, &dir, Some(&session), &key, owners.clone(), 0).unwrap();
+        assert!(!loaded && Arc::ptr_eq(&got, &held));
+        // Same key text, other owners: never served from the session.
+        let mut other = owners.clone();
+        other[0][0] = 3;
+        session.geometry = Some((key.clone(), held));
+        let refused = staged_geometry(&req, &files, &dir, Some(&session), &key, other, 0);
+        assert!(refused.is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hydraulic_key_names_the_geometry() {
+        let (dir, _) = staged_fixture("hyd");
+        let files = vec!["s0.bin".to_string()];
+        let a = hydraulic_key("geom-a", sloping::Options::default(), &dir, &files).unwrap();
+        let b = hydraulic_key("geom-b", sloping::Options::default(), &dir, &files).unwrap();
+        assert_ne!(a, b);
+        assert!(a.contains("|geometry:geom-a|"), "{a}");
+        let _ = fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn final_report_failure_removes_exported_ownership() {
