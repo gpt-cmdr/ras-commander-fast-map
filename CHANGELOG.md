@@ -18,9 +18,9 @@
   - Retained hydraulic state is keyed on the geometry key as well.
   - `tests/thread_budget.rs`: a per-thread CPU control asserted on every host
     (each terrio pool thread of a two-, three- and five-thread control pool is
-    seen using CPU), and concurrency controls on a child that only computes:
-    two spinners above the threads=1 bound (asserted with 2 CPUs, so on the
-    Linux runner) and four above the threads=3 bound (5 CPUs).
+    seen using CPU; this one is asserted on the 2-CPU Linux runner too), and
+    concurrency controls on a child that only computes: two spinners above the
+    threads=1 bound (3 CPUs) and four above the threads=3 bound (5 CPUs).
 
 ## 0.20.0 - 2026-11-12
 

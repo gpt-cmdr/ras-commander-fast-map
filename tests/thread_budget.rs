@@ -837,9 +837,11 @@ fn burn_child(threads: usize, terrio_threads: usize) -> Trace {
 /// - concurrency, asserted only where the host has CPUs for the excess: one
 ///   worker with pools of two and three must exceed one busy thread (3 and 4
 ///   CPUs). The sampler's own concurrency measurement is checked on a child
-///   whose threads only compute: two spinners exceed the threads=1 bound (2
-///   CPUs, so the Linux runner asserts it) and four exceed the threads=3 bound
-///   (5 CPUs; the Windows runner has 6). Three workers with terrio's pool of
+///   whose threads only compute: two spinners exceed the threads=1 bound (3
+///   CPUs) and four exceed the threads=3 bound (5 CPUs; the Windows runner has
+///   6). On the 2-CPU Linux runner the sampler's own polling takes enough CPU
+///   that two spinners show about 1.35 busy threads, so there they are reported
+///   and the per-thread CPU control is the asserted one. Three workers with terrio's pool of
 ///   five are reported: their excess over three needs burns to overlap.
 ///
 /// (Earlier, three workers with a pool of three had to exceed 3.2 busy threads,
@@ -914,8 +916,9 @@ fn terrio_calls_from_busy_request_workers_stay_within_budget() {
     // The sampler's concurrency measurement itself: a child with n threads that
     // only compute must show more than n - 1 + TOLERANCE busy threads. Four
     // spinners exceed the threads=3 bound (5 CPUs: four and the sampler); two
-    // exceed the threads=1 bound, on every host with 2 CPUs.
-    for (spinners, needed) in [(2, 2), (4, 5)] {
+    // exceed the threads=1 bound with 3 CPUs (on 2, the sampler's own polling
+    // leaves about 1.35: reported, not asserted).
+    for (spinners, needed) in [(2, 3), (4, 5)] {
         let t = spin_child(spinners);
         let bound = (spinners - 1) as f64 + TOLERANCE;
         if cpus >= needed && !cfg!(debug_assertions) {
