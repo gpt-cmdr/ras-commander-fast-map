@@ -882,7 +882,10 @@ fn build_report(
         },
     });
     if let Some(keys) = &req.crs_geokeys {
-        report["output_crs"] = serde_json::json!({"kind": "geokeys", "fnv1a64": keys.fnv1a64()});
+        // The keys as written (PixelIsPoint becomes PixelIsArea), as every
+        // other report fingerprints them.
+        report["output_crs"] =
+            serde_json::json!({"kind": "geokeys", "fnv1a64": keys.written().fnv1a64()});
     }
     Ok(report)
 }

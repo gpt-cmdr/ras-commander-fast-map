@@ -694,7 +694,9 @@ Per method, for a CRS without an EPSG code:
 | Method | Request | Output label |
 | --- | --- | --- |
 | Effective terrain, sloping, `final_format` | `crs_geokeys` | GeoKey tags in the GeoTIFF |
-| Horizontal, whole simulation, batch session (`crs_geokeys` beside `crs_epsg`), storage, 1D, coupled | `crs_geokeys` (terrain identity) | raw arrays; the caller labels them |
+| Horizontal, whole simulation (`horizontal.crs_geokeys`), batch session (`crs_geokeys` beside `crs_epsg`) | `crs_geokeys` (terrain identity) | raw arrays; the caller labels them |
+| Storage | no CRS field: the request reads raw terrain records | raw arrays; the caller labels them |
+| 1D, coupled | `crs_geokeys` only with `final_format` (raw-array requests refuse it) | `final_format` GeoTIFFs: GeoKey tags |
 | Depth groups | `model.crs_geokeys` and `crs_wkt` | GeoTIFF groups: GeoKey tags; group metadata `crs_wkt`: the request's WKT, verbatim, with `crs_geokeys` |
 | Boundaries | `model.crs_geokeys` and `crs_wkt` | GeoJSON `crs` member `{"type": "name", "properties": {"name": <crs_wkt>}}`, verbatim |
 | Step05 | `terrain.crs_geokeys`; `source_crs` `{"kind": "wkt", "wkt": ...}` for an untagged terrain; `nudge.dst_wkt` instead of `dst_epsg` | raw arrays in the destination CRS; the caller labels them |

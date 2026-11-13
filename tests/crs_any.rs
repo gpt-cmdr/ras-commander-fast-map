@@ -820,3 +820,47 @@ fn batch_session_samples_a_geokeys_terrain_like_its_epsg_twin() {
     }
     assert_eq!(outputs[0], outputs[1]);
 }
+
+#[test]
+fn capability_names_where_each_method_takes_the_crs() {
+    let record = engine_method_record();
+    let field = |m: &str| {
+        record[m]["crs_geokeys"]["request_field"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert!(field("storage").starts_with("none"), "{}", field("storage"));
+    assert!(field("whole_simulation").starts_with("horizontal.crs_geokeys"));
+    for m in [
+        "one_d_clipped_diagnostic",
+        "coupled_diagnostic",
+        "coupled_storage_diagnostic",
+    ] {
+        assert!(field(m).contains("with final_format only"), "{m}");
+    }
+    assert!(field("sloping").starts_with("crs_geokeys {directory"));
+}
+
+#[test]
+fn batch_session_validates_geokeys_in_every_terrain_mode() {
+    use ras_commander_fast_map::model::SessionRequest;
+    let base = |crs_epsg: u32, keys: Value| {
+        let v = json!({"schema": "ras2fim-batch-session/1", "crs_epsg": crs_epsg, "crs_geokeys": keys,
+            "terrain": {"mode": "caller_buffer"},
+            "budgets": {"threads": 1, "max_cache_bytes": 0, "max_inflight_profiles": 1,
+                "max_profile_bytes": 1 << 20, "output_tile": 16, "max_tiles_in_flight": 1},
+            "products": ["depth"],
+            "profiles": [{"id": "p", "source": {"kind": "inline", "samples": [[0,0,1],[1,0,1],[0,1,1]],
+                "simplices": [[0,1,2]], "grid": {"kind": "explicit", "width": 2, "height": 2,
+                "x0": 0, "y0": 0, "dx": 0.4, "dy": 0.4}, "mask_all_wet": true, "terrain": [0, 0, 0, 0]}}],
+            "aois": [{"id": "full"}], "error_policy": "isolate_profile"});
+        serde_json::from_value::<SessionRequest>(v).unwrap()
+    };
+    assert!(base(0, keys_json()).validate().is_ok());
+    let both = base(2277, keys_json()).validate().unwrap_err().to_string();
+    assert!(both.contains("not both"), "{both}");
+    let mut bad = keys_json();
+    bad["directory"][0] = json!(2);
+    assert!(base(0, bad).validate().is_err());
+}

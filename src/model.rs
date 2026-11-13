@@ -343,6 +343,11 @@ impl SessionRequest {
                 "max_session_bytes must be positive when given".into(),
             ));
         }
+        // Both terrain modes: the same CRS contract (epsg or crs_geokeys,
+        // never both; well-formed keys) before any read or report.
+        if let Some(keys) = &self.crs_geokeys {
+            crate::crs::OutputCrs::resolve(self.crs_epsg, Some(keys))?;
+        }
         let out_bytes = self.output_buffer_bound()?;
         if out_bytes > 16 * 1024 * 1024 * 1024 {
             return Err(MapError::Budget(format!(

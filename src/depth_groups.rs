@@ -752,7 +752,9 @@ pub fn run_with_session(
                         "reduce_seconds":group_reduce_seconds[slot]}});
                     if let Some(keys) = crs.geokeys() {
                         metadata["output_crs"] = crs.echo();
-                        metadata["crs_geokeys"] = json!(keys);
+                        // The keys the group TIFF carries (PixelIsPoint is
+                        // written PixelIsArea), matching output_crs.
+                        metadata["crs_geokeys"] = json!(keys.written());
                     }
                     let mut writer = if req.sink == Sink::Geotiff {
                         let dir = out.join(&job.job_id);
