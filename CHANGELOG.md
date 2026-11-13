@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.21.0 - 2026-11-13
+
+Release summary: staged-session follow-ups (#50), duration with storage-area
+level pools, and the stored-map effective-terrain basis for several sources on
+one lattice (`rasmapper-stored-map-composition/1`). Requests that 0.20.0
+accepts keep their output bytes. Checked with installed Windows wheels on the
+119 staged effective-terrain corpus requests on CLB-08 against 0.20.0 (116
+float32-, transform- and file-identical with identical reports apart from
+timings, 3 identical refusals). With `basis: "stored_map"`, the 5 requests
+0.20.0 accepted give the same rasters; the 110 multi-source requests it refused
+as single-source only are still refused, now because their sources differ in
+cell size or lie off the lattice (107) or the request sets a grid or extent (3).
 
 - **Staged sessions (#50).** No Depth/WSE bit changes; request schemas and
   `ras-commander-staged-cells/1` are unchanged.
