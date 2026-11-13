@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.21.0 - 2026-11-13
+
+Release summary: staged-session follow-ups (#50), duration with storage-area
+level pools, and the stored-map effective-terrain basis for several sources on
+one lattice (`rasmapper-stored-map-composition/1`). Requests that 0.20.0
+accepts keep their output bytes.
 
 - **Staged sessions (#50).** No Depth/WSE bit changes; request schemas and
   `ras-commander-staged-cells/1` are unchanged.
