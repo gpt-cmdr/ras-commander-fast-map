@@ -343,8 +343,8 @@ pub fn stage_profiles(
             && t >= time_counts[i]
         {
             return Err(Error::invalid(format!(
-                "time index {t} is outside the saved times of {:?}",
-                mesh.name
+                "time index {t} is outside the saved times of {}",
+                crate::error::py_repr(&mesh.name)
             )));
         }
         let times: Vec<u64> = first.keys().copied().collect();

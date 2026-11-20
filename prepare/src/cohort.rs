@@ -438,19 +438,24 @@ pub fn prepare(req: &PrepareInput, control: &Path, ordinal: usize) -> Result<Pre
             "Prepared sloping inputs exceed max_prepared_mib",
         ));
     }
-    // ras-commander's time-series view reads the saved-time axis first.
+    // `HdfResultsMesh.get_mesh_timeseries` checks each mesh's Water Surface
+    // dataset, then the saved-time axis, before reading.
+    let missing = |path: &str| Error::invalid(format!("Path {path} not found in HDF file"));
     let time_path = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Time";
+    if let Some(first) = meshes.first() {
+        let ws = Hdf::water_surface_path(&first.name);
+        if hdf.dataset_shape(&ws)?.is_none() {
+            return Err(missing(&ws));
+        }
+    }
     if hdf.dataset_shape(time_path)?.is_none() {
-        return Err(Error::invalid(format!(
-            "Path {time_path} not found in HDF file"
-        )));
+        return Err(missing(time_path));
     }
     let time_counts = meshes
         .iter()
         .map(|m| {
-            let shape = hdf
-                .dataset_shape(&Hdf::water_surface_path(&m.name))?
-                .unwrap_or_default();
+            let ws = Hdf::water_surface_path(&m.name);
+            let shape = hdf.dataset_shape(&ws)?.ok_or_else(|| missing(&ws))?;
             if shape.len() != 2 || shape[1] != m.cell_count as u64 {
                 return Err(Error::invalid("Sloping profile source dimensions changed"));
             }

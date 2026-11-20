@@ -112,13 +112,13 @@ impl Hdf {
 
     /// `HdfUtils.collect_hdf_crs_evidence` for this plan HDF.
     pub fn crs_evidence(&self) -> Result<Vec<crate::crs::Evidence>> {
-        let read =
+        let hdf_projection =
             |p: &std::path::Path| -> Result<Option<String>> { Hdf::open(p, 1)?.projection_wkt() };
-        Ok(crate::crs::model_crs_evidence(
-            self.projection_wkt()?,
-            &self.path,
-            &read,
-        ))
+        let readers = crate::crs::EvidenceReaders {
+            hdf_projection: &hdf_projection,
+            raster_epsg: &crate::grid::geotiff_epsg,
+        };
+        crate::crs::model_crs_evidence(self.projection_wkt()?, &self.path, &readers)
     }
 
     /// `HdfMesh._mesh_area_names`: `2D Flow Areas/Attributes` `Name` field in

@@ -97,32 +97,61 @@ Evidence (2026-11-20): UPGU1 and UPGU3 slim p02 plan HDFs, all 222 reaches: iden
 GeoTIFFs byte-identical. `tests/` checks the invalid-cell policies against ras-commander's
 own synthetic meshes and the window arithmetic against values Python computed.
 
-## Differences (refusals only)
+## Differences
+
+### Refusals
 
 The preparation is meant never to accept input ras-commander refuses, and it refuses some input
 ras-commander accepts:
 
 - an AOI whose CRS does not declare the terrain's projected EPSG code (ras-commander compares
-  with PROJ and reprojects when they differ);
-- a terrain without an explicit EPSG `ProjectedCSTypeGeoKey`, with a GDAL sidecar that could
-  change its CRS or geotransform (`.aux.xml` SRS/GeoTransform, world file), or whose size,
-  geotransform or EPSG the engine's `terrain-info` reports differently;
+  with PROJ and reprojects when they differ). The declared code is trusted: a WKT2 `PROJCRS`
+  carrying `ID["EPSG",2278]` over a different conversion would be used unprojected. pyproj's
+  `to_wkt()`, which fim-commander writes, never produces such a CRS;
+- a terrain without an explicit EPSG `ProjectedCSTypeGeoKey`, with an external mask
+  (`.msk`), with a GDAL sidecar that could change its CRS or geotransform (`.aux.xml`
+  SRS/GeoTransform, world file), or whose size, geotransform or EPSG the engine's `terrain-info`
+  reports differently. `terrain-info` uses the engine's own reader, so this check catches engine
+  skew, not a GDAL/terrio disagreement;
 - model CRS evidence (`HdfUtils.collect_hdf_crs_evidence`: the plan HDF's `Projection`, then the
-  `.rasmap` projection file and terrain layer HDFs) that does not match the terrain's EPSG
+  `.rasmap` projection file and terrain layers) that does not match the terrain's EPSG
   definition parameter by parameter: projection method (LCC 2SP, Transverse Mercator, Albers),
   datum name, ellipsoid, prime meridian, angular and linear units, axes and parameters within
-  PROJ's 1e-10 relative tolerance; WKT with `TOWGS84`, `EXTENSION` or other elements;
+  PROJ's 1e-10 relative tolerance; WKT with `TOWGS84`, `EXTENSION`, other elements or bare words
+  outside `AXIS`. Evidence ras-commander records as unreadable and lets go without a vote is
+  refused here: a `.rasmap` that is not UTF-8 XML, a terrain layer HDF that cannot be opened, a
+  `.prj` over 1 MiB, and a `.vrt` terrain layer. A GeoTIFF terrain layer votes with its explicit
+  EPSG key (rasterio would read its full CRS). `.rasmap` stems are compared with `to_lowercase`,
+  not `casefold`;
 - unit attributes outside `True/False/1/0` and `SI Units/SI/US Customary`, and the root `SI
   Units` / geometry `SI Units = False` disagreement ras-commander resolves from dataset labels;
 - `postprocessing_hdf`, depth-weighted faces, `slopingPretty`, shallow-to-horizontal and staging
   without cell subsets.
 
+### Tiles
+
 Water surface comes from the plan HDF. Where fim-commander would stage a wave from a parent
 extract's tiles (`wse_tiles`, `_tile_layout`), only the staged cells' columns are read and only
 those values must be finite, as on the tile path; the wave records
 `wse_source: plan-hdf-staged-cells/1` instead of `parent-extract-cell-wse-tiles/1`. Elsewhere
-complete rows are read and must be finite, as on the HDF path. If tiles exist but cannot be read,
-ras-commander falls back to complete rows; this preparation keeps the staged-only check.
+complete rows are read and must be finite, as on the HDF path. One acceptance difference: if
+tiles exist but cannot be read, ras-commander falls back to complete rows and refuses a
+non-finite value outside the staged closure; this preparation keeps the staged-only check.
+
+### Errors
+
+A refusal ras-commander and this preparation share has the same Python class; the message is
+ported where Python's is fixed text. Known differences, none parsed by fim-commander:
+
+- a changed source in a multi-job cohort names the first job, not the changed one; a change
+  during the engine run is reported after delivery as `RuntimeError`, where Python raises
+  `FimEngineError` before the remaining jobs are delivered; the changed-key list repeats keys
+  per job;
+- engine capabilities come from the supervisor's record in the config, not a fresh
+  `ras2fim-batch method`, and the gates are checked in a different order;
+- unit-resolution refusals keep Python's prefix with this crate's own detail;
+- with interleaved band groups and two non-finite staged selectors, the tile-path refusal can
+  name a different selector.
 
 ## Building
 
@@ -135,5 +164,5 @@ GEOS_LIB_DIR=/path/to/geos-3.13.1/lib GEOS_VERSION=3.13.1 cargo build --release 
 GEOS is LGPL-2.1 and linked dynamically; ship `libgeos_c` and `libgeos` 3.13.1 with the
 binary. CI builds against conda-forge `geos=3.13.1=h97f6797_0` and uploads the binary with
 `libgeos_c.so.1`, `libgeos.so.3.13.1` and the conda `libstdc++.so.6` / `libgcc_s.so.1` they were
-built against, found next to the binary (rpath `$ORIGIN`). `tests/fixtures/make_fixtures.py` regenerates the fixtures
-with the oracle pins.
+built against (pinned), found next to the binary (rpath `$ORIGIN`).
+`tests/fixtures/make_fixtures.py` regenerates the fixtures with the oracle pins.

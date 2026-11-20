@@ -193,6 +193,30 @@ fn gdal_sidecar(path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The explicit EPSG `ProjectedCSTypeGeoKey`, when terrio identifies the same code.
+fn explicit_epsg(path: &Path, identified: Option<u32>) -> Result<Option<u32>> {
+    let keyed = ras_commander_fast_map::crs::read_geokeys(path)?
+        .and_then(|k| k.short(3072))
+        .filter(|c| *c != 0 && *c != 32767)
+        .map(u32::from);
+    Ok(keyed.filter(|k| identified == Some(*k)))
+}
+
+/// A GeoTIFF terrain layer's CRS as CRS evidence: its explicit EPSG code, with
+/// no GDAL sidecar that could give rasterio another CRS. Anything else is
+/// refused rather than guessed.
+pub fn geotiff_epsg(path: &Path) -> Result<u32> {
+    if let Some(sidecar) = gdal_sidecar(path) {
+        return Err(Error::unsupported(format!(
+            "sidecar {} can change the raster's CRS for GDAL",
+            sidecar.display()
+        )));
+    }
+    let info = ras_commander_fast_map::terrain::inspect(&path.to_string_lossy())?;
+    explicit_epsg(path, info.epsg)?
+        .ok_or_else(|| Error::unsupported("the raster has no explicit EPSG ProjectedCSTypeGeoKey"))
+}
+
 impl Terrain {
     /// plan_grid's terrain checks (single-band float32, nodata declared, no
     /// dataset/alpha mask, north-up square pixels) and the terrain identity:
@@ -206,8 +230,9 @@ impl Terrain {
                 "horizontal mapping requires single-band float32 terrain",
             ));
         }
-        let msk = format!("{p}.msk");
-        if Path::new(&msk).exists() || tiff_mask_or_alpha(path)? {
+        // GDAL's external mask: `<file>.msk`, also `<file>.MSK` on case-sensitive systems.
+        let msk = [format!("{p}.msk"), format!("{p}.MSK")];
+        if msk.iter().any(|m| Path::new(m).exists()) || tiff_mask_or_alpha(path)? {
             return Err(Error::unsupported(
                 "horizontal terrain with a dataset/alpha mask is unsupported; export nodata-tagged terrain",
             ));
@@ -233,18 +258,11 @@ impl Terrain {
                 "horizontal mapping requires north-up square terrain pixels",
             ));
         }
-        let keyed = ras_commander_fast_map::crs::read_geokeys(path)?
-            .and_then(|k| k.short(3072))
-            .filter(|c| *c != 0 && *c != 32767)
-            .map(u32::from);
-        let epsg = match (keyed, info.epsg) {
-            (Some(k), Some(e)) if k == e => k,
-            _ => {
-                return Err(Error::unsupported(
-                    "terrain CRS has no explicit EPSG ProjectedCSTypeGeoKey; this preparation requires an EPSG-coded terrain",
-                ));
-            }
-        };
+        let epsg = explicit_epsg(path, info.epsg)?.ok_or_else(|| {
+            Error::unsupported(
+                "terrain CRS has no explicit EPSG ProjectedCSTypeGeoKey; this preparation requires an EPSG-coded terrain",
+            )
+        })?;
         let (bw, bh) = info.block;
         if bw == 0 || bh == 0 {
             return Err(Error::unsupported("terrain block size is unknown"));

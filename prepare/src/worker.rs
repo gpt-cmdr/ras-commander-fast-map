@@ -660,10 +660,34 @@ fn set_affinity(_cpus: &[usize]) -> Result<()> {
     Ok(())
 }
 
+/// The CPUs this process may run on (`psutil.Process().cpu_affinity()`), the
+/// partition a supervisor hands its workers. Tests use it to pick valid CPUs.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // sched_getaffinity has no safe std wrapper.
+pub fn current_cpus() -> Vec<usize> {
+    // SAFETY: `set` is a zeroed, properly sized cpu_set_t that lives for the call.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return vec![0];
+        }
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|&c| libc::CPU_ISSET(c, &set))
+            .collect()
+    }
+}
+#[cfg(not(target_os = "linux"))]
+pub fn current_cpus() -> Vec<usize> {
+    vec![0]
+}
+
 /// `os.environ["OMP_NUM_THREADS"] = str(len(cpus))`, inherited by the engine.
 #[allow(unsafe_code)] // `set_var` is unsafe in edition 2024.
 fn set_engine_threads(n: usize) {
-    // SAFETY: called once at start-up, before this process starts any thread.
+    // SAFETY: in production `run` is called from `main` before any other thread
+    // exists. The crate's tests call `run` from test threads and serialise
+    // those calls through one lock, so no other thread reads the environment
+    // while it changes.
     unsafe { std::env::set_var("OMP_NUM_THREADS", n.to_string()) };
 }
 

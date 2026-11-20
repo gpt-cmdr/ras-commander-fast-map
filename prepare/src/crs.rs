@@ -110,6 +110,20 @@ fn parse_node(s: &[char], pos: &mut usize, depth: usize) -> Result<Node> {
     })
 }
 
+/// True when every bare word (an unquoted, non-numeric token) is an argument of
+/// one of `parents`, as in `AXIS["Easting",EAST]` or WKT2's `CS[Cartesian,2]`.
+/// PROJ rejects bare words anywhere else, so such WKT is invalid evidence.
+fn bare_words_only_in(node: &Node, parents: &[&str]) -> bool {
+    match node {
+        Node::Tag(t, args) => args.iter().all(|a| match a {
+            Node::Word(_) => parents.contains(&t.as_str()),
+            other => bare_words_only_in(other, parents),
+        }),
+        Node::Word(_) => false,
+        _ => true,
+    }
+}
+
 fn tag(n: &Node) -> Option<&str> {
     match n {
         Node::Tag(t, _) => Some(t),
@@ -268,6 +282,11 @@ pub fn require_epsg(wkt: Option<&str>, epsg: u32) -> Result<()> {
     if tag(&root) != Some("PROJCS") {
         return Err(fail("the CRS is not a projected WKT1 CRS"));
     }
+    if !bare_words_only_in(&root, &["AXIS"]) {
+        return Err(fail(
+            "an unquoted word outside AXIS (PROJ cannot parse this WKT)",
+        ));
+    }
     let mut all = Vec::new();
     tags(&root, &mut all);
     const ALLOWED: [&str; 10] = [
@@ -420,6 +439,9 @@ pub fn declared_projected_epsg(wkt: &str) -> Option<u32> {
     if !matches!(tag(&root), Some("PROJCRS") | Some("PROJCS")) {
         return None;
     }
+    if !bare_words_only_in(&root, &["AXIS", "CS"]) {
+        return None;
+    }
     let mut all = Vec::new();
     tags(&root, &mut all);
     if all.iter().any(|t| {
@@ -433,25 +455,38 @@ pub fn declared_projected_epsg(wkt: &str) -> Option<u32> {
     authority_code(&root)
 }
 
-/// One CRS evidence item (`CrsEvidence`; `wkt` is Some when found).
+/// One CRS evidence item (`CrsEvidence`). `wkt` is Some when a WKT was found;
+/// `epsg` is Some for a raster terrain layer, whose GeoTIFF EPSG key is read.
 pub struct Evidence {
     pub source: &'static str,
     pub path: PathBuf,
     pub wkt: Option<String>,
+    pub epsg: Option<u32>,
+}
+
+/// Python's `glob("*.rasmap")`: case-insensitive on Windows, exact elsewhere;
+/// it matches directories and a file named `.rasmap` too.
+fn is_rasmap_name(name: &str) -> bool {
+    if cfg!(windows) {
+        name.to_ascii_lowercase().ends_with(".rasmap")
+    } else {
+        name.ends_with(".rasmap")
+    }
 }
 
 /// `HdfUtils._select_rasmap`: the `.rasmap` beside the HDF whose stem is the
 /// project name, else the only one; None when there is none or the choice is
 /// ambiguous (ras-commander then records invalid evidence, which does not vote).
+/// A selected entry that is not a file is missing evidence, as in Python.
+/// (Stems are compared with `to_lowercase`, not Python's `casefold`.)
 fn select_rasmap(hdf: &Path) -> Option<PathBuf> {
     let folder = hdf.parent()?;
     let mut maps: Vec<PathBuf> = std::fs::read_dir(folder)
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
-            p.is_file()
-                && p.extension()
-                    .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("rasmap"))
+            p.file_name()
+                .is_some_and(|n| is_rasmap_name(&n.to_string_lossy()))
         })
         .collect();
     maps.sort();
@@ -510,38 +545,110 @@ fn ras_relative(base: &Path, filename: &str) -> PathBuf {
     base.join(relative)
 }
 
-fn read_prj(path: &Path) -> Option<String> {
-    let raw = std::fs::read(path).ok()?;
+/// Largest projection file read; real `.prj` files are a few KiB.
+const MAX_PRJ_BYTES: u64 = 1 << 20;
+
+fn read_prj(path: &Path) -> Result<String> {
+    if std::fs::metadata(path)?.len() > MAX_PRJ_BYTES {
+        return Err(Error::unsupported(format!(
+            "projection file {} is larger than 1 MiB",
+            path.display()
+        )));
+    }
+    let raw = std::fs::read(path)?;
     let raw = raw.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&raw);
-    Some(match std::str::from_utf8(raw) {
+    Ok(match std::str::from_utf8(raw) {
         Ok(s) => s.to_string(),
         Err(_) => raw.iter().map(|&b| b as char).collect(),
     })
 }
 
+/// Readers for evidence files other than the plan HDF: another HDF's
+/// `Projection` attribute, and a GeoTIFF's explicit EPSG key.
+pub struct EvidenceReaders<'a> {
+    pub hdf_projection: &'a dyn Fn(&Path) -> Result<Option<String>>,
+    pub raster_epsg: &'a dyn Fn(&Path) -> Result<u32>,
+}
+
+/// `HdfUtils.read_crs_evidence` for a file named by the `.rasmap`, dispatched
+/// by suffix as Python does. A missing file, or a suffix Python cannot read,
+/// does not vote (as in Python). A file that exists but cannot be read is
+/// refused here, where Python lets it not vote: the gate refuses what it
+/// cannot check. A `.vrt` layer is refused (no GDAL here).
+fn file_evidence(
+    source: &'static str,
+    path: PathBuf,
+    readers: &EvidenceReaders,
+) -> Result<Evidence> {
+    let mut e = Evidence {
+        source,
+        path,
+        wkt: None,
+        epsg: None,
+    };
+    if !e.path.is_file() {
+        return Ok(e);
+    }
+    let suffix = e
+        .path
+        .extension()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let refuse = |err: Error| {
+        Error::unsupported(format!(
+            "{source} ({}) cannot be read as CRS evidence: {}",
+            e.path.display(),
+            err.message
+        ))
+    };
+    match suffix.as_str() {
+        "hdf" | "h5" | "hdf5" => {
+            e.wkt = found_wkt((readers.hdf_projection)(&e.path).map_err(refuse)?);
+        }
+        "prj" => e.wkt = found_wkt(Some(read_prj(&e.path).map_err(refuse)?)),
+        "tif" | "tiff" => e.epsg = Some((readers.raster_epsg)(&e.path).map_err(refuse)?),
+        "vrt" => {
+            return Err(refuse(Error::unsupported(
+                "a VRT's CRS needs GDAL; this preparation cannot check it",
+            )));
+        }
+        _ => {}
+    }
+    Ok(e)
+}
+
+fn found_wkt(w: Option<String>) -> Option<String> {
+    w.map(|w| w.trim().to_string()).filter(|w| !w.is_empty())
+}
+
 /// `HdfUtils.collect_hdf_crs_evidence(hdf_path)`: the HDF attribute (given),
-/// then the selected `.rasmap`'s projection file and terrain layer HDFs.
-/// `read_hdf_projection` reads another HDF's `Projection` attribute.
+/// then the selected `.rasmap`'s projection file and terrain layers. A
+/// `.rasmap` that exists but is not UTF-8 XML is refused (Python records it
+/// unreadable and lets it not vote).
 pub fn model_crs_evidence(
     hdf_attribute: Option<String>,
     hdf_path: &Path,
-    read_hdf_projection: &dyn Fn(&Path) -> Result<Option<String>>,
-) -> Vec<Evidence> {
-    let found = |w: Option<String>| w.map(|w| w.trim().to_string()).filter(|w| !w.is_empty());
+    readers: &EvidenceReaders,
+) -> Result<Vec<Evidence>> {
     let mut evidence = vec![Evidence {
         source: "hdf_attribute",
         path: hdf_path.to_path_buf(),
-        wkt: found(hdf_attribute),
+        wkt: found_wkt(hdf_attribute),
+        epsg: None,
     }];
-    let Some(rasmap) = select_rasmap(hdf_path) else {
-        return evidence;
+    let Some(rasmap) = select_rasmap(hdf_path).filter(|p| p.is_file()) else {
+        return Ok(evidence);
     };
-    let Ok(text) = std::fs::read_to_string(&rasmap) else {
-        return evidence;
+    let unreadable = |why: String| {
+        Error::unsupported(format!(
+            "RASMapper file {} cannot be read for CRS evidence: {why}",
+            rasmap.display()
+        ))
     };
-    let Ok(doc) = roxmltree::Document::parse(&text) else {
-        return evidence;
-    };
+    let raw = std::fs::read(&rasmap)?;
+    let text = std::str::from_utf8(raw.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&raw))
+        .map_err(|_| unreadable("it is not UTF-8".into()))?;
+    let doc = roxmltree::Document::parse(text).map_err(|e| unreadable(e.to_string()))?;
     let base = rasmap.parent().unwrap_or(Path::new("")).to_path_buf();
     let root = doc.root_element();
     if let Some(projection) = root
@@ -550,36 +657,24 @@ pub fn model_crs_evidence(
         .and_then(|n| n.attribute("Filename"))
         .filter(|f| !f.is_empty())
     {
-        let path = ras_relative(&base, projection);
-        let wkt = if path.is_file() {
-            read_prj(&path)
-        } else {
-            None
-        };
-        evidence.push(Evidence {
-            source: "rasmap_projection",
-            path,
-            wkt: found(wkt),
-        });
+        evidence.push(file_evidence(
+            "rasmap_projection",
+            ras_relative(&base, projection),
+            readers,
+        )?);
     }
     for terrains in root.children().filter(|n| n.has_tag_name("Terrains")) {
         for layer in terrains.children().filter(|n| n.has_tag_name("Layer")) {
             if let Some(file) = layer.attribute("Filename").filter(|f| !f.is_empty()) {
-                let path = ras_relative(&base, file);
-                let wkt = if path.is_file() {
-                    read_hdf_projection(&path).ok().flatten()
-                } else {
-                    None
-                };
-                evidence.push(Evidence {
-                    source: "terrain_hdf",
-                    path,
-                    wkt: found(wkt),
-                });
+                evidence.push(file_evidence(
+                    "terrain_hdf",
+                    ras_relative(&base, file),
+                    readers,
+                )?);
             }
         }
     }
-    evidence
+    Ok(evidence)
 }
 
 /// Every CRS evidence item found must be the terrain's EPSG CRS, and at least
@@ -587,6 +682,16 @@ pub fn model_crs_evidence(
 pub fn require_model_crs(evidence: &[Evidence], epsg: u32) -> Result<()> {
     let mut any = false;
     for e in evidence {
+        if let Some(code) = e.epsg {
+            any = true;
+            if code != epsg {
+                return Err(Error::unsupported(format!(
+                    "{} ({}): EPSG:{code} is not the terrain CRS EPSG:{epsg}",
+                    e.source,
+                    e.path.display()
+                )));
+            }
+        }
         if let Some(w) = &e.wkt {
             any = true;
             require_epsg(Some(w), epsg).map_err(|err| {
@@ -689,18 +794,69 @@ mod tests {
         )
         .unwrap();
         let none = |_: &Path| -> Result<Option<String>> { Ok(None) };
-        let evidence = model_crs_evidence(Some(UPGU.into()), &hdf, &none);
+        let epsg_2277 = |_: &Path| -> Result<u32> { Ok(2277) };
+        let readers = EvidenceReaders {
+            hdf_projection: &none,
+            raster_epsg: &epsg_2277,
+        };
+        let evidence = model_crs_evidence(Some(UPGU.into()), &hdf, &readers).unwrap();
         assert_eq!(evidence.len(), 2);
         assert!(require_model_crs(&evidence, 2278).is_err());
         std::fs::write(folder.join("GIS").join("other.prj"), UPGU).unwrap();
-        let evidence = model_crs_evidence(Some(UPGU.into()), &hdf, &none);
+        let evidence = model_crs_evidence(Some(UPGU.into()), &hdf, &readers).unwrap();
         require_model_crs(&evidence, 2278).unwrap();
         // A blank root attribute is absent; the .rasmap alone can resolve it.
-        let evidence = model_crs_evidence(Some("   ".into()), &hdf, &none);
+        let evidence = model_crs_evidence(Some("   ".into()), &hdf, &readers).unwrap();
         require_model_crs(&evidence, 2278).unwrap();
+        // A GeoTIFF terrain layer votes with its EPSG key; a VRT is refused.
+        std::fs::write(folder.join("GIS").join("t.tif"), b"").unwrap();
+        std::fs::write(folder.join("GIS").join("t.vrt"), b"").unwrap();
+        let layers = |layer: &str| {
+            std::fs::write(
+                folder.join("Model.rasmap"),
+                format!("<RASMapper><RASProjectionFilename Filename=\".\\GIS\\other.prj\" /><Terrains><Layer Filename=\".\\GIS\\{layer}\" /></Terrains></RASMapper>"),
+            )
+            .unwrap();
+        };
+        layers("t.tif");
+        let evidence = model_crs_evidence(Some(UPGU.into()), &hdf, &readers).unwrap();
+        assert_eq!(evidence.len(), 3);
+        assert!(require_model_crs(&evidence, 2278).is_err());
+        layers("t.vrt");
+        assert!(model_crs_evidence(Some(UPGU.into()), &hdf, &readers).is_err());
+        // A .rasmap that exists but is not UTF-8 is refused, not ignored.
+        std::fs::write(folder.join("Model.rasmap"), b"<RASMapper>\xe9</RASMapper>").unwrap();
+        assert!(model_crs_evidence(Some(UPGU.into()), &hdf, &readers).is_err());
         std::fs::remove_file(folder.join("Model.rasmap")).unwrap();
-        let evidence = model_crs_evidence(Some("   ".into()), &hdf, &none);
+        let evidence = model_crs_evidence(Some("   ".into()), &hdf, &readers).unwrap();
         assert!(require_model_crs(&evidence, 2278).is_err());
         std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn rasmap_selection_follows_python_glob() {
+        let folder = std::env::temp_dir().join(format!("fmp-select-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let hdf = folder.join("UPGU1.p02.hdf");
+        std::fs::write(folder.join("Other.rasmap"), b"").unwrap();
+        std::fs::write(folder.join("old.RASMAP"), b"").unwrap();
+        // POSIX glob is case-sensitive: one map, selected. Windows sees two, neither
+        // matching the project stem: ambiguous, none selected.
+        let selected = select_rasmap(&hdf);
+        if cfg!(windows) {
+            assert_eq!(selected, None);
+        } else {
+            assert_eq!(selected, Some(folder.join("Other.rasmap")));
+        }
+        std::fs::write(folder.join("upgu1.rasmap"), b"").unwrap();
+        assert_eq!(select_rasmap(&hdf), Some(folder.join("upgu1.rasmap")));
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn bare_words_are_refused_outside_axis() {
+        let junk = UPGU.replacen("0.3048006096012192]", "0.3048006096012192,junk]", 1);
+        assert!(require_epsg(Some(&junk), 2278).is_err());
+        require_epsg(Some(UPGU), 2278).unwrap();
     }
 }

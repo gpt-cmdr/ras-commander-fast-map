@@ -36,6 +36,8 @@ jobs:
       GEOS_VERSION: "3.13.1"
       # The conda-forge build the parity evidence used, and micromamba by checksum.
       GEOS_SPEC: "geos=3.13.1=h97f6797_0"
+      # The C++ runtime shipped beside the binary, pinned to the builds of the parity run.
+      RUNTIME_SPECS: "libstdcxx=16.2.0=h934c35e_7 libgcc=16.2.0=ha9f2e26_7 libgomp=16.2.0=he0feb66_7 _openmp_mutex=4.5=20_gnu"
       MICROMAMBA_SHA256: "9a97976244929bbae28fb1fae504e74a3e7e6d1932870e3a03321f01b7fbd07b"
       CARGO_TERM_COLOR: never
       FAST_MAP_BUILD_COMMIT: ${{ github.sha }}
@@ -52,7 +54,7 @@ jobs:
           echo "$MICROMAMBA_SHA256  $GEOS_ROOT/micromamba.tar.bz2" | sha256sum -c -
           tar -xjf "$GEOS_ROOT/micromamba.tar.bz2" -C "$GEOS_ROOT" bin/micromamba
           MAMBA_ROOT_PREFIX="$GEOS_ROOT/root" "$GEOS_ROOT/bin/micromamba" create -y \
-            -p "$GEOS_ROOT/geos" -c conda-forge --override-channels "$GEOS_SPEC"
+            -p "$GEOS_ROOT/geos" -c conda-forge --override-channels "$GEOS_SPEC" $RUNTIME_SPECS
           echo "GEOS_LIB_DIR=$GEOS_ROOT/geos/lib" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$GEOS_ROOT/geos/lib" >> "$GITHUB_ENV"
       - run: cargo fmt --check
@@ -69,7 +71,8 @@ jobs:
           mkdir -p "$out"
           cp target/release/fast-map-prepare "$out/"
           # GEOS and the C++ runtime it was built against (found through $ORIGIN).
-          cp -L "$GEOS_ROOT/geos/lib/libgeos_c.so.1" "$GEOS_ROOT/geos/lib/libgeos.so.3.13.1"             "$GEOS_ROOT/geos/lib/libstdc++.so.6" "$GEOS_ROOT/geos/lib/libgcc_s.so.1" "$out/"
+          cp -L "$GEOS_ROOT/geos/lib/libgeos_c.so.1" "$GEOS_ROOT/geos/lib/libgeos.so.3.13.1" \
+            "$GEOS_ROOT/geos/lib/libstdc++.so.6" "$GEOS_ROOT/geos/lib/libgcc_s.so.1" "$out/"
           MAMBA_ROOT_PREFIX="$GEOS_ROOT/root" "$GEOS_ROOT/bin/micromamba" list -p "$GEOS_ROOT/geos" > "$out/conda-packages.txt"
           (cd "$out" && env -u LD_LIBRARY_PATH ldd fast-map-prepare > ldd.txt && env -u LD_LIBRARY_PATH ./fast-map-prepare version > version.json && sha256sum fast-map-prepare libgeos_c.so.1 libgeos.so.3.13.1 libstdc++.so.6 libgcc_s.so.1 > SHA256SUMS)
           sha256sum Cargo.lock >> "$out/SHA256SUMS"
