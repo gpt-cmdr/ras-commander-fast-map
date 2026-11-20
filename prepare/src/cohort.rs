@@ -18,6 +18,10 @@ pub struct PrepareInput {
     pub controls: Controls,
     pub invalid_cells: String,
     pub persistent_session: bool,
+    /// The config's `wse_tiles` (fim-commander `_check_wse_tiles` record). A wave the
+    /// tiles could serve (`_tile_layout`) is staged from the staged cells' HDF columns
+    /// with only staged values checked, as fim-commander's tile path checks them.
+    pub wse_tiles: Option<Value>,
     /// Source files with the `(size, mtime_ns)` identity recorded at normalisation.
     pub sources: Vec<(PathBuf, (u64, i128))>,
 }
@@ -26,6 +30,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 pub const STAGED_CELLS_METHOD: &str = "ras-commander-staged-cells/1";
+/// Recorded on a wave staged by reading only the staged cells' HDF columns
+/// (fim-commander records `parent-extract-cell-wse-tiles/1` when it reads tiles).
+pub const STAGED_CELL_READS_SOURCE: &str = "plan-hdf-staged-cells/1";
 
 /// What the caller needs after preparation.
 pub struct Prepared {
@@ -192,6 +199,74 @@ fn plan_window_cache(
         "retention_enabled": effective > 0, "entries": entries,
         "scope": "distinct windows in one parent call; charged within native working memory",
     }))
+}
+
+/// `_tile_layout(tiles, hdf_path, meshes, selectors)` is not None: the tiles
+/// could stage this wave exactly (metadata only; no tile is read here).
+fn tile_layout(
+    tiles: Option<&Value>,
+    hdf_path: &Path,
+    meshes: &[MeshPayload],
+    wave: &[u64],
+) -> Result<bool> {
+    let Some(t) = tiles else {
+        return Ok(false);
+    };
+    if meshes.len() != 1 {
+        return Ok(false);
+    }
+    let mesh = &meshes[0];
+    let time_count = t["time_count"].as_u64().unwrap_or(0);
+    let same_hdf = t["hdf_path"]
+        .as_str()
+        .and_then(|p| request::resolve(Path::new(p)).ok())
+        .is_some_and(|p| p == hdf_path);
+    if t["mesh_name"].as_str() != Some(mesh.name.as_str())
+        || t["cell_count"].as_u64() != Some(mesh.cell_count as u64)
+        || !same_hdf
+        || wave.iter().any(|&s| s >= time_count)
+    {
+        return Ok(false);
+    }
+    let mut by_time: std::collections::BTreeMap<(u64, u64), Vec<(u64, u64)>> = Default::default();
+    for c in t["chunks"].as_array().into_iter().flatten() {
+        let key = (
+            c["time_start"].as_u64().unwrap_or(u64::MAX),
+            c["time_stop"].as_u64().unwrap_or(u64::MAX),
+        );
+        by_time.entry(key).or_default().push((
+            c["entity_start"].as_u64().unwrap_or(u64::MAX),
+            c["entity_stop"].as_u64().unwrap_or(u64::MAX),
+        ));
+    }
+    let mut end = 0;
+    for &(start, stop) in by_time.keys() {
+        if start != end {
+            return Ok(false);
+        }
+        end = stop;
+    }
+    if end != time_count {
+        return Ok(false);
+    }
+    for (&(start, stop), space) in &by_time {
+        if !wave.iter().any(|&s| start <= s && s < stop) {
+            continue;
+        }
+        let mut space = space.clone();
+        space.sort_unstable();
+        let mut edge = 0;
+        for (lo, hi) in space {
+            if lo != edge {
+                return Ok(false);
+            }
+            edge = hi;
+        }
+        if edge != mesh.cell_count as u64 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn write_framed_wkb(path: &Path, wkbs: &[Vec<u8>]) -> Result<()> {
@@ -402,6 +477,7 @@ pub fn prepare(req: &PrepareInput, control: &Path, ordinal: usize) -> Result<Pre
             )));
         }
         let wanted: Vec<(String, u64)> = wave.iter().map(|i| (names[i].clone(), *i)).collect();
+        let staged_reads = tile_layout(req.wse_tiles.as_ref(), &hdf_path, &meshes, wave)?;
         let (units, views, size) = payload::stage_profiles(
             &hdf,
             &wave_root,
@@ -410,13 +486,18 @@ pub fn prepare(req: &PrepareInput, control: &Path, ordinal: usize) -> Result<Pre
             &subsets,
             allowed as i64 - staged_bytes as i64,
             &time_counts,
+            !staged_reads,
         )?;
         staged.extend(units.into_iter().map(|u| {
             json!({"id": u.id, "values_files": u.values_files.iter().map(|p| path_string(p)).collect::<Vec<_>>()})
         }));
         staged_bytes += size as u64;
-        source_wave
-            .push(json!({"indices": wave, "staged_bytes": size, "profile_views_prepared": views}));
+        let mut record =
+            json!({"indices": wave, "staged_bytes": size, "profile_views_prepared": views});
+        if staged_reads {
+            record["wse_source"] = json!(STAGED_CELL_READS_SOURCE);
+        }
+        source_wave.push(record);
         check_sources()?;
     }
     lap("staged_cells_and_wse", &mut phases);

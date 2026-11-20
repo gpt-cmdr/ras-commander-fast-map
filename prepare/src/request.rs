@@ -290,6 +290,7 @@ impl PrepareIn {
                 controls: self.controls,
                 invalid_cells: self.invalid_cells,
                 persistent_session: persistent,
+                wse_tiles: None,
                 sources,
             },
             method,

@@ -261,12 +261,31 @@ pub struct Unit {
 /// Ceiling of one Water Surface read (values), as `_profile_block`'s bounded slabs.
 const READ_BLOCK_BYTES: usize = 64 << 20;
 
+/// Column ranges `[lo, hi)` covering ascending `cells`, split where two staged
+/// cells are more than one slim tile width (16,384 cells) apart.
+fn column_clusters(cells: &[u32]) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for &c in cells {
+        let c = u64::from(c);
+        match out.last_mut() {
+            Some((_, hi)) if c < *hi + 16_384 => *hi = c + 1,
+            _ => out.push((c, c + 1)),
+        }
+    }
+    out
+}
+
 /// `_stage_profiles(hdf, root, meshes, {}, selected, deduplicate=True,
-/// max_staged_bytes, cell_subsets)`: every complete source row is read and
-/// must be finite; each file holds the subset cells' float32 values in
-/// ascending cell order. Rows are read in ascending time blocks of at most
-/// 64 MiB; files are named by the selector's position in `selected`.
-/// Returns (units, profile views, staged bytes).
+/// max_staged_bytes, cell_subsets)`: each file holds the subset cells' float32
+/// values in ascending cell order, named by the selector's position in
+/// `selected`. Reads are ascending time blocks of at most 64 MiB.
+///
+/// `complete_rows=true` is the HDF path: every complete source row is read and
+/// must be finite. `complete_rows=false` follows fim-commander's staged-cell
+/// path (`_stage_tile_profiles`, engineer decision 2026-11-13): only the column
+/// ranges holding staged cells are read, and only staged values must be finite.
+/// The staged bytes are the same either way. Returns (units, views, staged bytes).
+#[allow(clippy::too_many_arguments)] // Mirrors `_stage_profiles` plus the staging mode.
 pub fn stage_profiles(
     hdf: &Hdf,
     root: &Path,
@@ -275,6 +294,7 @@ pub fn stage_profiles(
     subsets: &[Vec<u32>],
     max_staged_bytes: i64,
     time_counts: &[u64],
+    complete_rows: bool,
 ) -> Result<(Vec<Unit>, usize, i64)> {
     // First occurrence of each selector (deduplicate=True).
     let mut first: std::collections::BTreeMap<u64, usize> = Default::default();
@@ -308,8 +328,14 @@ pub fn stage_profiles(
             )));
         }
         let times: Vec<u64> = first.keys().copied().collect();
-        let per = (READ_BLOCK_BYTES / (mesh.cell_count * 4).max(1)).max(1) as u64;
         let subset = &subsets[i];
+        let clusters = if complete_rows {
+            vec![(0u64, mesh.cell_count as u64)]
+        } else {
+            column_clusters(subset)
+        };
+        let width: u64 = clusters.iter().map(|(lo, hi)| hi - lo).sum();
+        let per = (READ_BLOCK_BYTES as u64 / (width * 4).max(1)).max(1);
         let mut k = 0;
         while k < times.len() {
             let start = times[k];
@@ -319,22 +345,40 @@ pub fn stage_profiles(
                 stop += 1;
                 j += 1;
             }
-            let block = hdf.rows_f32(&path, start, stop, mesh.cell_count as u64)?;
-            if block.len() as u64 != (stop - start) * mesh.cell_count as u64 {
-                return Err(Error::invalid("Sloping profile source dimensions changed"));
+            let rows = (stop - start) as usize;
+            let mut blocks = Vec::with_capacity(clusters.len());
+            for &(lo, hi) in &clusters {
+                let block = hdf.slab_f32(&path, start, stop, lo, hi)?;
+                if block.len() != rows * (hi - lo) as usize {
+                    return Err(Error::invalid("Sloping profile source dimensions changed"));
+                }
+                blocks.push(block);
             }
-            for (n, row) in block.chunks_exact(mesh.cell_count).enumerate() {
+            for n in 0..rows {
                 let profile = first[&(start + n as u64)];
-                if !row.iter().all(|v| v.is_finite()) {
+                let mut values = Vec::with_capacity(subset.len());
+                let mut cluster = 0;
+                for &c in subset {
+                    let c = u64::from(c);
+                    while clusters[cluster].1 <= c {
+                        cluster += 1;
+                    }
+                    let (lo, hi) = clusters[cluster];
+                    values.push(blocks[cluster][n * (hi - lo) as usize + (c - lo) as usize]);
+                }
+                let finite = if complete_rows {
+                    let w = mesh.cell_count;
+                    blocks[0][n * w..(n + 1) * w].iter().all(|v| v.is_finite())
+                } else {
+                    values.iter().all(|v| v.is_finite())
+                };
+                if !finite {
                     if bad.is_none_or(|b| (profile, i) < b) {
                         bad = Some((profile, i));
                     }
                     continue;
                 }
-                let bytes: Vec<u8> = subset
-                    .iter()
-                    .flat_map(|&c| row[c as usize].to_le_bytes())
-                    .collect();
+                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
                 write_all(&root.join(format!("values-{profile}-{i}.bin")), &bytes)?;
             }
             k = j;

@@ -151,6 +151,7 @@ fn cohort_input(jobs: &[Value], config: &Value) -> Result<PrepareInput> {
         controls: controls(config)?,
         invalid_cells: s(&options["invalid_cells"], "options.invalid_cells")?.to_string(),
         persistent_session: config["engine"]["method"]["sloping"]["persistent_session"] == true,
+        wse_tiles: config.get("wse_tiles").cloned(),
         sources,
     })
 }

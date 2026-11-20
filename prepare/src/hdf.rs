@@ -198,7 +198,19 @@ impl Hdf {
     /// Rows `[start, stop)` of a 2-D float dataset as float32 (the stored
     /// float32 values; a float64 dataset is narrowed as NumPy's `astype("<f4")`).
     pub fn rows_f32(&self, path: &str, start: u64, stop: u64, columns: u64) -> Result<Vec<f32>> {
-        let selection = [Slice::new(start, stop, 1), Slice::new(0, columns, 1)];
+        self.slab_f32(path, start, stop, 0, columns)
+    }
+
+    /// Rows `[start, stop)` and columns `[col_lo, col_hi)` of a 2-D float dataset as float32.
+    pub fn slab_f32(
+        &self,
+        path: &str,
+        start: u64,
+        stop: u64,
+        col_lo: u64,
+        col_hi: u64,
+    ) -> Result<Vec<f32>> {
+        let selection = [Slice::new(start, stop, 1), Slice::new(col_lo, col_hi, 1)];
         let a = self.read(path, Some(&selection))?;
         Ok(match a.values {
             NumericValues::F32(v) => v,
