@@ -33,3 +33,11 @@ Ordinary mapping has no hidden Python fallback or HEC runtime dependency.
 Preparing missing stored corner elevations remains an explicit Commander
 Windows/pythonnet operation. Numerical/timing claims must state fixture,
 version, options and scope. No future DSS capability is implemented here.
+
+`prepare/` is a separate crate (own lock, unpublished) that writes the
+`ras-commander-depth-groups-request/1` and its binary inputs from a plan HDF,
+terrain and AOI, value-identical to ras-commander 0.124.0's Python preparation
+(fim-commander decision 40). It may depend on ras-commander-fast-hdf and GEOS
+3.13.1; the Fast-Map library itself still must not. Keep it byte-identical to
+the ras-commander release it names: any change to its outputs needs the parity
+evidence its README describes. Its CI runs only on the CLB self-hosted runner.

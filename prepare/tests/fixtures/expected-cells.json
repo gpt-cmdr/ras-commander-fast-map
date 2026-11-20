@@ -1,0 +1,1064 @@
+{
+ "bowtie/hull": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "convex_hull",
+     "cell_id": 0,
+     "fallback_area": 90.9090909090909,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 91.81818181818181,
+     "overlap_with": [],
+     "pieces": 1,
+     "reason": "no_polygon: Self-intersection[1.81818181818182 0]"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 2,
+     "fallback_area": 99.0909090909091,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 100.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 1,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 2,
+   "policy": "hull",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 0,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000002440000000000000244000000000000024400000000000000000175d74d14517fd3f00000000000000000000000000000000000000000000244000000000000024400000000000002440"
+   },
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "01030000000100000006000000000000000000000000000000000024400000000000000040000000000000f0bf0000000000000000000000000000000000000000000024c0000000000000000000000000000024c0000000000000244000000000000000000000000000002440"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "0103000000010000000700000000000000000024400000000000000000000000000000244000000000000024c0000000000000000000000000000024c0000000000000000000000000000000000000000000000040000000000000f0bf175d74d14517fd3f000000000000000000000000000024400000000000000000"
+   }
+  ]
+ },
+ "bowtie/omit": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "omitted",
+     "cell_id": 0,
+     "fallback_area": null,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 91.81818181818181,
+     "overlap_with": [],
+     "pieces": 0,
+     "reason": "no_polygon: Self-intersection[1.81818181818182 0]"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 2,
+     "fallback_area": 99.0909090909091,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 100.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 1,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 2,
+   "policy": "omit",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "01030000000100000006000000000000000000000000000000000024400000000000000040000000000000f0bf0000000000000000000000000000000000000000000024c0000000000000000000000000000024c0000000000000244000000000000000000000000000002440"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "0103000000010000000700000000000000000024400000000000000000000000000000244000000000000024c0000000000000000000000000000024c0000000000000000000000000000000000000000000000040000000000000f0bf175d74d14517fd3f000000000000000000000000000024400000000000000000"
+   }
+  ]
+ },
+ "bowtie/raise": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "omitted",
+     "cell_id": 0,
+     "fallback_area": null,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 91.81818181818181,
+     "overlap_with": [],
+     "pieces": 0,
+     "reason": "no_polygon: Self-intersection[1.81818181818182 0]"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 2,
+     "fallback_area": 99.0909090909091,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 100.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 1,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 2,
+   "policy": "raise",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "01030000000100000006000000000000000000000000000000000024400000000000000040000000000000f0bf0000000000000000000000000000000000000000000024c0000000000000000000000000000024c0000000000000244000000000000000000000000000002440"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "0103000000010000000700000000000000000024400000000000000000000000000000244000000000000024c0000000000000000000000000000024c0000000000000000000000000000000000000000000000040000000000000f0bf175d74d14517fd3f000000000000000000000000000024400000000000000000"
+   }
+  ]
+ },
+ "bowtie/repair": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "repaired",
+     "cell_id": 0,
+     "fallback_area": 90.9090909090909,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 91.81818181818181,
+     "overlap_with": [],
+     "pieces": 1,
+     "reason": "no_polygon: Self-intersection[1.81818181818182 0]"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 2,
+     "fallback_area": 99.0909090909091,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 100.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 1,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 2,
+   "policy": "repair",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 0,
+    "mesh": "Bowtie Mesh",
+    "wkb": "01030000000100000005000000000000000000000000000000000024400000000000002440000000000000244000000000000024400000000000000000175d74d14517fd3f000000000000000000000000000000000000000000002440"
+   },
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "01030000000100000006000000000000000000000000000000000024400000000000000040000000000000f0bf0000000000000000000000000000000000000000000024c0000000000000000000000000000024c0000000000000244000000000000000000000000000002440"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "0103000000010000000700000000000000000024400000000000000000000000000000244000000000000024c0000000000000000000000000000024c0000000000000000000000000000000000000000000000040000000000000f0bf175d74d14517fd3f000000000000000000000000000024400000000000000000"
+   }
+  ]
+ },
+ "cascade/hull": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "convex_hull",
+     "cell_id": 0,
+     "fallback_area": 90.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 1,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 2,
+     "fallback_area": 100.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 150.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 1,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 3,
+     "fallback_area": 100.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 150.0,
+     "overlap_with": [
+      2
+     ],
+     "pieces": 1,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 3,
+   "policy": "hull",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 0,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000000000000000000000244000000000000022400000000000002440000000000000224000000000000000000000000000000000000000000000000000000000000000000000000000002440"
+   },
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000003440000000000000244000000000000034400000000000000000000000000000224000000000000000000000000000002240000000000000244000000000000034400000000000002440"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000003e40000000000000000000000000000034400000000000000000000000000000344000000000000024400000000000003e4000000000000024400000000000003e400000000000000000"
+   },
+   {
+    "cell_id": 3,
+    "mesh": "Bowtie Mesh",
+    "wkb": "01030000000100000005000000000000000000444000000000000000000000000000003e4000000000000000000000000000003e4000000000000024400000000000004440000000000000244000000000000044400000000000000000"
+   }
+  ]
+ },
+ "cascade/omit": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "omitted",
+     "cell_id": 0,
+     "fallback_area": null,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 0,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 2,
+     "fallback_area": 100.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 150.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 1,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 3,
+     "fallback_area": 100.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 150.0,
+     "overlap_with": [
+      2
+     ],
+     "pieces": 1,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 3,
+   "policy": "omit",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000003440000000000000244000000000000034400000000000000000000000000000224000000000000000000000000000002240000000000000244000000000000034400000000000002440"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000003e40000000000000000000000000000034400000000000000000000000000000344000000000000024400000000000003e4000000000000024400000000000003e400000000000000000"
+   },
+   {
+    "cell_id": 3,
+    "mesh": "Bowtie Mesh",
+    "wkb": "01030000000100000005000000000000000000444000000000000000000000000000003e4000000000000000000000000000003e4000000000000024400000000000004440000000000000244000000000000044400000000000000000"
+   }
+  ]
+ },
+ "cascade/raise": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "omitted",
+     "cell_id": 0,
+     "fallback_area": null,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 0,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 2,
+     "fallback_area": 100.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 150.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 1,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 3,
+     "fallback_area": 100.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 150.0,
+     "overlap_with": [
+      2
+     ],
+     "pieces": 1,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 3,
+   "policy": "raise",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000003440000000000000244000000000000034400000000000000000000000000000224000000000000000000000000000002240000000000000244000000000000034400000000000002440"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000003e40000000000000000000000000000034400000000000000000000000000000344000000000000024400000000000003e4000000000000024400000000000003e400000000000000000"
+   },
+   {
+    "cell_id": 3,
+    "mesh": "Bowtie Mesh",
+    "wkb": "01030000000100000005000000000000000000444000000000000000000000000000003e4000000000000000000000000000003e4000000000000024400000000000004440000000000000244000000000000044400000000000000000"
+   }
+  ]
+ },
+ "cascade/repair": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "repaired",
+     "cell_id": 0,
+     "fallback_area": 24.5,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 1,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 2,
+     "fallback_area": 100.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 150.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 1,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 3,
+     "fallback_area": 100.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 150.0,
+     "overlap_with": [
+      2
+     ],
+     "pieces": 1,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 3,
+   "policy": "repair",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 0,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000002240000000000000f03f0000000000002240000000000000000000000000000000000000000000000000000000000000144000000000000014400000000000002240000000000000f03f"
+   },
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000003440000000000000244000000000000034400000000000000000000000000000224000000000000000000000000000002240000000000000244000000000000034400000000000002440"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000003e40000000000000000000000000000034400000000000000000000000000000344000000000000024400000000000003e4000000000000024400000000000003e400000000000000000"
+   },
+   {
+    "cell_id": 3,
+    "mesh": "Bowtie Mesh",
+    "wkb": "01030000000100000005000000000000000000444000000000000000000000000000003e4000000000000000000000000000003e4000000000000024400000000000004440000000000000244000000000000044400000000000000000"
+   }
+  ]
+ },
+ "consumed/hull": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "omitted",
+     "cell_id": 0,
+     "fallback_area": null,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 0,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    },
+    {
+     "action": "overlap_consumed",
+     "cell_id": 2,
+     "fallback_area": 0.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 64.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 0,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 2,
+   "policy": "hull",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000002440000000000000244000000000000024400000000000000000000000000000000000000000000000000000000000000000000000000000244000000000000024400000000000002440"
+   }
+  ]
+ },
+ "consumed/omit": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "omitted",
+     "cell_id": 0,
+     "fallback_area": null,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 0,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    },
+    {
+     "action": "overlap_consumed",
+     "cell_id": 2,
+     "fallback_area": 0.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 64.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 0,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 2,
+   "policy": "omit",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000002440000000000000244000000000000024400000000000000000000000000000000000000000000000000000000000000000000000000000244000000000000024400000000000002440"
+   }
+  ]
+ },
+ "consumed/raise": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "omitted",
+     "cell_id": 0,
+     "fallback_area": null,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 0,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    },
+    {
+     "action": "overlap_consumed",
+     "cell_id": 2,
+     "fallback_area": 0.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 64.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 0,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 2,
+   "policy": "raise",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000002440000000000000244000000000000024400000000000000000000000000000000000000000000000000000000000000000000000000000244000000000000024400000000000002440"
+   }
+  ]
+ },
+ "consumed/repair": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "omitted",
+     "cell_id": 0,
+     "fallback_area": null,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 0,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    },
+    {
+     "action": "overlap_consumed",
+     "cell_id": 2,
+     "fallback_area": 0.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 64.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 0,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 2,
+   "policy": "repair",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000002440000000000000244000000000000024400000000000000000000000000000000000000000000000000000000000000000000000000000244000000000000024400000000000002440"
+   }
+  ]
+ },
+ "hole/hull": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "convex_hull",
+     "cell_id": 0,
+     "fallback_area": 100.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 1,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 2,
+     "fallback_area": 96.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 100.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 1,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 2,
+   "policy": "hull",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 0,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000000000000000000000244000000000000024400000000000002440000000000000244000000000000000000000000000000000000000000000000000000000000000000000000000002440"
+   },
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000002c4000000000000010400000000000002c40000000000000004000000000000028400000000000000040000000000000284000000000000010400000000000002c400000000000001040"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "0103000000020000000500000000000000000034400000000000000000000000000000244000000000000000000000000000002440000000000000244000000000000034400000000000002440000000000000344000000000000000000500000000000000000028400000000000001040000000000000284000000000000000400000000000002c4000000000000000400000000000002c40000000000000104000000000000028400000000000001040"
+   }
+  ]
+ },
+ "hole/omit": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "omitted",
+     "cell_id": 0,
+     "fallback_area": null,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 0,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 2,
+     "fallback_area": 96.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 100.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 1,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 2,
+   "policy": "omit",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000002c4000000000000010400000000000002c40000000000000004000000000000028400000000000000040000000000000284000000000000010400000000000002c400000000000001040"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "0103000000020000000500000000000000000034400000000000000000000000000000244000000000000000000000000000002440000000000000244000000000000034400000000000002440000000000000344000000000000000000500000000000000000028400000000000001040000000000000284000000000000000400000000000002c4000000000000000400000000000002c40000000000000104000000000000028400000000000001040"
+   }
+  ]
+ },
+ "hole/raise": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "omitted",
+     "cell_id": 0,
+     "fallback_area": null,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 0,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 2,
+     "fallback_area": 96.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 100.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 1,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 2,
+   "policy": "raise",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000002c4000000000000010400000000000002c40000000000000004000000000000028400000000000000040000000000000284000000000000010400000000000002c400000000000001040"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "0103000000020000000500000000000000000034400000000000000000000000000000244000000000000000000000000000002440000000000000244000000000000034400000000000002440000000000000344000000000000000000500000000000000000028400000000000001040000000000000284000000000000000400000000000002c4000000000000000400000000000002c40000000000000104000000000000028400000000000001040"
+   }
+  ]
+ },
+ "hole/repair": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "repaired",
+     "cell_id": 0,
+     "fallback_area": 25.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 1,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 2,
+     "fallback_area": 96.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 100.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 1,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 2,
+   "policy": "repair",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 0,
+    "mesh": "Bowtie Mesh",
+    "wkb": "0103000000010000000400000000000000000024400000000000000000000000000000000000000000000000000000000000001440000000000000144000000000000024400000000000000000"
+   },
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000002c4000000000000010400000000000002c40000000000000004000000000000028400000000000000040000000000000284000000000000010400000000000002c400000000000001040"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "0103000000020000000500000000000000000034400000000000000000000000000000244000000000000000000000000000002440000000000000244000000000000034400000000000002440000000000000344000000000000000000500000000000000000028400000000000001040000000000000284000000000000000400000000000002c4000000000000000400000000000002c40000000000000104000000000000028400000000000001040"
+   }
+  ]
+ },
+ "split/hull": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "omitted",
+     "cell_id": 0,
+     "fallback_area": null,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 0,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 2,
+     "fallback_area": 80.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 100.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 2,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 2,
+   "policy": "hull",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "01030000000100000005000000000000000000184000000000000026400000000000001840000000000000f0bf0000000000001040000000000000f0bf0000000000001040000000000000264000000000000018400000000000002640"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000000000000000000000000000000000000000000000000000002440000000000000104000000000000024400000000000001040000000000000000000000000000000000000000000000000"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000002440000000000000000000000000000018400000000000000000000000000000184000000000000024400000000000002440000000000000244000000000000024400000000000000000"
+   }
+  ]
+ },
+ "split/omit": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "omitted",
+     "cell_id": 0,
+     "fallback_area": null,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 0,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 2,
+     "fallback_area": 80.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 100.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 2,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 2,
+   "policy": "omit",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "01030000000100000005000000000000000000184000000000000026400000000000001840000000000000f0bf0000000000001040000000000000f0bf0000000000001040000000000000264000000000000018400000000000002640"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000000000000000000000000000000000000000000000000000002440000000000000104000000000000024400000000000001040000000000000000000000000000000000000000000000000"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000002440000000000000000000000000000018400000000000000000000000000000184000000000000024400000000000002440000000000000244000000000000024400000000000000000"
+   }
+  ]
+ },
+ "split/raise": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "omitted",
+     "cell_id": 0,
+     "fallback_area": null,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 0,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 2,
+     "fallback_area": 80.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 100.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 2,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 2,
+   "policy": "raise",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "01030000000100000005000000000000000000184000000000000026400000000000001840000000000000f0bf0000000000001040000000000000f0bf0000000000001040000000000000264000000000000018400000000000002640"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000000000000000000000000000000000000000000000000000002440000000000000104000000000000024400000000000001040000000000000000000000000000000000000000000000000"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000002440000000000000000000000000000018400000000000000000000000000000184000000000000024400000000000002440000000000000244000000000000024400000000000000000"
+   }
+  ]
+ },
+ "split/repair": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "omitted",
+     "cell_id": 0,
+     "fallback_area": null,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 0,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    },
+    {
+     "action": "overlap_trimmed",
+     "cell_id": 2,
+     "fallback_area": 80.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 100.0,
+     "overlap_with": [
+      1
+     ],
+     "pieces": 2,
+     "reason": "overlaps a lower-ID cell next to an invalid cell"
+    }
+   ],
+   "count": 2,
+   "policy": "repair",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 1,
+    "mesh": "Bowtie Mesh",
+    "wkb": "01030000000100000005000000000000000000184000000000000026400000000000001840000000000000f0bf0000000000001040000000000000f0bf0000000000001040000000000000264000000000000018400000000000002640"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000000000000000000000000000000000000000000000000000002440000000000000104000000000000024400000000000001040000000000000000000000000000000000000000000000000"
+   },
+   {
+    "cell_id": 2,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000002440000000000000000000000000000018400000000000000000000000000000184000000000000024400000000000002440000000000000244000000000000024400000000000000000"
+   }
+  ]
+ },
+ "tie/hull": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "convex_hull",
+     "cell_id": 0,
+     "fallback_area": 100.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 1,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    }
+   ],
+   "count": 1,
+   "policy": "hull",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 0,
+    "mesh": "Bowtie Mesh",
+    "wkb": "010300000001000000050000000000000000000000000000000000000000000000000000000000000000002440000000000000244000000000000024400000000000002440000000000000000000000000000000000000000000000000"
+   }
+  ]
+ },
+ "tie/omit": {
+  "refused": "sloping mapping has no physical 2D cell polygons left under invalid_cells='omit': Bowtie Mesh cell 0 (omitted)"
+ },
+ "tie/raise": {
+  "refused": "sloping mapping has no physical 2D cell polygons left under invalid_cells='raise': Bowtie Mesh cell 0 (omitted)"
+ },
+ "tie/repair": {
+  "invalid_cells": {
+   "cells": [
+    {
+     "action": "repaired",
+     "cell_id": 0,
+     "fallback_area": 25.0,
+     "intersects_aoi": null,
+     "mesh": "Bowtie Mesh",
+     "original_area": 50.0,
+     "overlap_with": [],
+     "pieces": 1,
+     "reason": "no_polygon: Self-intersection[5 5]"
+    }
+   ],
+   "count": 1,
+   "policy": "repair",
+   "schema": "fim-invalid-cells/1"
+  },
+  "rows": [
+   {
+    "cell_id": 0,
+    "mesh": "Bowtie Mesh",
+    "wkb": "0103000000010000000400000000000000000014400000000000001440000000000000244000000000000000000000000000000000000000000000000000000000000014400000000000001440"
+   }
+  ]
+ }
+}

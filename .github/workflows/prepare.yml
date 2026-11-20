@@ -1,0 +1,83 @@
+name: Native preparation (fast-map-prepare)
+
+# fmt, clippy, tests and a locked release build of prepare/ against GEOS 3.13.1
+# (the release shapely 2.1.2 carries), on the CLB self-hosted Linux runner only.
+# GEOS comes from conda-forge through micromamba, as fim-commander's
+# fim-conflation CI does. The artifact is the Linux binary with the GEOS 3.13.1
+# shared libraries it was tested against (the binary finds them next to itself).
+
+on:
+  push:
+    paths: ["prepare/**", "src/**", "Cargo.toml", "Cargo.lock", ".github/workflows/prepare.yml"]
+  pull_request:
+    paths: ["prepare/**", "src/**", "Cargo.toml", "Cargo.lock", ".github/workflows/prepare.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+    working-directory: prepare
+
+jobs:
+  prepare:
+    # Pull requests from forks do not run here (no hosted fallback).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, clb-ci-linux]
+    timeout-minutes: 45
+    env:
+      GEOS_ROOT: ${{ github.workspace }}/.geos
+      GEOS_VERSION: "3.13.1"
+      CARGO_TERM_COLOR: never
+      FAST_MAP_BUILD_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt,clippy
+      - name: GEOS 3.13.1 from conda-forge
+        run: |
+          set -euo pipefail
+          mkdir -p "$GEOS_ROOT"
+          curl -fsSL https://micro.mamba.pm/api/micromamba/linux-64/2.10.0 | tar -xj -C "$GEOS_ROOT" bin/micromamba
+          MAMBA_ROOT_PREFIX="$GEOS_ROOT/root" "$GEOS_ROOT/bin/micromamba" create -y \
+            -p "$GEOS_ROOT/geos" -c conda-forge --override-channels "geos=$GEOS_VERSION"
+          echo "GEOS_LIB_DIR=$GEOS_ROOT/geos/lib" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$GEOS_ROOT/geos/lib" >> "$GITHUB_ENV"
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: Locked release build
+        env:
+          RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN"
+        run: cargo build --locked --release
+      - name: Package the binary with its GEOS runtime
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/fast-map-prepare-linux-x86_64"
+          mkdir -p "$out"
+          cp target/release/fast-map-prepare "$out/"
+          cp -L "$GEOS_ROOT/geos/lib/libgeos_c.so.1" "$GEOS_ROOT/geos/lib/libgeos.so.3.13.1" "$out/"
+          MAMBA_ROOT_PREFIX="$GEOS_ROOT/root" "$GEOS_ROOT/bin/micromamba" list -p "$GEOS_ROOT/geos" > "$out/conda-packages.txt"
+          (cd "$out" && env -u LD_LIBRARY_PATH ldd fast-map-prepare > ldd.txt && sha256sum fast-map-prepare libgeos_c.so.1 libgeos.so.3.13.1 > SHA256SUMS)
+          sha256sum Cargo.lock >> "$out/SHA256SUMS"
+          {
+            echo "### fast-map-prepare CI build"
+            echo
+            echo '```'
+            cat "$out/SHA256SUMS"
+            rustc -V
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fast-map-prepare-linux-x86_64
+          path: fast-map-prepare-linux-x86_64/*
+          if-no-files-found: error
+          retention-days: 90
