@@ -102,6 +102,8 @@ pub fn method_record() -> Value {
     let mut record = json!({"method_id":METHOD,"request_schema":SCHEMA,"report_schema":REPORT_SCHEMA,
         "sinks":["grouped-geotiff","grouped-buffer"],"compression":["NONE","LZW"],
         "products":["depth_max"],"render_modes":["sloping"],"saved_timesteps_only":true,
+        "sloping_methods":["rasmapper-plain-sloping/1",crate::sloping::BOUNDED_METHOD_ID],
+        "corner_fit_bound":"model.options.corner_fit_bound selects the bounded method; each frame and the report carry its corner_fit_bound record",
         "aoi_mask":crate::aoi::METHOD,"local_spill":true,"max_inflight_profiles":1,
         "buffer_protocol":"ras-commander-depth-group-buffer/1",
         "staged_cells":crate::sloping_binary::STAGED_METHOD,
@@ -168,7 +170,12 @@ impl Request {
             ));
         }
         self.model.options.validate()?;
-        if self.model.options != crate::sloping::Options::default()
+        // Plain sloping, natively or with the opt-in corner-fit bound.
+        let native = crate::sloping::Options {
+            corner_fit_bound: None,
+            ..self.model.options
+        };
+        if native != crate::sloping::Options::default()
             || self.model.velocity_normals_files.is_some()
             || self.model.shear_stress.is_some()
             || !self.model.derived_products.is_empty()
@@ -177,7 +184,7 @@ impl Request {
             || self.model.geotiff_outputs
             || self.model.max_inflight_profiles != 1
         {
-            return Err(MapError::Unsupported("depth groups require plain sloping, no velocity/derived/output flags, and one in-flight profile".into()));
+            return Err(MapError::Unsupported("depth groups require plain sloping (optionally with corner_fit_bound), no velocity/derived/output flags, and one in-flight profile".into()));
         }
         let mut selectors = HashSet::new();
         let mut profile_ids = HashSet::new();
@@ -535,6 +542,14 @@ pub fn run_with_session(
                 "source_indices":group.timesteps,"status":"in_progress",
                 "frames":group.timesteps.iter().map(|i| json!({"source_index":i,"status":"pending"})).collect::<Vec<_>>()
             })).collect::<Vec<_>>() })).collect::<Vec<_>>() });
+    if let Some(bound) = req.model.options.corner_fit_bound {
+        report["sloping_method_id"] = crate::sloping::BOUNDED_METHOD_ID.into();
+        report["corner_fit_bound"] = json!({"method_id":crate::sloping::BOUNDED_METHOD_ID,
+            "mode":bound.mode,"tolerance":bound.tolerance,"bounded_corner_groups":0,
+            "out_of_range_margin":crate::sloping::INPUT_EXCESS_MARGIN,
+            "out_of_range_pixels":0,"out_of_range_max_excess":null,
+            "profiles":[]});
+    }
     crate::sink::write_json(&out.join("report.json"), &report)?;
     let mut delivered = Vec::new();
     let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
@@ -654,11 +669,42 @@ pub fn run_with_session(
                         let seconds = tick.elapsed().as_secs_f64();
                         report["reduce_seconds"] =
                             (report["reduce_seconds"].as_f64().unwrap() + seconds).into();
-                        let frame = json!({"source_index":source_index,
+                        let mut frame = json!({"source_index":source_index,
                         "status":if native_wet == 0 {"no_flooded_pixels"} else {"complete"},
                         "native_wet_count":native_wet,"retained_count":retained,
                         "hydraulic_seconds":timing["hydraulic_seconds"],"render_seconds":timing["render_seconds"],
                         "hydraulic_reused":timing["hydraulic_reused"]});
+                        if let Some(record) = timing.get("corner_fit_bound") {
+                            frame["corner_fit_bound"] = record.clone();
+                            let summary = &mut report["corner_fit_bound"];
+                            // Every frame (window) carries its own sweep.
+                            let sweep = &record["same_profile_out_of_range"];
+                            summary["out_of_range_pixels"] = add(
+                                summary["out_of_range_pixels"].as_u64().unwrap(),
+                                sweep["out_of_range_pixels"].as_u64().unwrap_or(0),
+                            )?
+                            .into();
+                            if let Some(excess) = sweep["max_excess"].as_f64() {
+                                let previous = summary["out_of_range_max_excess"]
+                                    .as_f64()
+                                    .unwrap_or(f64::NEG_INFINITY);
+                                summary["out_of_range_max_excess"] = previous.max(excess).into();
+                            }
+                            // One corner record per profile: every job renders
+                            // the same reconstruction of this source index.
+                            let profiles = summary["profiles"].as_array_mut().unwrap();
+                            if !profiles.iter().any(|p| p["source_index"] == source_index) {
+                                let mut entry = record.clone();
+                                entry["source_index"] = source_index.into();
+                                let bounded = record["bounded_corner_groups"].as_u64().unwrap();
+                                profiles.push(entry);
+                                summary["bounded_corner_groups"] = add(
+                                    summary["bounded_corner_groups"].as_u64().unwrap(),
+                                    bounded,
+                                )?
+                                .into();
+                            }
+                        }
                         for (g, group) in job.groups.iter().enumerate() {
                             if let Some(position) =
                                 group.timesteps.iter().position(|i| *i == source_index)

@@ -358,6 +358,24 @@ struct RenderedProfile {
     hydraulic_reused: bool,
     finite_pixels: usize,
     flooded_pixels: usize,
+    /// `corner_fit_bound` record of a bounded request; `None` for native options.
+    corner_bound: Option<Value>,
+}
+
+/// A profile's `corner_fit_bound` record, summed over its meshes; `None` for
+/// native options (whose reports are unchanged).
+fn corner_bound_record(
+    options: sloping::Options,
+    prepared: &[sloping::PreparedProfile],
+) -> Option<Value> {
+    let bound = options.corner_fit_bound?;
+    let mut report = sloping::CornerBoundReport::default();
+    for profile in prepared {
+        if let Some(record) = profile.corner_bound_report() {
+            report.merge(record);
+        }
+    }
+    Some(report.to_json(bound))
 }
 
 #[allow(clippy::too_many_arguments)] // Explicit immutable geometry/window/cache borrows.
@@ -436,6 +454,7 @@ fn render(
     crate::terrain_scope::deny_wet_foreign(foreign, window.owner, window.owner_cells, |m, c| {
         prepared[m].is_wet(c)
     })?;
+    let mut corner_bound = corner_bound_record(options, &prepared);
     let hydraulic_seconds = tick.elapsed().as_secs_f64();
     let tick = Instant::now();
     let (mut depth, mut wse) =
@@ -445,6 +464,13 @@ fn render(
     let (mut finite_pixels, mut flooded_pixels) =
         crate::finalize::apply(&mut depth, &mut wse, pool);
     let finalize_seconds = tick.elapsed().as_secs_f64();
+    // The 2D render only, before any storage-area pool is composed.
+    if let (Some(record), Some(excess)) = (
+        corner_bound.as_mut(),
+        sloping::input_excess(&prepared, window, &wse, 0),
+    ) {
+        record["same_profile_out_of_range"] = excess.to_json();
+    }
     // Keep render_seconds scoped to the existing 2D render. Pool timing includes
     // profile-value reads, rendering and the storage flooded-pixel count.
     let mut storage_render_seconds = 0.0;
@@ -558,6 +584,7 @@ fn render(
         hydraulic_reused,
         finite_pixels,
         flooded_pixels,
+        corner_bound,
     })
 }
 
@@ -904,6 +931,12 @@ pub fn method_record() -> Value {
         "native_plot_tolerance":0.001_f32,"extra_depth_cutoff":null,
         "scope":"2D cells; plain cell-corner sloping; optional storage-area level pools; no 1D, slopingPretty or additional rendering options",
         "reuse":"geometry, terrio ownership and terrain prepared once; bounded Rayon pixel and reconstruction workers"});
+    // The opt-in method selected by `options.corner_fit_bound` (its own record:
+    // `sloping_bounded_corners`). This record's numerical contract is unchanged.
+    record["bounded_corners"] = json!({"method_id":sloping::BOUNDED_METHOD_ID,
+        "with_faces_method_id":sloping::BOUNDED_WITH_FACES_METHOD_ID,
+        "request_field":"options.corner_fit_bound","native_parity_qualified":false,
+        "discovery_key":"sloping_bounded_corners"});
     record["staged_cells"] = crate::sloping_binary::STAGED_METHOD.into();
     crate::crs::advertise(&mut record);
     record
@@ -926,7 +959,63 @@ pub fn native_grid_method_record() -> Value {
     record
 }
 
+/// The opt-in bounded-corner method record (`ras2fim-batch method` key
+/// `sloping_bounded_corners`). Not native-parity qualified; its basis states
+/// exactly where it equals `rasmapper-plain-sloping/1`.
+pub fn bounded_method_record() -> Value {
+    let mut record = method_record();
+    let map = record.as_object_mut().unwrap();
+    for key in [
+        "native_version_qualified",
+        "enhanced_options",
+        "enhanced_method_id",
+        "depth_weighted_faces",
+        "velocity",
+        "velocity_depth",
+        "velocity_render_modes",
+        "velocity_with_faces",
+        "velocity_with_faces_options",
+        "derived_products",
+        "derived_method_id",
+        "derived_max",
+        "shear_stress",
+        "shear_stress_depth",
+        "bounded_corners",
+    ] {
+        map.remove(key);
+    }
+    record["method_id"] = sloping::BOUNDED_METHOD_ID.into();
+    record["native_parity_qualified"] = false.into();
+    record["basis"] = sloping::BOUNDED_BASIS.into();
+    record["default_method_id"] = "rasmapper-plain-sloping/1".into();
+    record["with_faces_method_id"] = sloping::BOUNDED_WITH_FACES_METHOD_ID.into();
+    record["with_faces_status"] = "reserved; refused until qualified".into();
+    record["corner_fit_bound"] = json!({
+        "request_field":"options.corner_fit_bound","modes":["input_range"],
+        "tolerance":"required; finite and >= 0, in WSE units; 0 recommended",
+        "detection":"a corner group with 3 or more inputs whose plane fit lies outside [min(inputs) - tolerance, max(inputs) + tolerance], or is not finite; from the profile being rendered only",
+        "replacement":"clamp to the nearest end of that interval; a non-finite fit becomes the mean of its inputs; unflagged corners keep their native values",
+        "report":"profiles[].corner_fit_bound",
+        "diagnostics":["bounded_groups_min_wet_input_depth_lt_0p1","bounded_groups_L_ge_3"]});
+    record["unsupported"] = json!([
+        "slopingPretty",
+        "velocity",
+        "derived_products",
+        "reduce_max",
+        "shear_stress",
+        "boundary",
+        "native_grid"
+    ]);
+    record["scope"] = "2D cells; plain cell-corner sloping with bounded corner fits; optional storage-area level pools; no 1D, slopingPretty, velocity, derived, shear or boundary products".into();
+    record
+}
+
 fn selected_method(options: sloping::Options) -> Value {
+    if let Some(bound) = options.corner_fit_bound {
+        let mut record = bounded_method_record();
+        record["options"]["CornerFitBound"] = json!(bound);
+        return record;
+    }
     let mut record = method_record();
     if options.render_mode == sloping::RenderMode::WithFaces {
         record["method_id"] = "rasmapper-sloping-with-faces/1".into();
@@ -1122,6 +1211,18 @@ fn run_internal(
     }
 
     req.options.validate()?;
+    if req.options.corner_fit_bound.is_some()
+        && (req.velocity_normals_files.is_some()
+            || !req.derived_products.is_empty()
+            || req.reduce_max
+            || req.shear_stress.is_some()
+            || req.profiles.iter().any(|p| p.face_velocity_files.is_some()))
+    {
+        return Err(MapError::Unsupported(format!(
+            "{} is qualified for Depth/WSE only: velocity, derived products, reduce_max and shear stress are refused",
+            sloping::BOUNDED_METHOD_ID
+        )));
+    }
     validate_derived(req)?;
     validate_shear(req)?;
     if req.shear_stress.is_some() && consumer.is_some() {
@@ -2203,6 +2304,7 @@ fn run_internal(
                         hydraulic_reused,
                         finite_pixels,
                         flooded_pixels,
+                        corner_bound,
                     } = rendered;
                     if let Some(consumer) = consumer.as_mut() {
                         let unit = json!({"id":profile.id,"status":"complete",
@@ -2210,6 +2312,10 @@ fn run_internal(
                             "velocity_seconds":velocity_seconds,"derived_seconds":derived_seconds,
                             "storage_render_seconds":storage_render_seconds,
                             "hydraulic_reused":hydraulic_reused});
+                        let mut unit = unit;
+                        if let Some(record) = &corner_bound {
+                            unit["corner_fit_bound"] = record.clone();
+                        }
                         drop(wse);
                         consumer(profile, depth, unit.clone())?;
                         report["profiles"].as_array_mut().unwrap().push(unit);
@@ -2227,6 +2333,9 @@ fn run_internal(
                             std::io::BufWriter::with_capacity(65536, std::io::stdout().lock());
                         let mut header =
                             json!({"id":profile.id,"status":"complete","pixels":count});
+                        if let Some(record) = &corner_bound {
+                            header["corner_fit_bound"] = record.clone();
+                        }
                         header["storage_render_seconds"] = storage_render_seconds.into();
                         if velocity.is_some() {
                             header["velocity"] = true.into();
@@ -2319,6 +2428,9 @@ fn run_internal(
                         }
                     }
                     let mut unit = json!({"id":profile.id,"status":"complete","hydraulic_seconds":hydraulic_seconds,"render_seconds":render_seconds,"finalize_seconds":finalize_seconds,"velocity_seconds":velocity_seconds,"derived_seconds":derived_seconds,"storage_render_seconds":storage_render_seconds,"hydraulic_reused":hydraulic_reused});
+                    if let Some(record) = corner_bound {
+                        unit["corner_fit_bound"] = record;
+                    }
                     if let Some(values) = &shear {
                         unit["shear_seconds"] = shear_seconds.into();
                         unit["shear_valid_pixels"] =
@@ -2702,6 +2814,7 @@ fn render_native_rows(
     crate::terrain_scope::deny_wet_foreign(foreign, window.owner, window.owner_cells, |m, c| {
         prepared[m].is_wet(c)
     })?;
+    let mut corner_bound = corner_bound_record(options, &prepared);
     let hydraulic_seconds = tick.elapsed().as_secs_f64();
     let create = |name: &str| {
         output
@@ -2728,6 +2841,7 @@ fn render_native_rows(
     let mut write_seconds = 0.0;
     let mut finite_pixels = 0;
     let mut flooded_pixels = 0;
+    let mut excess: Option<sloping::InputExcess> = None;
     for row in (0..window.height).step_by(output.row_stream_rows) {
         let rows = output.row_stream_rows.min(window.height - row);
         let tick = Instant::now();
@@ -2739,6 +2853,16 @@ fn render_native_rows(
         finite_pixels += finite;
         flooded_pixels += flooded;
         finalize_seconds += tick.elapsed().as_secs_f64();
+        if let Some(part) = sloping::input_excess(&prepared, window, &wse, row * window.width) {
+            let total = excess.get_or_insert(sloping::InputExcess {
+                wet_pixels: 0,
+                out_of_range_pixels: 0,
+                max_excess: f64::NEG_INFINITY,
+            });
+            total.wet_pixels += part.wet_pixels;
+            total.out_of_range_pixels += part.out_of_range_pixels;
+            total.max_excess = total.max_excess.max(part.max_excess);
+        }
         let tick = Instant::now();
         if let Some(writer) = depth_writer.as_mut() {
             writer.write_rows(&depth, pool)?;
@@ -2763,14 +2887,22 @@ fn render_native_rows(
     if let Some(format) = &output.final_format {
         header["final_format"] = json!(format);
     }
+    if let (Some(record), Some(excess)) = (corner_bound.as_mut(), excess) {
+        record["same_profile_out_of_range"] = excess.to_json();
+    }
+    if let Some(record) = &corner_bound {
+        header["corner_fit_bound"] = record.clone();
+    }
     let tick = Instant::now();
     let mut stream = std::io::stdout().lock();
     writeln!(stream, "{header}")?;
     stream.flush()?;
-    Ok(
-        json!({"id":profile.id,"status":"complete","hydraulic_seconds":hydraulic_seconds,
+    let mut unit = json!({"id":profile.id,"status":"complete","hydraulic_seconds":hydraulic_seconds,
         "render_seconds":render_seconds,"finalize_seconds":finalize_seconds,"write_seconds":write_seconds,
         "stream_seconds":tick.elapsed().as_secs_f64(),"row_stream_rows":output.row_stream_rows,
-        "storage_render_seconds":0.0,"hydraulic_reused":false}),
-    )
+        "storage_render_seconds":0.0,"hydraulic_reused":false});
+    if let Some(record) = corner_bound {
+        unit["corner_fit_bound"] = record;
+    }
+    Ok(unit)
 }

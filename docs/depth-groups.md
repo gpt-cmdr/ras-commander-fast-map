@@ -250,3 +250,13 @@ EPSG:3857 reprojection, wet crop, block maxima, packing and viewer checks. The
 coordinator must authorize the exact two-reach packet before external acceptance
 or benchmarks. Generated-fixture software parity alone establishes neither
 hydraulic acceptance nor a wall-time speedup.
+
+## Bounded corner fits
+
+`model.options.corner_fit_bound` selects the opt-in sloping method
+`rasmapper-plain-sloping-bounded-corners/1` for every frame (see README,
+"Bounded corner fits"). Each frame then carries the profile's `corner_fit_bound`
+record, including the window's `same_profile_out_of_range` test, and the report
+adds `sloping_method_id` and a `corner_fit_bound` summary: bounded corner groups
+summed once per source index, out-of-range pixels summed over every frame.
+Without the option, depth-group requests and reports are unchanged.
