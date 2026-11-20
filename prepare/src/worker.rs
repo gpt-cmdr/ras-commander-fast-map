@@ -8,7 +8,7 @@
 //! samples memory, enforces the timeout and writes the receipt.
 
 use crate::aoi::Aoi;
-use crate::cohort::{self, PrepareInput, file_identity};
+use crate::cohort::{self, PrepareInput, Source, check_job_sources, file_identity};
 use crate::error::{Error, Kind, Result};
 use crate::geom;
 use crate::request::{Controls, Job};
@@ -26,6 +26,11 @@ pub fn python_class(kind: Kind) -> &'static str {
         Kind::MeshCellPolygon => "MeshCellPolygonError",
         Kind::Budget => "MemoryError",
         Kind::Engine => "FimEngineError",
+        Kind::Runtime => "RuntimeError",
+        Kind::FastHdf => "FastHdfError",
+        Kind::NotFound => "FileNotFoundError",
+        Kind::Permission => "PermissionError",
+        Kind::Type => "TypeError",
         Kind::Io => "OSError",
     }
 }
@@ -63,6 +68,7 @@ fn controls(config: &Value) -> Result<Controls> {
         max_accumulator_mib: u("max_accumulator_mib")?,
         max_scratch_bytes: u("max_scratch_bytes")?,
         stage_cell_subsets: c["stage_cell_subsets"].as_bool().unwrap_or(false),
+        depth_cutoff_json: Some(c["depth_cutoff_ft"].clone()),
     })
 }
 
@@ -94,14 +100,28 @@ fn cohort_input(jobs: &[Value], config: &Value) -> Result<PrepareInput> {
             "the Rust preparation does not read a postprocessing HDF",
         ));
     }
-    let mut sources = Vec::new();
+    // `prepare_sloping_model`'s engine gates (`_sloping._validate_method`, and
+    // `window_cache_mib=0` requires `multi_window_cache`).
+    let sloping = &config["engine"]["method"]["sloping"];
+    if sloping["method_id"] != "rasmapper-plain-sloping/1" || sloping["stream_outputs"] != true {
+        return Err(Error::engine(
+            "engine lacks rasmapper-plain-sloping/1; install a matching engine",
+        ));
+    }
+    if sloping["multi_window_cache"] != true {
+        return Err(Error::engine(
+            "Configurable windows require multi_window_cache capability",
+        ));
+    }
+    let engine_path = PathBuf::from(s(&config["engine"]["engine_path"], "engine.engine_path")?);
+    let mut sources = vec![Source {
+        key: "engine".into(),
+        identity: file_identity(&engine_path)?,
+        path: engine_path.clone(),
+    }];
     let mut normal = Vec::new();
     for job in jobs {
-        for src in job["sources"]
-            .as_object()
-            .into_iter()
-            .flat_map(|m| m.values())
-        {
+        for (key, src) in job["sources"].as_object().into_iter().flatten() {
             let path = PathBuf::from(s(&src["path"], "sources.path")?);
             let id = src["identity"]
                 .as_array()
@@ -114,12 +134,21 @@ fn cohort_input(jobs: &[Value], config: &Value) -> Result<PrepareInput> {
                 .get(1)
                 .and_then(Value::as_i64)
                 .ok_or_else(|| Error::invalid("sources.identity"))?;
-            sources.push((path, (size, i128::from(mtime))));
+            sources.push(Source {
+                key: key.clone(),
+                path,
+                identity: (size, i128::from(mtime)),
+            });
         }
         let aoi = &job["aoi"];
         let crs = s(&aoi["crs"], "aoi.crs")?;
-        let epsg = terrio::crs::SpatialRef::from_wkt(crs).epsg.ok_or_else(|| {
-            Error::unsupported("AOI CRS has no EPSG identity; reprojection is not supported")
+        // ras-commander keeps the AOI unchanged only when its CRS equals the
+        // grid's; here that needs a declared projected EPSG code (pyproj's
+        // `to_wkt()` writes one), compared with the terrain's.
+        let epsg = crate::crs::declared_projected_epsg(crs).ok_or_else(|| {
+            Error::unsupported(
+                "AOI CRS declares no projected EPSG code; reprojection is not supported",
+            )
         })?;
         let geometry = geom::from_wkb(&hex(s(&aoi["wkb"], "aoi.wkb")?)?)?;
         let groups: Vec<Value> = job["groups"].as_array().cloned().unwrap_or_default();
@@ -153,6 +182,7 @@ fn cohort_input(jobs: &[Value], config: &Value) -> Result<PrepareInput> {
         persistent_session: config["engine"]["method"]["sloping"]["persistent_session"] == true,
         wse_tiles: config.get("wse_tiles").cloned(),
         sources,
+        engine_path,
     })
 }
 
@@ -210,6 +240,9 @@ fn tiff_header(path: &Path) -> Result<TiffHeader> {
         rd(&nb[..2], 2)
     };
     let size = if big { 20 } else { 12 };
+    if count > 4096 {
+        return Err(Error::engine("delivered TIFF has an implausible tag count"));
+    }
     let mut entries = vec![0u8; count as usize * size];
     f.read_exact(&mut entries)?;
     let mut h = TiffHeader {
@@ -240,7 +273,11 @@ fn tiff_header(path: &Path) -> Result<TiffHeader> {
             rd(&e[4..8], 4)
         };
         let inline = if big { &e[12..20] } else { &e[8..12] };
-        let total = type_size(typ) * n as usize;
+        let total = usize::try_from(n)
+            .ok()
+            .and_then(|n| n.checked_mul(type_size(typ)))
+            .filter(|t| *t <= 1 << 26)
+            .ok_or_else(|| Error::engine("delivered TIFF tag is too large"))?;
         let data: Vec<u8> = if total <= inline.len() {
             inline[..total].to_vec()
         } else {
@@ -267,12 +304,12 @@ fn tiff_header(path: &Path) -> Result<TiffHeader> {
                 .collect()
         };
         match tag {
-            256 => h.width = ints()[0],
-            257 => h.height = ints()[0],
-            258 => h.bits = ints()[0],
-            259 => h.compression = ints()[0],
-            277 => h.samples = ints()[0],
-            339 => h.format = ints()[0],
+            256 => h.width = ints().first().copied().unwrap_or(0),
+            257 => h.height = ints().first().copied().unwrap_or(0),
+            258 => h.bits = ints().first().copied().unwrap_or(0),
+            259 => h.compression = ints().first().copied().unwrap_or(0),
+            277 => h.samples = ints().first().copied().unwrap_or(0),
+            339 => h.format = ints().first().copied().unwrap_or(0),
             33550 => h.scale = doubles(),
             33922 => h.tie = doubles(),
             42113 => {
@@ -487,17 +524,29 @@ fn run_session(engine: &Path, request: &Path, native_out: &Path, errors: &Path) 
 /// One cohort: prepare, run the engine, validate, deliver (`_cohort`, no consumer).
 pub fn run_cohort(jobs: &[Value], config: &Value, control: &Path, ordinal: usize) -> Result<Value> {
     let input = cohort_input(jobs, config)?;
-    let prepared = cohort::prepare(&input, control, ordinal)?;
-    let engine = PathBuf::from(s(&config["engine"]["engine_path"], "engine.engine_path")?);
+    let job_id = input
+        .jobs
+        .first()
+        .map(|j| j.job_id.clone())
+        .unwrap_or_default();
+    let result = run_prepared(jobs, config, control, ordinal, &input, &job_id);
+    // The prepared context's payloads go when the context closes, as Python's do.
+    let _ = std::fs::remove_dir_all(control.join(format!("ras-fim-prepared-rust{ordinal:04}")));
+    result
+}
+
+fn run_prepared(
+    jobs: &[Value],
+    config: &Value,
+    control: &Path,
+    ordinal: usize,
+    input: &PrepareInput,
+    job_id: &str,
+) -> Result<Value> {
+    let prepared = cohort::prepare(input, control, ordinal)?;
+    let engine = input.engine_path.clone();
     let native_out = prepared.root.join("native");
-    for (p, id) in &input.sources {
-        if file_identity(p)? != *id {
-            return Err(Error::engine(format!(
-                "Catalog source changed: {}",
-                p.display()
-            )));
-        }
-    }
+    check_job_sources(&input.sources, job_id)?;
     run_session(
         &engine,
         &prepared.request_path,
@@ -536,7 +585,7 @@ pub fn run_cohort(jobs: &[Value], config: &Value, control: &Path, ordinal: usize
         let shape: Vec<u64> = serde_json::from_value(plan["shape"].clone())?;
         let t: Vec<f64> = serde_json::from_value(plan["transform"].clone())?;
         let destination = output.join(job_id);
-        std::fs::create_dir_all(&destination)?;
+        std::fs::create_dir(&destination)?;
         for group in delivered["groups"].as_array_mut().into_iter().flatten() {
             let source = native_out.join(s(&group["output"]["path"], "output.path")?);
             let h = tiff_header(&source)?;
@@ -574,14 +623,7 @@ pub fn run_cohort(jobs: &[Value], config: &Value, control: &Path, ordinal: usize
             group["output"]["path"] = json!(target.to_string_lossy());
         }
     }
-    for (p, id) in &input.sources {
-        if file_identity(p)? != *id {
-            return Err(Error::engine(format!(
-                "Catalog source changed: {}",
-                p.display()
-            )));
-        }
-    }
+    check_job_sources(&input.sources, job_id)?;
     let mut record = prepared.preparation.clone();
     let engine_record = record
         .as_object_mut()
@@ -591,13 +633,39 @@ pub fn run_cohort(jobs: &[Value], config: &Value, control: &Path, ordinal: usize
     Ok(report)
 }
 
+/// `psutil.Process().cpu_affinity(config["cpus"])`: pin this process (and so
+/// the engine child) to the supervisor's CPU partition.
 #[cfg(target_os = "linux")]
-fn set_affinity(_cpus: &[usize]) {
-    // The supervisor's CPU partition is recorded in the request (`threads`);
-    // the engine child inherits this process's affinity from the supervisor.
+#[allow(unsafe_code)] // sched_setaffinity has no safe std wrapper.
+fn set_affinity(cpus: &[usize]) -> Result<()> {
+    // SAFETY: `set` is a zeroed, properly sized cpu_set_t that lives for the call.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        for &c in cpus {
+            if c >= libc::CPU_SETSIZE as usize {
+                return Err(Error::invalid(format!("CPU {c} is outside the CPU set")));
+            }
+            libc::CPU_SET(c, &mut set);
+        }
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
 }
+/// Windows and other platforms: the partition is recorded (`threads`), not
+/// pinned (production runs on Linux).
 #[cfg(not(target_os = "linux"))]
-fn set_affinity(_cpus: &[usize]) {}
+fn set_affinity(_cpus: &[usize]) -> Result<()> {
+    Ok(())
+}
+
+/// `os.environ["OMP_NUM_THREADS"] = str(len(cpus))`, inherited by the engine.
+#[allow(unsafe_code)] // `set_var` is unsafe in edition 2024.
+fn set_engine_threads(n: usize) {
+    // SAFETY: called once at start-up, before this process starts any thread.
+    unsafe { std::env::set_var("OMP_NUM_THREADS", n.to_string()) };
+}
 
 /// `_worker(config_path)`.
 pub fn run(config_path: &Path) -> Result<()> {
@@ -609,7 +677,8 @@ pub fn run(config_path: &Path) -> Result<()> {
         .flatten()
         .filter_map(|v| v.as_u64().map(|v| v as usize))
         .collect();
-    set_affinity(&cpus);
+    set_affinity(&cpus)?;
+    set_engine_threads(cpus.len());
     let mut result = json!({"status": "in_progress", "cohorts": []});
     write_json(&control.join("result.json"), &result)?;
     let mut order: Vec<String> = Vec::new();
@@ -622,7 +691,21 @@ pub fn run(config_path: &Path) -> Result<()> {
         grouped.entry(key).or_default().push(job.clone());
     }
     for (ordinal, key) in order.iter().enumerate() {
-        match run_cohort(&grouped[key], &config, &control, ordinal) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_cohort(&grouped[key], &config, &control, ordinal)
+        }))
+        .unwrap_or_else(|panic| {
+            let detail = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "unknown panic".into());
+            Err(Error::new(
+                Kind::Runtime,
+                format!("internal error (panic): {detail}"),
+            ))
+        });
+        match outcome {
             Ok(report) => {
                 result["cohorts"].as_array_mut().unwrap().push(report);
                 write_json(&control.join("result.json"), &result)?;

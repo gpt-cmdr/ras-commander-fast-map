@@ -19,7 +19,18 @@ pub enum Kind {
     Budget,
     /// `FimEngineError`: a source changed, or the engine failed or disagreed.
     Engine,
-    /// Reading a model, terrain or file failed.
+    /// `RuntimeError`: a catalog source changed between normalisation and use,
+    /// or an internal fault (a caught panic).
+    Runtime,
+    /// `FastHdfError`: native polygon assembly refused the mesh.
+    FastHdf,
+    /// `FileNotFoundError`.
+    NotFound,
+    /// `PermissionError`.
+    Permission,
+    /// `TypeError`: a value ras-commander's own code cannot handle.
+    Type,
+    /// `OSError`: reading a model, terrain or file failed.
     Io,
 }
 
@@ -32,6 +43,11 @@ impl Kind {
             Kind::MeshCellPolygon => "mesh_cell_polygon",
             Kind::Budget => "budget",
             Kind::Engine => "engine",
+            Kind::Runtime => "runtime",
+            Kind::FastHdf => "fast_hdf",
+            Kind::NotFound => "not_found",
+            Kind::Permission => "permission",
+            Kind::Type => "type",
             Kind::Io => "io",
         }
     }
@@ -82,8 +98,40 @@ impl std::error::Error for Error {}
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Error::io(e.to_string())
+        let kind = match e.kind() {
+            std::io::ErrorKind::NotFound => Kind::NotFound,
+            std::io::ErrorKind::PermissionDenied => Kind::Permission,
+            _ => Kind::Io,
+        };
+        Error::new(kind, e.to_string())
     }
+}
+
+/// Python `repr()` of a str for messages (`'name'`; double quotes when the
+/// text holds a single quote and no double quote).
+pub fn py_repr(s: &str) -> String {
+    let quote = if s.contains('\'') && !s.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push(quote);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
 }
 
 impl From<ras_commander_fast_hdf::Error> for Error {

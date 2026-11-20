@@ -10,6 +10,26 @@ fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
+/// JSON text with object keys sorted, as `json.dumps(sort_keys=True)` orders them.
+fn canonical(v: &Value) -> String {
+    fn sort(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => {
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort();
+                let mut out = serde_json::Map::new();
+                for k in keys {
+                    out.insert(k.clone(), sort(&m[k]));
+                }
+                Value::Object(out)
+            }
+            Value::Array(a) => Value::Array(a.iter().map(sort).collect()),
+            other => other.clone(),
+        }
+    }
+    serde_json::to_string(&sort(v)).unwrap()
+}
+
 #[test]
 fn invalid_cell_policies_match_ras_commander() {
     let expected: Value = serde_json::from_str(
@@ -45,7 +65,8 @@ fn invalid_cell_policies_match_ras_commander() {
                 "{key}: Python refuses, Rust gave {got}"
             );
         } else {
-            assert_eq!(&got, want, "{key}");
+            // Text, not values: `-0.0 == 0.0` as values but not as bytes.
+            assert_eq!(canonical(&got), canonical(want), "{key}");
         }
         checked += 1;
     }

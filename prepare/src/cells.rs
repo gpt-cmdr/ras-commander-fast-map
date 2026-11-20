@@ -75,14 +75,32 @@ fn read_raw(hdf: &Hdf, mesh: &str) -> Result<Raw> {
             return Err(Error::unsupported("Incomplete native mesh layout"));
         }
     }
-    Ok(Raw {
+    let raw = Raw {
         points: arr_f64(hdf, &p(MESH_ARRAYS[0]))?,
         ends: arr_i64(hdf, &p(MESH_ARRAYS[1]))?,
         perim_info: arr_i64(hdf, &p(MESH_ARRAYS[2]))?,
         perim: arr_f64(hdf, &p(MESH_ARRAYS[3]))?,
         cell_info: arr_i64(hdf, &p(MESH_ARRAYS[4]))?,
         cell_faces: arr_i64(hdf, &p(MESH_ARRAYS[5]))?,
-    })
+    };
+    // Every array is indexed by its first two columns below.
+    let narrow = [
+        raw.points.ncols(),
+        raw.ends.ncols(),
+        raw.perim_info.ncols(),
+        raw.cell_info.ncols(),
+        raw.cell_faces.ncols(),
+    ]
+    .iter()
+    .any(|c| *c < 2)
+        || (raw.perim.nrows() > 0 && raw.perim.ncols() < 2);
+    if narrow {
+        return Err(Error::new(
+            Kind::FastHdf,
+            format!("Native polygon assembly failed for {mesh}: mesh tables need two columns"),
+        ));
+    }
+    Ok(raw)
 }
 
 /// `_face_lines`: one cell's face polylines in HDF face order.
@@ -208,7 +226,10 @@ pub fn load(hdf: &Hdf, mesh_names: &[String], policy: &str, threads: usize) -> R
         let packed = top
             .assemble(GeometryPolicy::QuarantineInvalid, threads.max(1))
             .map_err(|e| {
-                Error::invalid(format!("Native polygon assembly failed for {name}: {e}"))
+                Error::new(
+                    Kind::FastHdf,
+                    format!("Native polygon assembly failed for {name}: {e}"),
+                )
             })?;
         let invalid: BTreeSet<i64> = packed
             .diagnostics
@@ -254,10 +275,13 @@ pub fn load(hdf: &Hdf, mesh_names: &[String], policy: &str, threads: usize) -> R
             originals.push((m, *id, polygon));
         }
         if !bad.is_empty() {
-            return Err(Error::invalid(format!(
-                "Native polygon geometry is invalid for {name}, cell IDs {:?}",
-                &bad[..bad.len().min(10)]
-            )));
+            return Err(Error::new(
+                Kind::FastHdf,
+                format!(
+                    "Native polygon geometry is invalid for {name}, cell IDs {:?}",
+                    &bad[..bad.len().min(10)]
+                ),
+            ));
         }
         raws.push(raw);
     }
@@ -292,6 +316,8 @@ pub fn load(hdf: &Hdf, mesh_names: &[String], policy: &str, threads: usize) -> R
         });
     }
     // Invalid records in (mesh_name, cell_id) order.
+    // `order` takes record meshes in diagnostics (HDF mesh) order, before sorting.
+    let diagnostics_meshes: Vec<usize> = omitted.iter().map(|o| o.0).collect();
     omitted.sort_by(|a, b| mesh_names[a.0].cmp(&mesh_names[b.0]).then(a.1.cmp(&b.1)));
     struct Entry {
         mesh: usize,
@@ -336,9 +362,9 @@ pub fn load(hdf: &Hdf, mesh_names: &[String], policy: &str, threads: usize) -> R
         let k = order.len();
         order.entry(*m).or_insert(k);
     }
-    for e in &entries {
+    for m in &diagnostics_meshes {
         let k = order.len();
-        order.entry(e.mesh).or_insert(k);
+        order.entry(*m).or_insert(k);
     }
     let rank = |i: usize| (order[&originals[i].0], originals[i].1);
     let mut geometries: Vec<Option<Geometry>> = originals
@@ -411,12 +437,11 @@ pub fn load(hdf: &Hdf, mesh_names: &[String], policy: &str, threads: usize) -> R
             originals[i].2.difference(&geom::union_all(winners)?)?
         };
         let parts = polygon_parts(&remainder)?;
-        let fallback: f64 = parts
-            .iter()
-            .map(|p| p.area())
-            .collect::<std::result::Result<Vec<_>, _>>()?
-            .iter()
-            .sum();
+        // `float(sum(...))` starts at +0.0 (Rust's `Sum` for f64 starts at -0.0).
+        let mut fallback = 0.0f64;
+        for part in &parts {
+            fallback += part.area()?;
+        }
         let count = parts.len();
         geometries[i] = match count {
             0 => None,
@@ -546,7 +571,8 @@ pub fn load(hdf: &Hdf, mesh_names: &[String], policy: &str, threads: usize) -> R
             })
             .collect();
         return Err(Error::invalid(format!(
-            "sloping mapping has no physical 2D cell polygons left under invalid_cells={policy:?}: {}",
+            "sloping mapping has no physical 2D cell polygons left under invalid_cells={}: {}",
+            crate::error::py_repr(policy),
             listed.join(", ")
         )));
     }

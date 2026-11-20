@@ -100,17 +100,25 @@ impl Hdf {
             }))
     }
 
-    /// The stored `Projection` WKT: the root attribute, else `Geometry`'s
-    /// (the first evidence `HdfBase.get_projection` consults).
+    /// The stored `Projection` text, as `HdfUtils.read_crs_evidence` reads it:
+    /// the root attribute whenever it is stored (a blank one is absent
+    /// evidence, with no fallback), else the `Geometry` group's.
     pub fn projection_wkt(&self) -> Result<Option<String>> {
-        if let Some(p) = self.text_attribute("/", "Projection")?
-            && !p.trim().is_empty()
-        {
+        if let Some(p) = self.text_attribute("/", "Projection")? {
             return Ok(Some(p));
         }
-        Ok(self
-            .text_attribute("Geometry", "Projection")?
-            .filter(|p| !p.trim().is_empty()))
+        self.text_attribute("Geometry", "Projection")
+    }
+
+    /// `HdfUtils.collect_hdf_crs_evidence` for this plan HDF.
+    pub fn crs_evidence(&self) -> Result<Vec<crate::crs::Evidence>> {
+        let read =
+            |p: &std::path::Path| -> Result<Option<String>> { Hdf::open(p, 1)?.projection_wkt() };
+        Ok(crate::crs::model_crs_evidence(
+            self.projection_wkt()?,
+            &self.path,
+            &read,
+        ))
     }
 
     /// `HdfMesh._mesh_area_names`: `2D Flow Areas/Attributes` `Name` field in
@@ -225,24 +233,38 @@ impl Hdf {
 
     /// `HdfBase.get_result_unit_metadata(strict=True)` for a standalone plan
     /// HDF (`source="plan_hdf"`): `/Geometry/@SI Units` and `/@Units System`
-    /// must agree. Returns the request's `depth_units` (`feet`/`metres`) and
-    /// the record. The one accepted disagreement in ras-commander (root `SI
-    /// Units` with geometry `False`, resolved from dataset unit labels) is
-    /// refused here.
+    /// must agree, and the file must hold `/Results`. Returns the request's
+    /// `depth_units` (`feet`/`metres`) and the record. ras-commander accepts
+    /// more spellings and one disagreement (root `SI Units` with geometry
+    /// `False`, resolved from dataset unit labels); those are refused here.
     pub fn result_units(&self, source_file: &str) -> Result<(String, Value)> {
-        let si = self.text_attribute("Geometry", "SI Units")?;
-        let system = self.text_attribute("/", "Units System")?;
+        let file = std::path::Path::new(source_file)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let unresolved = |problem: &str| {
+            Error::invalid(format!(
+                "Could not resolve result-HDF units for {file}: {problem}. If the true unit system is known, pass unit_system='SI' or unit_system='US Customary'"
+            ))
+        };
+        if self.members("Results")?.is_none() {
+            return Err(Error::invalid(format!(
+                "Could not resolve result-HDF units for {file}: the file holds no /Results group"
+            )));
+        }
+        let si = self
+            .text_attribute("Geometry", "SI Units")?
+            .map(|v| v.trim().to_string());
+        let system = self
+            .text_attribute("/", "Units System")?
+            .map(|v| v.trim().to_string());
         let mut evidence = Vec::new();
         let mut systems = Vec::new();
         if let Some(raw) = &si {
-            let unit = match raw.trim() {
+            let unit = match raw.as_str() {
                 "True" | "true" | "1" => "SI",
                 "False" | "false" | "0" => "US Customary",
-                other => {
-                    return Err(Error::invalid(format!(
-                        "unrecognized /Geometry/@SI Units {other:?}; pass unit_system"
-                    )));
-                }
+                _ => return Err(unresolved("unrecognized /Geometry/@SI Units")),
             };
             evidence.push(
                 json!({"attribute":"/Geometry/@SI Units","raw_value":raw,"unit_system":unit}),
@@ -250,27 +272,19 @@ impl Hdf {
             systems.push(unit);
         }
         if let Some(raw) = &system {
-            let unit = match raw.trim() {
+            let unit = match raw.as_str() {
                 "SI Units" | "SI" => "SI",
                 "US Customary" => "US Customary",
-                other => {
-                    return Err(Error::invalid(format!(
-                        "unrecognized /@Units System {other:?}; pass unit_system"
-                    )));
-                }
+                _ => return Err(unresolved("unrecognized /@Units System")),
             };
             evidence.push(json!({"attribute":"/@Units System","raw_value":raw,"unit_system":unit}));
             systems.push(unit);
         }
         let Some(first) = systems.first().copied() else {
-            return Err(Error::invalid(
-                "result HDF records no unit system; pass unit_system",
-            ));
+            return Err(unresolved("no unit-system evidence"));
         };
         if systems.iter().any(|s| *s != first) {
-            return Err(Error::unsupported(
-                "contradictory unit-system evidence; ras-commander's dataset-label resolution is not ported",
-            ));
+            return Err(unresolved("/Geometry/@SI Units contradicts /@Units System"));
         }
         let (length, depth, velocity, flow, depth_units) = if first == "SI" {
             ("m", "m", "m/s", "m3/s", "metres")

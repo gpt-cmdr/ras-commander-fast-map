@@ -26,6 +26,10 @@ pub struct Controls {
     pub max_accumulator_mib: u64,
     pub max_scratch_bytes: u64,
     pub stage_cell_subsets: bool,
+    /// The caller's `depth_cutoff_ft` JSON number as given (an int stays an int
+    /// in the request, as Python writes it).
+    #[serde(skip)]
+    pub depth_cutoff_json: Option<Value>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -72,6 +76,11 @@ pub struct PrepareIn {
     pub invalid_cells: String,
     /// Fast-Map executable; `ras2fim-batch method` supplies its capabilities.
     pub engine_path: PathBuf,
+    /// Optional fim-commander `wse_tiles` record (the parent extract's
+    /// `cell_wse` tiles of this plan HDF): waves the tiles could serve are staged
+    /// from the staged cells' HDF columns with only staged values checked.
+    #[serde(default)]
+    pub wse_tiles: Option<Value>,
 }
 
 fn default_policy() -> String {
@@ -136,10 +145,15 @@ pub fn normalise(jobs: &[JobIn]) -> Result<Vec<Job>> {
     let mut ids = std::collections::HashSet::new();
     let mut out = Vec::new();
     for job in jobs {
-        if !portable(&job.job_id) {
+        let shape = (1..=64).contains(&job.job_id.len())
+            && job
+                .job_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !shape {
             return Err(Error::invalid("job_id must match [A-Za-z0-9_-]{1,64}"));
         }
-        if !ids.insert(job.job_id.to_lowercase()) {
+        if !portable(&job.job_id) || !ids.insert(job.job_id.to_lowercase()) {
             return Err(Error::invalid(
                 "job_id must be unique ignoring case and cannot be a reserved file name",
             ));
@@ -263,6 +277,11 @@ impl PrepareIn {
                 "Engine lacks bounded grouped profile preparation",
             ));
         }
+        if sloping["multi_window_cache"] != true {
+            return Err(Error::engine(
+                "Configurable windows require multi_window_cache capability",
+            ));
+        }
         if c.stage_cell_subsets && groups["staged_cells"] != crate::cohort::STAGED_CELLS_METHOD {
             return Err(Error::unsupported(
                 "Engine or Commander lacks staged cell subsets",
@@ -271,15 +290,26 @@ impl PrepareIn {
         let persistent = sloping["persistent_session"] == true;
         let hdf_path = resolve(&self.hdf_path)?;
         let terrain_path = resolve(&self.terrain_path)?;
-        let mut sources = vec![hdf_path.clone(), terrain_path.clone()];
-        for j in &self.jobs {
-            for f in &j.aoi.wkb_files {
-                sources.push(resolve(f)?);
+        let engine_path = resolve(&self.engine_path)?;
+        let mut named = vec![
+            ("hdf".to_string(), hdf_path.clone()),
+            ("terrain".to_string(), terrain_path.clone()),
+            ("engine".to_string(), engine_path.clone()),
+        ];
+        for (k, j) in self.jobs.iter().enumerate() {
+            for (n, f) in j.aoi.wkb_files.iter().enumerate() {
+                named.push((format!("polygon-{k}-{n}"), resolve(f)?));
             }
         }
-        let sources = sources
+        let sources = named
             .into_iter()
-            .map(|p| Ok((p.clone(), crate::cohort::file_identity(&p)?)))
+            .map(|(key, path)| {
+                Ok(crate::cohort::Source {
+                    key,
+                    identity: crate::cohort::file_identity(&path)?,
+                    path,
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         let jobs = normalise(&self.jobs)?;
         Ok((
@@ -290,8 +320,9 @@ impl PrepareIn {
                 controls: self.controls,
                 invalid_cells: self.invalid_cells,
                 persistent_session: persistent,
-                wse_tiles: None,
+                wse_tiles: self.wse_tiles,
                 sources,
+                engine_path,
             },
             method,
         ))
@@ -300,11 +331,22 @@ impl PrepareIn {
 
 /// `Path.resolve(strict=True)` (Windows verbatim prefix removed).
 pub fn resolve(p: &Path) -> Result<PathBuf> {
-    let r = std::fs::canonicalize(p).map_err(|e| Error::io(format!("{}: {e}", p.display())))?;
-    let s = r.to_string_lossy();
-    Ok(PathBuf::from(
-        s.strip_prefix(r"\\?\").unwrap_or(&s).to_string(),
-    ))
+    let r = std::fs::canonicalize(p).map_err(|e| {
+        let mut err = Error::from(e);
+        err.message = format!("{}: {}", p.display(), err.message);
+        err
+    })?;
+    Ok(PathBuf::from(plain_path(&r.to_string_lossy())))
+}
+
+/// Python's `str(Path.resolve())` form of a canonical Windows path: the
+/// verbatim prefix removed (`\\?\C:\x` -> `C:\x`, `\\?\UNC\srv\share` ->
+/// `\\srv\share`). Other platforms are unchanged.
+pub fn plain_path(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    s.strip_prefix(r"\\?\").unwrap_or(s).to_string()
 }
 
 /// `_write_json`: indent 2, then rename from `.partial`.

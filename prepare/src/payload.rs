@@ -98,6 +98,13 @@ pub fn write_meshes(
                     "cannot reshape {key} into {columns} columns"
                 )));
             }
+            // `_write_array` casts a memoryview, which fails for an empty array.
+            if bytes.is_empty() {
+                return Err(Error::new(
+                    crate::error::Kind::Type,
+                    "memoryview: cannot cast view with zeros in shape or strides",
+                ));
+            }
             let filename = format!("mesh-{index}-{key}.bin");
             if staged + bytes.len() as i64 > max_staged_bytes {
                 return Err(over());
@@ -296,6 +303,19 @@ pub fn stage_profiles(
     time_counts: &[u64],
     complete_rows: bool,
 ) -> Result<(Vec<Unit>, usize, i64)> {
+    // Commander's guard: an unsorted, repeated or out-of-range subset must never
+    // stage unset values (it also refuses a mesh without cells).
+    if subsets.len() != meshes.len()
+        || subsets.iter().zip(meshes).any(|(c, m)| {
+            c.is_empty()
+                || c.last().is_some_and(|&last| last as usize >= m.cell_count)
+                || c.windows(2).any(|w| w[1] <= w[0])
+        })
+    {
+        return Err(Error::invalid(
+            "cell_subsets must be ascending in-range cells, one array per mesh",
+        ));
+    }
     // First occurrence of each selector (deduplicate=True).
     let mut first: std::collections::BTreeMap<u64, usize> = Default::default();
     for (k, (_, s)) in selected.iter().enumerate() {
@@ -386,8 +406,9 @@ pub fn stage_profiles(
     }
     if let Some((profile, i)) = bad {
         return Err(Error::invalid(format!(
-            "Invalid complete cell profile {:?} for {:?}",
-            selected[profile].0, meshes[i].name
+            "Invalid complete cell profile {} for {}",
+            crate::error::py_repr(&selected[profile].0),
+            crate::error::py_repr(&meshes[i].name)
         )));
     }
     let units = selected
@@ -401,4 +422,41 @@ pub fn stage_profiles(
         .collect();
     let views = if first.is_empty() { 0 } else { meshes.len() };
     Ok((units, views, staged))
+}
+
+/// The parent context's complete profile (`prepare_sloping_model` stages the
+/// cohort's first selector from the HDF before any subset): every value of that
+/// saved time, in every mesh, must be finite.
+pub fn check_parent_profile(
+    hdf: &Hdf,
+    meshes: &[MeshPayload],
+    name: &str,
+    selector: u64,
+    time_counts: &[u64],
+) -> Result<()> {
+    for (i, mesh) in meshes.iter().enumerate() {
+        if selector >= time_counts[i] {
+            return Err(Error::invalid(format!(
+                "time index {selector} is outside the saved times of {}",
+                crate::error::py_repr(&mesh.name)
+            )));
+        }
+        let row = hdf.rows_f32(
+            &Hdf::water_surface_path(&mesh.name),
+            selector,
+            selector + 1,
+            mesh.cell_count as u64,
+        )?;
+        if row.len() != mesh.cell_count {
+            return Err(Error::invalid("Sloping profile source dimensions changed"));
+        }
+        if !row.iter().all(|v| v.is_finite()) {
+            return Err(Error::invalid(format!(
+                "Invalid complete cell profile {} for {}",
+                crate::error::py_repr(name),
+                crate::error::py_repr(&mesh.name)
+            )));
+        }
+    }
+    Ok(())
 }

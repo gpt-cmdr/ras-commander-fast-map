@@ -88,8 +88,8 @@ pub fn index_range(lo: f64, hi: f64, origin: f64, step: f64, count: i64) -> (i64
         ((lower - 0.5).ceil() as i64, (upper - 0.5).ceil() as i64)
     } else {
         (
-            (-upper - 0.5).floor() as i64 + 1,
-            (-lower - 0.5).floor() as i64 + 1,
+            ((-upper - 0.5).floor() as i64).saturating_add(1),
+            ((-lower - 0.5).floor() as i64).saturating_add(1),
         )
     };
     (start.min(count).max(0), stop.min(count).max(0))
@@ -104,9 +104,12 @@ pub fn center_index_range(lo: f64, hi: f64, origin: f64, step: f64, count: i64) 
     };
     let a = (lo - origin) / step - 0.5;
     let b = (hi - origin) / step - 0.5;
-    let i_lo = (a.min(b).floor() as i64 - 1).min(count).max(0);
-    let i_hi = (a.max(b).ceil() as i64 + 2).min(count).max(0);
-    let Some(start) = (i_lo..(i_lo + 4).min(i_hi)).find(|&i| inside(i)) else {
+    let i_lo = (a.min(b).floor() as i64)
+        .saturating_sub(1)
+        .min(count)
+        .max(0);
+    let i_hi = (a.max(b).ceil() as i64).saturating_add(2).min(count).max(0);
+    let Some(start) = (i_lo..i_lo.saturating_add(4).min(i_hi)).find(|&i| inside(i)) else {
         return (0, 0);
     };
     let last = (start..i_hi).rev().find(|&i| inside(i)).unwrap_or(start);

@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::geom::{self, Envelope};
 use geos::{Geom, Geometry};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// rasterio `Affine(a, b, c, d, e, f)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -173,9 +173,31 @@ fn tiff_mask_or_alpha(path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// GDAL sidecars that can replace a GeoTIFF's SRS or geotransform for
+/// rasterio (PAM `.aux.xml` with `SRS`/`GeoTransform`, world files); terrio
+/// reads the TIFF tags only, so their presence is refused.
+fn gdal_sidecar(path: &Path) -> Option<PathBuf> {
+    let p = path.to_string_lossy().to_string();
+    let aux = PathBuf::from(format!("{p}.aux.xml"));
+    if let Ok(text) = std::fs::read_to_string(&aux)
+        && (text.contains("<SRS") || text.contains("<GeoTransform"))
+    {
+        return Some(aux);
+    }
+    for ext in ["tfw", "tifw", "tiffw", "wld"] {
+        let w = path.with_extension(ext);
+        if w.exists() {
+            return Some(w);
+        }
+    }
+    None
+}
+
 impl Terrain {
     /// plan_grid's terrain checks (single-band float32, nodata declared, no
-    /// dataset/alpha mask, north-up square pixels, EPSG-coded CRS).
+    /// dataset/alpha mask, north-up square pixels) and the terrain identity:
+    /// an explicit EPSG `ProjectedCSTypeGeoKey`, no GDAL sidecar that could
+    /// change the SRS or geotransform.
     pub fn open(path: &Path) -> Result<Self> {
         let p = path.to_string_lossy().to_string();
         let info = ras_commander_fast_map::terrain::inspect(&p)?;
@@ -195,27 +217,89 @@ impl Terrain {
                 "horizontal terrain must declare its nodata value",
             ));
         }
+        if let Some(sidecar) = gdal_sidecar(path) {
+            return Err(Error::unsupported(format!(
+                "terrain sidecar {} can change its CRS or geotransform for GDAL; remove it",
+                sidecar.display()
+            )));
+        }
         let t = Affine::from_gdal(info.geo_transform);
+        if !info.geo_transform.iter().all(|v| v.is_finite()) {
+            return Err(Error::unsupported("terrain geotransform must be finite"));
+        }
         let close = (t.a - (-t.e)).abs() <= 1e-12 * (-t.e).abs();
         if t.b != 0.0 || t.d != 0.0 || t.a <= 0.0 || t.e >= 0.0 || !close {
             return Err(Error::unsupported(
                 "horizontal mapping requires north-up square terrain pixels",
             ));
         }
-        let epsg = info.epsg.ok_or_else(|| {
-            Error::unsupported(
-                "terrain CRS has no EPSG code; this preparation requires an EPSG-coded terrain",
-            )
-        })?;
+        let keyed = ras_commander_fast_map::crs::read_geokeys(path)?
+            .and_then(|k| k.short(3072))
+            .filter(|c| *c != 0 && *c != 32767)
+            .map(u32::from);
+        let epsg = match (keyed, info.epsg) {
+            (Some(k), Some(e)) if k == e => k,
+            _ => {
+                return Err(Error::unsupported(
+                    "terrain CRS has no explicit EPSG ProjectedCSTypeGeoKey; this preparation requires an EPSG-coded terrain",
+                ));
+            }
+        };
+        let (bw, bh) = info.block;
+        if bw == 0 || bh == 0 {
+            return Err(Error::unsupported("terrain block size is unknown"));
+        }
         Ok(Self {
             path: p,
             transform: t,
-            width: info.width as i64,
-            height: info.height as i64,
+            width: i64::try_from(info.width).map_err(|_| Error::unsupported("terrain too wide"))?,
+            height: i64::try_from(info.height)
+                .map_err(|_| Error::unsupported("terrain too tall"))?,
             // rasterio block_shapes[0] is (rows, columns); terrio reports (columns, rows).
-            block: (info.block.1 as i64, info.block.0 as i64),
+            block: (bh as i64, bw as i64),
             epsg,
         })
+    }
+
+    /// `_engine.terrain_identity`'s cross-check: the engine's `terrain-info`
+    /// must report this size, geotransform and EPSG code.
+    pub fn check_engine(&self, engine: &Path) -> Result<()> {
+        let out = std::process::Command::new(engine)
+            .arg("terrain-info")
+            .arg(&self.path)
+            .output()?;
+        if !out.status.success() {
+            return Err(Error::engine(format!(
+                "ras2fim-batch terrain-info failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let info: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+        if (info["width"].as_i64(), info["height"].as_i64())
+            != (Some(self.width), Some(self.height))
+        {
+            return Err(Error::engine(format!(
+                "terrain size differs: engine {}x{}, reader {}x{}",
+                info["width"], info["height"], self.width, self.height
+            )));
+        }
+        let gt: Option<Vec<f64>> = info["geo_transform"]
+            .as_array()
+            .map(|a| a.iter().filter_map(serde_json::Value::as_f64).collect());
+        if gt.as_deref() != Some(&self.transform.to_gdal()[..]) {
+            return Err(Error::engine(format!(
+                "terrain geotransform differs: engine {}, reader {:?}",
+                info["geo_transform"],
+                self.transform.to_gdal()
+            )));
+        }
+        if info["epsg"].as_u64() != Some(u64::from(self.epsg)) {
+            return Err(Error::engine(format!(
+                "terrain EPSG differs: engine {}, reader {}",
+                info["epsg"], self.epsg
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -276,14 +360,19 @@ pub fn plan_grid(
     }
     let t = terrain.transform;
     let (bh, bw) = terrain.block;
-    let block_bytes = (bh * bw * 4) as u64;
+    let block_bytes = (bh as u64)
+        .checked_mul(bw as u64)
+        .and_then(|v| v.checked_mul(4))
+        .ok_or_else(|| {
+            Error::unsupported("horizontal terrain block exceeds 64 MiB; export tiled terrain")
+        })?;
     if block_bytes > 64 << 20 {
         return Err(Error::unsupported(
             "horizontal terrain block exceeds 64 MiB; export tiled terrain",
         ));
     }
-    let transient = block_bytes * 4
-        + (((terrain.width + bw - 1) / bw) * ((terrain.height + bh - 1) / bh) * 16) as u64;
+    let blocks = ((terrain.width + bw - 1) / bw) as u64 * ((terrain.height + bh - 1) / bh) as u64;
+    let transient = block_bytes * 4 + blocks * 16;
     let (fc0, fc1) = crate::aoi::center_index_range(bounds[0], bounds[2], t.c, t.a, terrain.width);
     let (fr0, fr1) = crate::aoi::center_index_range(bounds[1], bounds[3], t.f, t.e, terrain.height);
     let ab = geom::envelope_any(aoi)?;
@@ -366,14 +455,23 @@ fn residue_without_sample(intersection: &Geometry, plan: &GridPlan) -> Result<bo
     }
     let t = plan.transform;
     let (h, w) = plan.shape();
-    let c0 = (((e.min[0] - t.c) / t.a - 0.5).ceil() as i64 - 1).max(0);
-    let c1 = (((e.max[0] - t.c) / t.a - 0.5).floor() as i64 + 1).min(w - 1);
-    let r0 = (((e.max[1] - t.f) / t.e - 0.5).ceil() as i64 - 1).max(0);
-    let r1 = (((e.min[1] - t.f) / t.e - 0.5).floor() as i64 + 1).min(h - 1);
+    let qs = [
+        (e.min[0] - t.c) / t.a - 0.5,
+        (e.max[0] - t.c) / t.a - 0.5,
+        (e.max[1] - t.f) / t.e - 0.5,
+        (e.min[1] - t.f) / t.e - 0.5,
+    ];
+    if !qs.iter().all(|q| q.is_finite()) {
+        return Err(Error::invalid("overlap residue bounds are not finite"));
+    }
+    let c0 = (qs[0].ceil() as i64).saturating_sub(1).max(0);
+    let c1 = (qs[1].floor() as i64).saturating_add(1).min(w - 1);
+    let r0 = (qs[2].ceil() as i64).saturating_sub(1).max(0);
+    let r1 = (qs[3].floor() as i64).saturating_add(1).min(h - 1);
     if c1 < c0 || r1 < r0 {
         return Ok(true);
     }
-    if (c1 - c0 + 1) * (r1 - r0 + 1) > 4096 {
+    if (c1 - c0 + 1).saturating_mul(r1 - r0 + 1) > 4096 {
         return Ok(false);
     }
     let point = |x: f64, y: f64| -> Result<Geometry> {

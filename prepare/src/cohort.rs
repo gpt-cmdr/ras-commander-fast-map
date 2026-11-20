@@ -22,8 +22,41 @@ pub struct PrepareInput {
     /// tiles could serve (`_tile_layout`) is staged from the staged cells' HDF columns
     /// with only staged values checked, as fim-commander's tile path checks them.
     pub wse_tiles: Option<Value>,
-    /// Source files with the `(size, mtime_ns)` identity recorded at normalisation.
-    pub sources: Vec<(PathBuf, (u64, i128))>,
+    /// Watched sources (`hdf`, `terrain`, `polygon`, `geometry`, `engine`, ...)
+    /// with the `(size, mtime_ns)` identity recorded at normalisation.
+    pub sources: Vec<Source>,
+    /// The engine, for its `terrain-info` cross-check.
+    pub engine_path: PathBuf,
+}
+
+/// One watched source file.
+#[derive(Clone, Debug)]
+pub struct Source {
+    pub key: String,
+    pub path: PathBuf,
+    pub identity: (u64, i128),
+}
+
+/// `_catalog._check_sources(jobs)`: `RuntimeError` naming the job.
+pub fn check_job_sources(sources: &[Source], job_id: &str) -> Result<()> {
+    for s in sources {
+        if file_identity(&s.path).ok() != Some(s.identity) {
+            return Err(Error::new(
+                crate::error::Kind::Runtime,
+                format!(
+                    "Catalog source changed for job {}",
+                    crate::error::py_repr(job_id)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `max_*_mib << 20` without wrapping.
+fn mib(v: u64, what: &str) -> Result<u64> {
+    v.checked_mul(1 << 20)
+        .ok_or_else(|| Error::invalid(format!("{what} is too large")))
 }
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
@@ -132,9 +165,7 @@ fn py_json_len(v: &Value) -> usize {
 /// `str(Path(p).resolve())` byte length (Windows verbatim prefix removed).
 fn resolved_len(p: &Path) -> Result<u64> {
     let r = std::fs::canonicalize(p)?;
-    let s = r.to_string_lossy();
-    let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
-    Ok(s.len() as u64)
+    Ok(request::plain_path(&r.to_string_lossy()).len() as u64)
 }
 
 /// `_group_budgets.plan_window_cache(model, jobs, requested_mib)`.
@@ -220,7 +251,7 @@ fn tile_layout(
     let same_hdf = t["hdf_path"]
         .as_str()
         .and_then(|p| request::resolve(Path::new(p)).ok())
-        .is_some_and(|p| p == hdf_path);
+        .is_some_and(|p| request::resolve(hdf_path).is_ok_and(|h| h == p));
     if t["mesh_name"].as_str() != Some(mesh.name.as_str())
         || t["cell_count"].as_u64() != Some(mesh.cell_count as u64)
         || !same_hdf
@@ -300,19 +331,48 @@ pub fn prepare(req: &PrepareInput, control: &Path, ordinal: usize) -> Result<Pre
     }
     let hdf_path = req.hdf_path.clone();
     let terrain_path = req.terrain_path.clone();
-    let check_sources = || -> Result<()> {
-        for (p, id) in &req.sources {
-            if file_identity(p)? != *id {
-                return Err(Error::engine(format!(
-                    "Catalog source changed: {}",
-                    p.display()
-                )));
+    if controls.max_profiles_per_batch == 0 {
+        return Err(Error::invalid(
+            "max_profiles_per_batch must be a positive integer",
+        ));
+    }
+    if req.jobs.is_empty() || req.jobs.iter().any(|j| j.selectors.is_empty()) {
+        return Err(Error::invalid(
+            "Group timesteps must be unique nonnegative saved indices",
+        ));
+    }
+    let max_prepared = mib(controls.max_prepared_mib, "max_prepared_mib")?;
+    let max_working = mib(controls.max_working_mib, "max_working_mib")?;
+    let max_accumulator = mib(controls.max_accumulator_mib, "max_accumulator_mib")?;
+    // Sources were bound by the caller; refuse if any changed before we start.
+    let job_id = req.jobs.first().map(|j| j.job_id.as_str()).unwrap_or("");
+    check_job_sources(&req.sources, job_id)?;
+    let hdf = Hdf::open(&hdf_path, controls.threads)?;
+    // `FimPreparedSlopingModel._check_sources`: a changed source closes the
+    // context; a geometry text file that appears re-runs the 1D guard.
+    let check_sources = |geometry_absent: bool| -> Result<()> {
+        let changed: Vec<String> = req
+            .sources
+            .iter()
+            .filter(|s| file_identity(&s.path).ok() != Some(s.identity))
+            .map(|s| crate::error::py_repr(&s.key))
+            .collect();
+        if !changed.is_empty() {
+            return Err(Error::engine(format!(
+                "Prepared sloping sources changed; create a new context: [{}]",
+                changed.join(", ")
+            )));
+        }
+        if geometry_absent {
+            let scope = crate::scope::validate_2d_model(&hdf)?;
+            if !scope["geometry_path"].is_null() {
+                return Err(Error::engine(
+                    "Source geometry appeared; create a new prepared context",
+                ));
             }
         }
         Ok(())
     };
-    check_sources()?;
-    let hdf = Hdf::open(&hdf_path, controls.threads)?;
     let (depth_units, unit_metadata) = hdf.result_units(&path_string(&hdf_path))?;
     let jobs = &req.jobs;
     let mut source_indices: Vec<u64> = Vec::new();
@@ -340,9 +400,10 @@ pub fn prepare(req: &PrepareInput, control: &Path, ordinal: usize) -> Result<Pre
     // ---- RasFim.prepare_sloping_model(profiles={first}, invalid_cells=...) ----
     lap("open_and_units", &mut phases);
     let scope = crate::scope::validate_2d_model(&hdf)?;
+    let geometry_absent = scope["geometry_path"].is_null();
     lap("scope", &mut phases);
-    let validation_limit = (8u64 << 20).min((controls.max_prepared_mib << 20) / 8);
-    let prepared_budget = (controls.max_prepared_mib << 20) - validation_limit;
+    let validation_limit = (8u64 << 20).min(max_prepared / 8);
+    let prepared_budget = max_prepared - validation_limit;
     let mesh_names = hdf.mesh_names()?;
     let cell_tick = Instant::now();
     let cells = cells::load(&hdf, &mesh_names, &req.invalid_cells, controls.threads)?;
@@ -355,7 +416,8 @@ pub fn prepare(req: &PrepareInput, control: &Path, ordinal: usize) -> Result<Pre
         ));
     }
     let terrain = Terrain::open(&terrain_path)?;
-    crate::crs::require_epsg(hdf.projection_wkt()?.as_deref(), terrain.epsg)?;
+    crate::crs::require_model_crs(&hdf.crs_evidence()?, terrain.epsg)?;
+    terrain.check_engine(&req.engine_path)?;
     let crs_identity = json!({"kind": "epsg"});
     // Python's `ras-fim-prepared-XXXXXXXX` has the same length.
     let prepared_dir = control.join(format!("ras-fim-prepared-rust{ordinal:04}"));
@@ -376,6 +438,13 @@ pub fn prepare(req: &PrepareInput, control: &Path, ordinal: usize) -> Result<Pre
             "Prepared sloping inputs exceed max_prepared_mib",
         ));
     }
+    // ras-commander's time-series view reads the saved-time axis first.
+    let time_path = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Time";
+    if hdf.dataset_shape(time_path)?.is_none() {
+        return Err(Error::invalid(format!(
+            "Path {time_path} not found in HDF file"
+        )));
+    }
     let time_counts = meshes
         .iter()
         .map(|m| {
@@ -388,6 +457,7 @@ pub fn prepare(req: &PrepareInput, control: &Path, ordinal: usize) -> Result<Pre
             Ok(shape[0])
         })
         .collect::<Result<Vec<_>>>()?;
+    payload::check_parent_profile(&hdf, &meshes, &name(0), first_index, &time_counts)?;
     let info_staged = mesh_bytes + values_bytes;
     let planned_prepared = geometry_bytes + mesh_bytes + values_bytes + validation_limit;
     let invalid_cells = cells.describe(None)?;
@@ -414,7 +484,7 @@ pub fn prepare(req: &PrepareInput, control: &Path, ordinal: usize) -> Result<Pre
         "cell_polygon_seconds": cell_seconds,
         "scope": scope,
     });
-    check_sources()?;
+    check_sources(geometry_absent)?;
 
     // ---- per job: AOI, plan_grid, validation, AOI file ----
     let mut staged_bytes = planned_prepared;
@@ -451,7 +521,7 @@ pub fn prepare(req: &PrepareInput, control: &Path, ordinal: usize) -> Result<Pre
     ownership.sort_unstable();
     ownership.dedup();
     let extra_bytes = ownership.len() as u64 * 256 + source_indices.len() as u64 * 256;
-    let allowed = controls.max_prepared_mib << 20;
+    let allowed = max_prepared;
     if staged_bytes + extra_bytes > allowed {
         return Err(Error::budget(format!(
             "Grouped preparation required {} bytes, allowed {allowed}",
@@ -498,7 +568,7 @@ pub fn prepare(req: &PrepareInput, control: &Path, ordinal: usize) -> Result<Pre
             record["wse_source"] = json!(STAGED_CELL_READS_SOURCE);
         }
         source_wave.push(record);
-        check_sources()?;
+        check_sources(geometry_absent)?;
     }
     lap("staged_cells_and_wse", &mut phases);
     let staged_cells = json!({
@@ -532,7 +602,7 @@ pub fn prepare(req: &PrepareInput, control: &Path, ordinal: usize) -> Result<Pre
         "profiles": staged,
         "threads": controls.threads,
         "max_inflight_profiles": controls.max_inflight_profiles,
-        "max_working_bytes": controls.max_working_mib << 20,
+        "max_working_bytes": max_working,
     });
     let cache = plan_window_cache(
         &terrain_path,
@@ -550,11 +620,11 @@ pub fn prepare(req: &PrepareInput, control: &Path, ordinal: usize) -> Result<Pre
         "source_indices": source_indices,
         "jobs": native_jobs,
         "depth_units": depth_units,
-        "depth_cutoff_ft": controls.depth_cutoff_ft,
+        "depth_cutoff_ft": controls.depth_cutoff_json.clone().unwrap_or(json!(controls.depth_cutoff_ft)),
         "products": ["depth_max"],
         "compression": controls.compression,
         "sink": "grouped-geotiff",
-        "max_accumulator_bytes": controls.max_accumulator_mib << 20,
+        "max_accumulator_bytes": max_accumulator,
         "scratch": {"path": path_string(control), "node_local": true, "max_bytes": controls.max_scratch_bytes},
     });
     let request_path = root.join("request.json");

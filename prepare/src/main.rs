@@ -49,11 +49,23 @@ fn run() -> fast_map_prepare::Result<()> {
             );
             Ok(())
         }
+        Some("version") if args.len() == 2 => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "name": "fast-map-prepare",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "commit": option_env!("FAST_MAP_BUILD_COMMIT").unwrap_or("unknown"),
+                    "oracle": "ras-commander 0.124.0 (_depth_groups._cohort), GEOS 3.13.1",
+                })
+            );
+            Ok(())
+        }
         Some("worker") if args.len() == 3 => {
             fast_map_prepare::worker::run(&PathBuf::from(&args[2]))
         }
         _ => Err(fast_map_prepare::Error::invalid(
-            "usage: fast-map-prepare prepare <request.json> <control-dir> | worker <config.json>",
+            "usage: fast-map-prepare prepare <request.json> <control-dir> | worker <config.json> | cells <plan.hdf> <policy> | version",
         )),
     }
 }

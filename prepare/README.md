@@ -70,10 +70,16 @@ engine's `sloping-server`, validates the report and the GeoTIFF headers, deliver
 sampling, timeout, receipt) is unchanged.
 
 `cells` prints the ownership rows and invalid-cell record (`load_cells` + `require_cells`),
-for parity checks.
+for parity checks. `version` prints the name, version and build commit.
 
-Refusals exit 2 and print `{"status":"refused","kind":...,"message":...}`; the worker records
-the Python exception class the same refusal raises in `result.json`.
+`wkb_files` hold bare WKB (as in a GeoParquet geometry column), not GeoPackage blobs.
+
+Refusals exit 2 and print `{"status":"refused","kind":...,"message":...}`. The worker writes
+`result.json` as `_worker` does (`status: aborted`, `error: "<class>: <message>"`), also for an
+internal fault (`RuntimeError: internal error (panic): ...`). For refusals it shares with
+ras-commander it records the same exception class, and for the ported ones the same message;
+messages from its own HDF, TIFF and JSON parsing differ. It pins itself to the supervisor's CPU
+partition (Linux) and sets `OMP_NUM_THREADS` for the engine, as `_worker` does.
 
 ## Parity
 
@@ -93,20 +99,30 @@ own synthetic meshes and the window arithmetic against values Python computed.
 
 ## Differences (refusals only)
 
-The preparation never accepts input ras-commander refuses, and refuses a few inputs
+The preparation is meant never to accept input ras-commander refuses, and it refuses some input
 ras-commander accepts:
 
-- an AOI in another CRS than the terrain (ras-commander reprojects);
-- a terrain without an EPSG GeoKey; a plan-HDF CRS that does not match the terrain's EPSG
-  definition parameter by parameter (method, datum name, ellipsoid, prime meridian, unit,
-  parameters within PROJ's 1e-10 relative tolerance); ras-commander uses PROJ equivalence;
-- the root `SI Units` / geometry `SI Units = False` disagreement ras-commander resolves from
-  dataset labels;
-- `postprocessing_hdf`, depth-weighted faces, `slopingPretty`, shallow-to-horizontal and
-  staging without cell subsets.
+- an AOI whose CRS does not declare the terrain's projected EPSG code (ras-commander compares
+  with PROJ and reprojects when they differ);
+- a terrain without an explicit EPSG `ProjectedCSTypeGeoKey`, with a GDAL sidecar that could
+  change its CRS or geotransform (`.aux.xml` SRS/GeoTransform, world file), or whose size,
+  geotransform or EPSG the engine's `terrain-info` reports differently;
+- model CRS evidence (`HdfUtils.collect_hdf_crs_evidence`: the plan HDF's `Projection`, then the
+  `.rasmap` projection file and terrain layer HDFs) that does not match the terrain's EPSG
+  definition parameter by parameter: projection method (LCC 2SP, Transverse Mercator, Albers),
+  datum name, ellipsoid, prime meridian, angular and linear units, axes and parameters within
+  PROJ's 1e-10 relative tolerance; WKT with `TOWGS84`, `EXTENSION` or other elements;
+- unit attributes outside `True/False/1/0` and `SI Units/SI/US Customary`, and the root `SI
+  Units` / geometry `SI Units = False` disagreement ras-commander resolves from dataset labels;
+- `postprocessing_hdf`, depth-weighted faces, `slopingPretty`, shallow-to-horizontal and staging
+  without cell subsets.
 
-Water surface is always staged from the HDF. fim-commander can stage the same bytes from a
-parent extract's tiles; the preparation record then lacks that wave's `wse_source`.
+Water surface comes from the plan HDF. Where fim-commander would stage a wave from a parent
+extract's tiles (`wse_tiles`, `_tile_layout`), only the staged cells' columns are read and only
+those values must be finite, as on the tile path; the wave records
+`wse_source: plan-hdf-staged-cells/1` instead of `parent-extract-cell-wse-tiles/1`. Elsewhere
+complete rows are read and must be finite, as on the HDF path. If tiles exist but cannot be read,
+ras-commander falls back to complete rows; this preparation keeps the staged-only check.
 
 ## Building
 
@@ -117,5 +133,7 @@ GEOS_LIB_DIR=/path/to/geos-3.13.1/lib GEOS_VERSION=3.13.1 cargo build --release 
 ```
 
 GEOS is LGPL-2.1 and linked dynamically; ship `libgeos_c` and `libgeos` 3.13.1 with the
-binary (CI uploads them with it). `tests/fixtures/make_fixtures.py` regenerates the fixtures
+binary. CI builds against conda-forge `geos=3.13.1=h97f6797_0` and uploads the binary with
+`libgeos_c.so.1`, `libgeos.so.3.13.1` and the conda `libstdc++.so.6` / `libgcc_s.so.1` they were
+built against, found next to the binary (rpath `$ORIGIN`). `tests/fixtures/make_fixtures.py` regenerates the fixtures
 with the oracle pins.
