@@ -24,7 +24,7 @@
     grid.
   - Per-profile report `corner_fit_bound` (bounded group counts up, down and
     non-finite, largest removed overshoot, first-wet and L >= 3 diagnostics) and
-    SPIKE-SWEEP's same-profile out-of-range test `same_profile_out_of_range`
+    the same-profile out-of-range test `same_profile_out_of_range`
     (0.72 margin) for the rendered window; depth groups carry them per frame and
     summarise them in the report. Tolerances are echoed as their shortest
     decimal; -0 is read as +0; `"corner_fit_bound": null` is native.

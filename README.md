@@ -481,7 +481,7 @@ Plain sloping fits a least-squares plane through the face values around each
 facepoint and evaluates it at the facepoint. When the application points are
 nearly collinear and the facepoint lies off their line, the fit extrapolates
 far outside its inputs. Native HEC-RAS 6.6 RAS Mapper does the same: on nine
-stored UPGU1 maps (4,690 wet pixels) its WSE equals this engine's plain-sloping
+stored maps of a rain-on-grid model (4,690 wet pixels) its WSE equals this engine's plain-sloping
 arithmetic bit for bit, corner-fit overshoots included (up to 49.75 ft above
 every same-minute input). The default method `rasmapper-plain-sloping/1` keeps
 that native behaviour unchanged.
@@ -523,7 +523,7 @@ A sloping request may select an alternative instead:
   profile reconstructs (the staged closure, or the whole mesh).
 - **Same-profile out-of-range test:** under the bounded method each profile
   record also has `same_profile_out_of_range` for the rendered window,
-  SPIKE-SWEEP's test: wet pixels whose painted WSE exceeds, by more than 0.72
+  a same-minute screen: wet pixels whose painted WSE exceeds, by more than 0.72
   (0.5 plus the largest measured face-over-cell rebuild excess, 0.22; WSE units,
   calibrated in ft), the highest WSE at that profile of the owning cell and of
   every physical cell on a face at any of its stencil vertices, wet or dry. A
@@ -551,9 +551,10 @@ Default-path evidence: `tests/bounded_corners.rs` renders the synthetic
 fixtures (plain, AOI, staged, slopingPretty with and without shallow reduction
 and depth weighting, depth groups) with hashes recorded at the pre-change
 commit; a bounded request with tolerance `f32::MAX` renders the default bits.
-The unit tests in `src/sloping.rs` use two real UPGU1 rings: p03 minute 468,
-vertex 52923 (native 2060.02587890625 ft from inputs 1994.41-2014.03 ft;
-bounded 2014.02734375 ft) and the p03 Max profile, vertex 136296 (native
+The unit tests in `src/sloping.rs` use two recorded rings of that model, in
+facepoint-relative coordinates: a first-wetting output time (native
+2060.02587890625 ft from inputs 1994.41-2014.03 ft; bounded 2014.02734375 ft)
+and the summary Max profile (native
 1486.1566 ft, 266.1 ft below inputs 1752.26-1759.68 ft; bounded
 1752.2613525390625 ft).
 

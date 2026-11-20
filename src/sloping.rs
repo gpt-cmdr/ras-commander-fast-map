@@ -518,7 +518,7 @@ pub struct BoundedCorners {
     pub report: CornerBoundReport,
     /// Per vertex: the highest WSE, at this profile, of every physical cell on
     /// any face at the vertex (wet or dry; negative infinity without one), as
-    /// SPIKE-SWEEP's same-minute test bounds the corner fits there. Feeds
+    /// the same-minute out-of-range screen bounds the corner fits there. Feeds
     /// [`input_excess`].
     pub input_max: Vec<f32>,
 }
@@ -584,7 +584,7 @@ impl BoundContext<'_> {
         bounded
     }
 
-    /// SPIKE-SWEEP's same-minute bound at a vertex: the highest WSE of every
+    /// The same-minute screen's bound at a vertex: the highest WSE of every
     /// physical cell on any face at the vertex, wet or dry.
     fn vertex_cell_max(&self, corner: &Corner, faces: &[Face]) -> f32 {
         corner
@@ -1519,12 +1519,12 @@ pub fn prepare_profile_with_options(
     })
 }
 
-/// Margin of the same-profile out-of-range test: SPIKE-SWEEP's 0.5 plus the
+/// Margin of the same-profile out-of-range test: a 0.5 screening margin plus the
 /// largest measured face-over-cell rebuild excess, 0.22, in WSE units (ft).
 pub const INPUT_EXCESS_MARGIN: f64 = 0.72;
 
 /// The same-profile out-of-range test of one rendered window (bounded method
-/// only), SPIKE-SWEEP's test: a wet pixel is out of range when its painted WSE
+/// only), a same-minute screen: a wet pixel is out of range when its painted WSE
 /// exceeds, by more than [`INPUT_EXCESS_MARGIN`], the highest WSE at that
 /// profile of its owning cell and of every physical cell on a face at any of
 /// that cell's stencil vertices (wet or dry). A painted value is a convex
@@ -2749,10 +2749,11 @@ mod boundary_surface_tests {
 // The recorded binary32 values are written out exactly, as in the evidence.
 #[allow(clippy::excessive_precision)]
 mod bounded_corner_tests {
-    //! `rasmapper-plain-sloping-bounded-corners/1` on real corner rings. The
-    //! rings, face values and cell states are the UPGU1 (HEC-RAS 6.6) values at
-    //! the named vertices, extracted from the p03 slim HDF with the replay port
-    //! P03-DEPTH validated against native RAS Mapper; local indices replace ids.
+    //! `rasmapper-plain-sloping-bounded-corners/1` on two recorded corner rings
+    //! of a HEC-RAS 6.6 rain-on-grid 2D model (whose stored maps RAS Mapper 6.6
+    //! paints with the same corner values). Coordinates are relative to the
+    //! facepoint, exactly as the regression translates them; local indices
+    //! replace the model's ids. No other model data is kept.
     use super::*;
 
     type RingFace = ([usize; 2], [usize; 2], [f32; 2], Connection, [f64; 2]);
@@ -2805,55 +2806,53 @@ mod bounded_corner_tests {
 
     use Connection::{DownhillDeep, DownhillShallow, Levee, None as Unconnected};
 
-    /// wb-2417240, p03 minute 468 (01JAN2020 07:48), vertex 52923 at
-    /// (1867521.7602708347, 13975846.4679681) EPSG:2278. Ring faces 103626,
-    /// 103621, 103624, 880557, 110505, 108198; cells 37464, 37830, 385790,
-    /// 385791, 384019, 384018.
-    fn wb_2417240() -> (Corner, Vec<Face>, Vec<FaceWater>, Vec<Cell>, Vec<f32>) {
+    /// A first-wetting ring at one recorded output time (ft): the owning cell
+    /// is 0.018 ft deep and one neighbour is dry; six faces, six cells.
+    fn first_wetting() -> (Corner, Vec<Face>, Vec<FaceWater>, Vec<Cell>, Vec<f32>) {
         let (corner, faces, values) = ring(
-            [1867521.7602708347, 13975846.4679681],
+            [0.0, 0.0],
             &[
                 (
                     [2, 0],
                     [0, 1],
                     [2014.0091552734375; 2],
                     DownhillShallow,
-                    [1867536.2658785027, 13975898.04001275],
+                    [14.505607668077573, 51.57204465009272],
                 ),
                 (
                     [3, 2],
                     [0, 2],
                     [1992.9306640625, 1994.413818359375],
                     Unconnected,
-                    [1867421.2346157592, 13975971.709476482],
+                    [-100.52565507544205, 125.24150838144124],
                 ),
                 (
                     [3, 4],
                     [3, 0],
                     [2011.8123779296875; 2],
                     DownhillShallow,
-                    [1867466.150882308, 13975827.636414781],
+                    [-55.609388526761904, -18.831553319469094],
                 ),
                 (
                     [4, 5],
                     [4, 0],
                     [2014.575439453125; 2],
                     DownhillShallow,
-                    [1867496.9244559794, 13975673.47924017],
+                    [-24.835814855294302, -172.98872793093324],
                 ),
                 (
                     [1, 5],
                     [0, 5],
                     [NODATA, 2014.828857421875],
                     Unconnected,
-                    [1867558.4931723755, 13975780.56591139],
+                    [36.73290154081769, -65.90205671079457],
                 ),
                 (
                     [0, 1],
                     [0, 6],
                     [2014.02734375, NODATA],
                     Unconnected,
-                    [1867657.10061502, 13975846.4679681],
+                    [135.34034418524243, 0.0],
                 ),
             ],
         );
@@ -2868,47 +2867,46 @@ mod bounded_corner_tests {
         (corner, faces, values, cells, wse)
     }
 
-    /// p03 summary Max profile, vertex 136296 at (1877780.1158722613,
-    /// 13949789.469003635). Ring faces 278396, 871705, 871704, 278398, 278390;
-    /// cells 101015, 364725, 364724, 366777, 366778.
-    fn max_136296() -> (Corner, Vec<Face>, Vec<FaceWater>, Vec<Cell>, Vec<f32>) {
+    /// A ring of the same model's summary Max profile (ft): five faces, five
+    /// cells, whose fit lies 266 ft below all of its inputs.
+    fn summary_max() -> (Corner, Vec<Face>, Vec<FaceWater>, Vec<Cell>, Vec<f32>) {
         let (corner, faces, values) = ring(
-            [1877780.1158722613, 13949789.469003635],
+            [0.0, 0.0],
             &[
                 (
                     [0, 1],
                     [1, 0],
                     [1759.1474609375; 2],
                     DownhillShallow,
-                    [1877760.6277300008, 13949758.802121554],
+                    [-19.488142260583118, -30.666882080957294],
                 ),
                 (
                     [2, 1],
                     [0, 2],
                     [1760.1295166015625, 1759.6790771484375],
                     Levee,
-                    [1877831.0975270872, 13949673.572002241],
+                    [50.981654825853184, -115.89700139313936],
                 ),
                 (
                     [2, 3],
                     [3, 0],
                     [1759.6458740234375; 2],
                     DownhillShallow,
-                    [1877825.4736998752, 13949795.422545616],
+                    [45.357827613828704, 5.953541981056333],
                 ),
                 (
                     [4, 3],
                     [0, 4],
                     [1752.5445556640625; 2],
                     DownhillDeep,
-                    [1877799.2271683163, 13949914.22497657],
+                    [19.111296054907143, 124.75597293488681],
                 ),
                 (
                     [0, 4],
                     [0, 5],
                     [1752.2613525390625, 1752.3653564453125],
                     Unconnected,
-                    [1877702.0107853098, 13949830.976303],
+                    [-78.10508695151657, 41.507299365475774],
                 ),
             ],
         );
@@ -2945,8 +2943,8 @@ mod bounded_corner_tests {
     }
 
     #[test]
-    fn wb_2417240_minute_468_corner_is_clamped_to_its_highest_input() {
-        let fixture = wb_2417240();
+    fn first_wetting_corner_is_clamped_to_its_highest_input() {
+        let fixture = first_wetting();
         let (native, maxima, report) = run(&fixture, None);
         // Native (and RAS Mapper 6.6): 46.0 ft above the highest input.
         let spike = 2060.02587890625_f32;
@@ -2975,7 +2973,7 @@ mod bounded_corner_tests {
         // First wetting: the shallowest wet input cell is 0.0012 ft deep.
         assert_eq!(report.bounded_min_wet_input_depth_lt_0p1, 1);
         assert_eq!(report.bounded_l_ge_3, 1);
-        // SPIKE-SWEEP's same-minute bound at the vertex: every physical cell on a
+        // The same-minute screen's bound at the vertex: every physical cell on a
         // face there, wet or dry; here cell 37830, dry at its minimum, 2015.72.
         assert_eq!(maxima.to_bits(), 2015.7213134765625_f32.to_bits());
 
@@ -2993,8 +2991,8 @@ mod bounded_corner_tests {
     }
 
     #[test]
-    fn max_profile_vertex_136296_downward_fit_is_clamped_to_its_lowest_input() {
-        let fixture = max_136296();
+    fn summary_max_downward_fit_is_clamped_to_its_lowest_input() {
+        let fixture = summary_max();
         let (native, _, _) = run(&fixture, None);
         let hole = 1486.1566162109375_f32; // 266.1 ft below every input
         let inside = 1756.191162109375_f32;
