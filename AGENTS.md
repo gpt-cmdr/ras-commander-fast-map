@@ -27,6 +27,9 @@ credentials or workstation paths. External real fixtures are opt-in. Preserve
 license/provenance notices. Update SOURCE_MANIFEST.json with scripts/verify_sources.py
 --write after intentional source changes; verify migration fingerprints before
 the extraction release. Use cargo fmt/test/clippy and installed-wheel smoke.
+CI runs only on CLB self-hosted runners (clb-ci-linux, clb-ci-windows), with no
+GitHub-hosted fallback; pull requests from forks do not run. The Linux wheel is
+built for manylinux_2_28 through zig, without Docker.
 
 Release only reviewed qualified commits. Crate and wheel versions match.
 Ordinary mapping has no hidden Python fallback or HEC runtime dependency.
