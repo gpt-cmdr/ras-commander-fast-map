@@ -1444,7 +1444,7 @@ fn run_internal(
                         20
                     } else if req.options.corner_fit_bound.is_some() {
                         // The bound's transient per-vertex records and per-cell
-                        // input maxima, within one more geometry-sized share.
+                        // input maxima, within two more geometry-sized shares.
                         18
                     } else {
                         16
@@ -1648,7 +1648,7 @@ fn run_internal(
                         20
                     } else if req.options.corner_fit_bound.is_some() {
                         // The bound's transient per-vertex records and per-cell
-                        // input maxima, within one more geometry-sized share.
+                        // input maxima, within two more geometry-sized shares.
                         18
                     } else {
                         16

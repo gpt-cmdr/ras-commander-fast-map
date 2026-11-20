@@ -528,8 +528,9 @@ A sloping request may select an alternative instead:
   calibrated in ft), the highest WSE at that profile of the owning cell and of
   every physical cell on a face at any of its stencil vertices, wet or dry. A
   painted value is a convex combination of its cell's corners, so such a pixel
-  can only come from an out-of-range fit; under the bound the count is expected
-  to be 0. The first-wet diagnostic uses the census definition instead: the wet
+  can only come from an out-of-range fit; under the bound with a tolerance of at
+  most 0.5 the count is expected to be 0 (a larger tolerance can legitimately
+  lift a corner past the margin). The first-wet diagnostic uses the census definition instead: the wet
   cells on either side of the group's input faces.
 - **Depth groups** accept the option in `model.options`; each frame carries the
   profile record and the report adds `sloping_method_id` and a
@@ -538,8 +539,8 @@ A sloping request may select an alternative instead:
   pixel once per window).
 - The option is part of the sloping options, so it enters the retained
   hydraulic cache key: native and bounded requests in one session never share a
-  reconstruction (`tests/bounded_corners.rs`). A bounded request plans one more
-  geometry-sized share of working memory (18 instead of 16) for its transient
+  reconstruction (`tests/bounded_corners.rs`). A bounded request plans two more
+  geometry-sized shares of working memory (18 instead of 16) for its transient
   per-vertex records and per-cell input maxima.
 - Native requests keep their Depth/WSE bits and their report method objects
   (both pinned against the pre-change commit). The only native difference is
