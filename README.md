@@ -501,8 +501,11 @@ A sloping request may select an alternative instead:
   non-finite fit becomes the mean of its inputs (native's zero-determinant
   fallback). Every other corner keeps its native value exactly.
 - **Tolerance:** required, finite and >= 0, in WSE units; 0 is recommended.
-  Absent `corner_fit_bound` means native. A missing, negative or non-finite
-  tolerance, an unknown mode or field is refused before any read.
+  Absent (or `null`) `corner_fit_bound` means native. A missing, negative or
+  non-finite tolerance, an unknown mode or field is refused before any read. The
+  interval ends are rounded to binary32 first, so a fit is bounded exactly when
+  clamping changes it; -0 is read as +0, and reports echo the tolerance as its
+  shortest decimal (0.1, not 0.10000000149011612).
 - **Method record:** `ras2fim-batch method` key `sloping_bounded_corners`,
   `native_parity_qualified: false`, basis "bit-identical to
   rasmapper-plain-sloping/1 at every corner whose plane fit lies within its
@@ -519,19 +522,29 @@ A sloping request may select an alternative instead:
   most (L - 1)/2 of the input range). Counts cover every corner group the
   profile reconstructs (the staged closure, or the whole mesh).
 - **Same-profile out-of-range test:** under the bounded method each profile
-  record also has `same_profile_out_of_range` for the rendered window: wet
-  pixels whose painted WSE exceeds, by more than 0.72 (0.5 plus the largest
-  measured face-over-cell rebuild excess, 0.22; WSE units, calibrated in ft),
-  the highest WSE at that profile of every physical cell feeding the owning
-  cell's corner fits. A painted value is a convex combination of its cell's
-  corners, so such a pixel can only come from an out-of-range fit; under the
-  bound the count is expected to be 0.
+  record also has `same_profile_out_of_range` for the rendered window,
+  SPIKE-SWEEP's test: wet pixels whose painted WSE exceeds, by more than 0.72
+  (0.5 plus the largest measured face-over-cell rebuild excess, 0.22; WSE units,
+  calibrated in ft), the highest WSE at that profile of the owning cell and of
+  every physical cell on a face at any of its stencil vertices, wet or dry. A
+  painted value is a convex combination of its cell's corners, so such a pixel
+  can only come from an out-of-range fit; under the bound the count is expected
+  to be 0. The first-wet diagnostic uses the census definition instead: the wet
+  cells on either side of the group's input faces.
 - **Depth groups** accept the option in `model.options`; each frame carries the
   profile record and the report adds `sloping_method_id` and a
-  `corner_fit_bound` summary.
+  `corner_fit_bound` summary (profile-level counts once per source index;
+  out-of-range pixels summed over frames, so overlapping job windows count a
+  pixel once per window).
 - The option is part of the sloping options, so it enters the retained
   hydraulic cache key: native and bounded requests in one session never share a
-  reconstruction (`tests/bounded_corners.rs`).
+  reconstruction (`tests/bounded_corners.rs`). A bounded request plans one more
+  geometry-sized share of working memory (18 instead of 16) for its transient
+  per-vertex records and per-cell input maxima.
+- Native requests keep their Depth/WSE bits and their report method objects
+  (both pinned against the pre-change commit). The only native difference is
+  bookkeeping: a prepared profile is 16 bytes larger on 64-bit (144 instead of
+  128), so a retained hydraulic entry is charged 32 more bytes per mesh.
 
 Default-path evidence: `tests/bounded_corners.rs` renders the synthetic
 fixtures (plain, AOI, staged, slopingPretty with and without shallow reduction

@@ -102,8 +102,6 @@ pub fn method_record() -> Value {
     let mut record = json!({"method_id":METHOD,"request_schema":SCHEMA,"report_schema":REPORT_SCHEMA,
         "sinks":["grouped-geotiff","grouped-buffer"],"compression":["NONE","LZW"],
         "products":["depth_max"],"render_modes":["sloping"],"saved_timesteps_only":true,
-        "sloping_methods":["rasmapper-plain-sloping/1",crate::sloping::BOUNDED_METHOD_ID],
-        "corner_fit_bound":"model.options.corner_fit_bound selects the bounded method; each frame and the report carry its corner_fit_bound record",
         "aoi_mask":crate::aoi::METHOD,"local_spill":true,"max_inflight_profiles":1,
         "buffer_protocol":"ras-commander-depth-group-buffer/1",
         "staged_cells":crate::sloping_binary::STAGED_METHOD,
@@ -545,9 +543,10 @@ pub fn run_with_session(
     if let Some(bound) = req.model.options.corner_fit_bound {
         report["sloping_method_id"] = crate::sloping::BOUNDED_METHOD_ID.into();
         report["corner_fit_bound"] = json!({"method_id":crate::sloping::BOUNDED_METHOD_ID,
-            "mode":bound.mode,"tolerance":bound.tolerance,"bounded_corner_groups":0,
+            "mode":bound.mode,"tolerance":bound.tolerance_value(),"bounded_corner_groups":0,
             "out_of_range_margin":crate::sloping::INPUT_EXCESS_MARGIN,
             "out_of_range_pixels":0,"out_of_range_max_excess":null,
+            "out_of_range_scope":"summed over every frame (job window x source index); a pixel in overlapping job windows counts once per window",
             "profiles":[]});
     }
     crate::sink::write_json(&out.join("report.json"), &report)?;
@@ -695,6 +694,11 @@ pub fn run_with_session(
                             let profiles = summary["profiles"].as_array_mut().unwrap();
                             if !profiles.iter().any(|p| p["source_index"] == source_index) {
                                 let mut entry = record.clone();
+                                // Profile-level counts only; each frame keeps its
+                                // own window's out-of-range test.
+                                if let Some(map) = entry.as_object_mut() {
+                                    map.remove("same_profile_out_of_range");
+                                }
                                 entry["source_index"] = source_index.into();
                                 let bounded = record["bounded_corner_groups"].as_u64().unwrap();
                                 profiles.push(entry);

@@ -37,13 +37,37 @@ pub const BOUNDED_WITH_FACES_METHOD_ID: &str = "rasmapper-sloping-with-faces-bou
 /// Basis statement recorded with every bounded method record.
 pub const BOUNDED_BASIS: &str = "bit-identical to rasmapper-plain-sloping/1 at every corner whose plane fit lies within its inputs' range \u{b1} tolerance; flagged corners clamped";
 
-/// Corner-fit bound of [`BOUNDED_METHOD_ID`]. Both fields are required.
+/// Corner-fit bound of [`BOUNDED_METHOD_ID`]. Both fields are required;
+/// `"corner_fit_bound": null` is the same as absent (native).
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CornerFitBound {
     pub mode: CornerFitBoundMode,
-    /// Finite and >= 0, in the profile's WSE units. 0 is recommended.
+    /// Finite and >= 0, in the profile's WSE units. 0 is recommended. A
+    /// requested -0 is read as +0, and it is written as its shortest decimal.
+    #[serde(
+        deserialize_with = "read_tolerance",
+        serialize_with = "write_tolerance"
+    )]
     pub tolerance: f32,
+}
+
+fn read_tolerance<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    // IEEE: -0 + 0 is +0, every other value is unchanged.
+    Ok(<f32 as serde::Deserialize>::deserialize(d)? + 0.0)
+}
+
+fn write_tolerance<S: serde::Serializer>(tolerance: &f32, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_f64(shortest(*tolerance))
+}
+
+/// The binary32 value as the shortest decimal that reads back to it (0.1, not
+/// 0.10000000149011612), so reports echo the requested number.
+fn shortest(value: f32) -> f64 {
+    (value + 0.0)
+        .to_string()
+        .parse()
+        .unwrap_or(f64::from(value))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -53,10 +77,11 @@ pub enum CornerFitBoundMode {
     InputRange,
 }
 
-// Exact identity of the requested tolerance bits: a cache key, not arithmetic.
+// Identity of the requested tolerance (with -0 as +0): a cache key, not arithmetic.
 impl PartialEq for CornerFitBound {
     fn eq(&self, other: &Self) -> bool {
-        self.mode == other.mode && self.tolerance.to_bits() == other.tolerance.to_bits()
+        self.mode == other.mode
+            && (self.tolerance + 0.0).to_bits() == (other.tolerance + 0.0).to_bits()
     }
 }
 impl Eq for CornerFitBound {}
@@ -69,6 +94,16 @@ impl CornerFitBound {
             ));
         }
         Ok(())
+    }
+
+    /// The tolerance as reports write it (shortest decimal of the binary32).
+    pub fn tolerance_value(&self) -> f64 {
+        shortest(self.tolerance)
+    }
+
+    /// The request echo: `{"mode": ..., "tolerance": ...}`.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"mode": self.mode, "tolerance": self.tolerance_value()})
     }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -383,10 +418,10 @@ impl Mesh {
             let mut report = CornerBoundReport::default();
             let mut corners = Vec::with_capacity(bounded.len());
             let mut input_max = Vec::with_capacity(bounded.len());
-            for (values, maxima, corner_report) in bounded {
-                report.merge(&corner_report);
+            for (values, maximum, vertex) in bounded {
+                report.add_vertex(&vertex);
                 corners.push(values);
-                input_max.push(maxima);
+                input_max.push(maximum);
             }
             Ok((
                 Reconstruction { faces, corners },
@@ -426,6 +461,16 @@ impl CornerBoundReport {
         self.bounded_up + self.bounded_down + self.bounded_nonfinite
     }
 
+    fn add_vertex(&mut self, vertex: &VertexBound) {
+        self.groups_evaluated += u64::from(vertex.evaluated);
+        self.bounded_up += u64::from(vertex.up);
+        self.bounded_down += u64::from(vertex.down);
+        self.bounded_nonfinite += u64::from(vertex.nonfinite);
+        self.max_removed_overshoot = self.max_removed_overshoot.max(vertex.removed);
+        self.bounded_min_wet_input_depth_lt_0p1 += u64::from(vertex.shallow);
+        self.bounded_l_ge_3 += u64::from(vertex.l_ge_3);
+    }
+
     pub fn merge(&mut self, other: &Self) {
         self.groups_evaluated += other.groups_evaluated;
         self.bounded_up += other.bounded_up;
@@ -441,7 +486,7 @@ impl CornerBoundReport {
         serde_json::json!({
             "method_id": BOUNDED_METHOD_ID,
             "mode": bound.mode,
-            "tolerance": bound.tolerance,
+            "tolerance": bound.tolerance_value(),
             "corner_groups_evaluated": self.groups_evaluated,
             "bounded_corner_groups": self.bounded_corner_groups(),
             "bounded_up": self.bounded_up,
@@ -454,13 +499,28 @@ impl CornerBoundReport {
     }
 }
 
+/// One vertex's share of a [`CornerBoundReport`]: groups around one vertex fit
+/// easily in 16 bits, which keeps the transient per-vertex record small.
+#[derive(Clone, Copy, Debug, Default)]
+struct VertexBound {
+    evaluated: u16,
+    up: u16,
+    down: u16,
+    nonfinite: u16,
+    shallow: u16,
+    l_ge_3: u16,
+    removed: f64,
+}
+
 /// What a bounded reconstruction adds to the native one.
+#[derive(Clone, Debug)]
 pub struct BoundedCorners {
     pub report: CornerBoundReport,
-    /// Per vertex and ring slot: the highest WSE, at this profile, of any
-    /// physical cell on a face feeding that slot's corner fit (wet or dry);
-    /// negative infinity for a slot without inputs. Feeds [`input_excess`].
-    pub input_max: Vec<Vec<f32>>,
+    /// Per vertex: the highest WSE, at this profile, of every physical cell on
+    /// any face at the vertex (wet or dry; negative infinity without one), as
+    /// SPIKE-SWEEP's same-minute test bounds the corner fits there. Feeds
+    /// [`input_excess`].
+    pub input_max: Vec<f32>,
 }
 
 /// The profile a bounded reconstruction reads: only the profile being rendered.
@@ -485,61 +545,60 @@ impl BoundContext<'_> {
         regression: &Regression,
         inputs: &[GroupInput],
         faces: &[Face],
-        report: &mut CornerBoundReport,
+        report: &mut VertexBound,
     ) -> f32 {
         if inputs.len() < 3 {
             return value;
         }
-        report.groups_evaluated += 1;
+        report.evaluated += 1;
         let (lo, hi) = inputs.iter().fold(
             (f32::INFINITY, f32::NEG_INFINITY),
             |(lo, hi), &(_, z, _)| (lo.min(z), hi.max(z)),
         );
+        // The interval ends are the binary32 values a bounded corner takes, so a
+        // fit is flagged exactly when clamping changes it.
         let tolerance = f64::from(self.bound.tolerance);
-        let low = f64::from(lo) - tolerance;
-        let high = f64::from(hi) + tolerance;
-        let fit = f64::from(value);
+        let low = (f64::from(lo) - tolerance) as f32;
+        let high = (f64::from(hi) + tolerance) as f32;
         let bounded = if !value.is_finite() {
-            report.bounded_nonfinite += 1;
+            report.nonfinite += 1;
             // Native's own fallback for a zero determinant.
             (regression.z / regression.n as f64) as f32
-        } else if fit > high {
-            report.bounded_up += 1;
-            let bounded = high as f32;
-            report.max_removed_overshoot =
-                report.max_removed_overshoot.max(fit - f64::from(bounded));
-            bounded
-        } else if fit < low {
-            report.bounded_down += 1;
-            let bounded = low as f32;
-            report.max_removed_overshoot =
-                report.max_removed_overshoot.max(f64::from(bounded) - fit);
-            bounded
+        } else if value > high {
+            report.up += 1;
+            report.removed = report.removed.max(f64::from(value) - f64::from(high));
+            high
+        } else if value < low {
+            report.down += 1;
+            report.removed = report.removed.max(f64::from(low) - f64::from(value));
+            low
         } else {
             return value;
         };
         if self.min_wet_input_depth(inputs, faces) < 0.1 {
-            report.bounded_min_wet_input_depth_lt_0p1 += 1;
+            report.shallow += 1;
         }
         if regression.lebesgue_sum(inputs) >= 3.0 {
-            report.bounded_l_ge_3 += 1;
+            report.l_ge_3 += 1;
         }
         bounded
     }
 
-    /// Highest WSE of any physical cell on either side of the group's input
-    /// faces (wet or dry), as the same-profile out-of-range test reads it.
-    fn input_cell_max(&self, inputs: &[GroupInput], faces: &[Face]) -> f32 {
-        inputs
+    /// SPIKE-SWEEP's same-minute bound at a vertex: the highest WSE of every
+    /// physical cell on any face at the vertex, wet or dry.
+    fn vertex_cell_max(&self, corner: &Corner, faces: &[Face]) -> f32 {
+        corner
+            .faces
             .iter()
-            .flat_map(|&(_, _, f)| faces[f].cells)
+            .flat_map(|&f| faces[f].cells)
             .filter(|&c| !self.cells[c].virtual_cell)
             .map(|c| self.wse[c])
             .fold(f32::NEG_INFINITY, f32::max)
     }
 
     /// Shallowest depth among the wet (native plot tolerance) physical cells on
-    /// either side of the group's input faces; infinite when none is wet.
+    /// either side of the group's input faces (the census definition of
+    /// DEPTH-ANOMALY.md); infinite when none is wet.
     fn min_wet_input_depth(&self, inputs: &[GroupInput], faces: &[Face]) -> f32 {
         inputs
             .iter()
@@ -713,13 +772,13 @@ fn reconstruct_corner(
     faces: &[Face],
     values: &[FaceWater],
     bound: Option<&BoundContext<'_>>,
-) -> (Vec<f32>, Vec<f32>, CornerBoundReport) {
-    let mut report = CornerBoundReport::default();
+) -> (Vec<f32>, f32, VertexBound) {
+    let mut report = VertexBound::default();
     let mut output = vec![NODATA; corner.faces.len()];
-    // Bounded only: the same-profile input maximum of each slot's fit.
-    let mut input_max = match bound {
-        None => Vec::new(),
-        Some(_) => vec![f32::NEG_INFINITY; corner.faces.len()],
+    // Bounded only: the same-profile bound of the corner fits at this vertex.
+    let input_max = match bound {
+        None => f32::NEG_INFINITY,
+        Some(context) => context.vertex_cell_max(corner, faces),
     };
     if corner
         .faces
@@ -781,18 +840,7 @@ fn reconstruct_corner(
             let value = regression.solve();
             let value = match bound {
                 None => value,
-                Some(context) => {
-                    let maximum = context.input_cell_max(&inputs, faces);
-                    current = first;
-                    loop {
-                        input_max[current] = maximum;
-                        current = corner.ccw[current];
-                        if current == stop {
-                            break;
-                        }
-                    }
-                    context.apply(value, &regression, &inputs, faces, &mut report)
-                }
+                Some(context) => context.apply(value, &regression, &inputs, faces, &mut report),
             };
             current = first;
             loop {
@@ -1269,9 +1317,15 @@ pub struct PreparedProfile {
     horizontal: Vec<Option<f32>>,
     wet: Vec<bool>,
     options: Options,
-    corner_bound: Option<CornerBoundReport>,
-    /// Bounded only: per cell, the highest same-profile WSE of any physical
-    /// cell feeding its stencil's corner fits (see [`input_excess`]).
+    /// Bounded only (boxed: a native profile grows by one pointer).
+    bounded: Option<Box<BoundedProfile>>,
+}
+
+/// The bounded method's per-profile additions.
+struct BoundedProfile {
+    report: CornerBoundReport,
+    /// Per cell: the highest same-profile WSE of the cell and of every physical
+    /// cell on a face at any of its stencil's vertices (see [`input_excess`]).
     input_max: Vec<f32>,
 }
 
@@ -1288,7 +1342,9 @@ impl PreparedProfile {
             + nested(&self.depth_weights)
             + self.horizontal.capacity() * std::mem::size_of::<Option<f32>>()
             + self.wet.capacity()
-            + self.input_max.capacity() * 4) as u64
+            + self.bounded.as_ref().map_or(0, |b| {
+                std::mem::size_of::<BoundedProfile>() + b.input_max.capacity() * 4
+            })) as u64
     }
     /// A staged mesh without owner cells: rendering reads none of its cells.
     pub(crate) fn unread(options: Options) -> Self {
@@ -1299,15 +1355,17 @@ impl PreparedProfile {
             horizontal: Vec::new(),
             wet: Vec::new(),
             options,
-            corner_bound: options
-                .corner_fit_bound
-                .map(|_| CornerBoundReport::default()),
-            input_max: Vec::new(),
+            bounded: options.corner_fit_bound.map(|_| {
+                Box::new(BoundedProfile {
+                    report: CornerBoundReport::default(),
+                    input_max: Vec::new(),
+                })
+            }),
         }
     }
     /// The corner-fit bound record of this profile; `None` for native options.
     pub fn corner_bound_report(&self) -> Option<&CornerBoundReport> {
-        self.corner_bound.as_ref()
+        self.bounded.as_ref().map(|b| &b.report)
     }
     /// Native wet gate of a cell: WSE above its minimum plus the plot tolerance.
     pub fn is_wet(&self, cell: usize) -> bool {
@@ -1345,26 +1403,34 @@ pub fn prepare_profile_with_options(
     }
     let (reconstructed, bounded) =
         mesh.reconstruct_with_bound(values, tolerance, pool, options.corner_fit_bound)?;
-    let (corner_bound, input_max) = match bounded {
-        None => (None, Vec::new()),
-        Some(bounded) => {
-            let maxima = &bounded.input_max;
-            let input_max = pool.install(|| {
-                stencils
-                    .par_iter()
-                    .map(|s| match s {
+    let bounded = bounded.map(|bounded| {
+        let maxima = &bounded.input_max;
+        let input_max = pool.install(|| {
+            stencils
+                .par_iter()
+                .enumerate()
+                .map(|(cell, s)| {
+                    let own = if mesh.cells[cell].virtual_cell {
+                        f32::NEG_INFINITY
+                    } else {
+                        values[cell]
+                    };
+                    match s {
                         Some(s) => s
                             .corners
                             .iter()
-                            .map(|&[vertex, slot]| maxima[vertex][slot])
-                            .fold(f32::NEG_INFINITY, f32::max),
-                        None => f32::NEG_INFINITY,
-                    })
-                    .collect()
-            });
-            (Some(bounded.report), input_max)
-        }
-    };
+                            .map(|&[vertex, _]| maxima[vertex])
+                            .fold(own, f32::max),
+                        None => own,
+                    }
+                })
+                .collect()
+        });
+        Box::new(BoundedProfile {
+            report: bounded.report,
+            input_max,
+        })
+    });
     let local_values: Vec<Vec<f32>> = pool.install(|| {
         stencils
             .par_iter()
@@ -1449,8 +1515,7 @@ pub fn prepare_profile_with_options(
         horizontal,
         wet,
         options,
-        corner_bound,
-        input_max,
+        bounded,
     })
 }
 
@@ -1459,9 +1524,10 @@ pub fn prepare_profile_with_options(
 pub const INPUT_EXCESS_MARGIN: f64 = 0.72;
 
 /// The same-profile out-of-range test of one rendered window (bounded method
-/// only): a wet pixel is out of range when its painted WSE exceeds, by more than
-/// [`INPUT_EXCESS_MARGIN`], the highest WSE at that profile of every physical
-/// cell feeding its owning cell's corner fits. A painted value is a convex
+/// only), SPIKE-SWEEP's test: a wet pixel is out of range when its painted WSE
+/// exceeds, by more than [`INPUT_EXCESS_MARGIN`], the highest WSE at that
+/// profile of its owning cell and of every physical cell on a face at any of
+/// that cell's stencil vertices (wet or dry). A painted value is a convex
 /// combination of its cell's corners, so a value above every such input can
 /// only come from a corner fit outside its inputs' range.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1489,10 +1555,7 @@ pub fn input_excess(
     wse: &[f32],
     start: usize,
 ) -> Option<InputExcess> {
-    if profiles
-        .iter()
-        .any(|p| p.options.corner_fit_bound.is_none())
-    {
+    if profiles.iter().any(|p| p.bounded.is_none()) {
         return None;
     }
     let mut result = InputExcess {
@@ -1506,7 +1569,11 @@ pub fn input_excess(
             continue;
         }
         let [mesh, cell] = window.owner_cells[label - 1];
-        let Some(&limit) = profiles[mesh].input_max.get(cell) else {
+        let Some(&limit) = profiles[mesh]
+            .bounded
+            .as_ref()
+            .and_then(|b| b.input_max.get(cell))
+        else {
             continue;
         };
         result.wet_pixels += 1;
@@ -2470,8 +2537,7 @@ mod boundary_surface_tests {
             horizontal: vec![None],
             wet: vec![true],
             options: Options::default(),
-            corner_bound: None,
-            input_max: Vec::new(),
+            bounded: None,
         }];
         let owners = vec![1; 513 * 257];
         let ground: Vec<_> = (0..owners.len())
@@ -2573,8 +2639,7 @@ mod boundary_surface_tests {
             horizontal: vec![None],
             wet: vec![true],
             options: Options::default(),
-            corner_bound: None,
-            input_max: Vec::new(),
+            bounded: None,
         };
         (vec![vec![Some(stencil)]], vec![profile])
     }
@@ -2860,7 +2925,7 @@ mod bounded_corner_tests {
     fn run(
         fixture: &(Corner, Vec<Face>, Vec<FaceWater>, Vec<Cell>, Vec<f32>),
         bound: Option<CornerFitBound>,
-    ) -> (Vec<f32>, Vec<f32>, CornerBoundReport) {
+    ) -> (Vec<f32>, f32, CornerBoundReport) {
         let (corner, faces, values, cells, wse) = fixture;
         let context = bound.map(|bound| BoundContext {
             bound,
@@ -2868,7 +2933,11 @@ mod bounded_corner_tests {
             wse,
             plot_tolerance: 0.001,
         });
-        reconstruct_corner(0, corner, faces, values, context.as_ref())
+        let (values, maximum, vertex) =
+            reconstruct_corner(0, corner, faces, values, context.as_ref());
+        let mut report = CornerBoundReport::default();
+        report.add_vertex(&vertex);
+        (values, maximum, report)
     }
 
     fn bits(values: &[f32]) -> Vec<u32> {
@@ -2886,7 +2955,7 @@ mod bounded_corner_tests {
             bits(&native),
             bits(&[spike, inside, inside, inside, NODATA, spike])
         );
-        assert!(maxima.is_empty());
+        assert_eq!(maxima, f32::NEG_INFINITY);
         assert_eq!(report, CornerBoundReport::default());
 
         let (zero, maxima, report) = run(&fixture, Some(bounded(0.0)));
@@ -2906,12 +2975,9 @@ mod bounded_corner_tests {
         // First wetting: the shallowest wet input cell is 0.0012 ft deep.
         assert_eq!(report.bounded_min_wet_input_depth_lt_0p1, 1);
         assert_eq!(report.bounded_l_ge_3, 1);
-        // Same-profile input maximum of both fits: cell 37830, dry, 2015.72.
-        let high = 2015.7213134765625_f32;
-        assert_eq!(
-            bits(&maxima),
-            bits(&[high, high, high, high, f32::NEG_INFINITY, high])
-        );
+        // SPIKE-SWEEP's same-minute bound at the vertex: every physical cell on a
+        // face there, wet or dry; here cell 37830, dry at its minimum, 2015.72.
+        assert_eq!(maxima.to_bits(), 2015.7213134765625_f32.to_bits());
 
         let (half, _, _) = run(&fixture, Some(bounded(0.5)));
         let lifted = 2014.52734375_f32;
@@ -2978,24 +3044,57 @@ mod bounded_corner_tests {
             plot_tolerance: 0.001,
         };
         let mean = ((10.0_f64 + 11.0 + 13.0) / 3.0) as f32;
-        for fit in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+        let total = |vertex: &VertexBound| {
             let mut report = CornerBoundReport::default();
-            let value = context.apply(fit, &regression, &inputs, &faces, &mut report);
+            report.add_vertex(vertex);
+            report
+        };
+        for fit in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let mut vertex = VertexBound::default();
+            let value = context.apply(fit, &regression, &inputs, &faces, &mut vertex);
             assert_eq!(value.to_bits(), mean.to_bits());
+            let report = total(&vertex);
             assert_eq!(report.bounded_nonfinite, 1);
             assert_eq!(report.max_removed_overshoot, 0.0);
         }
         // An in-range fit keeps its exact bits.
-        let mut report = CornerBoundReport::default();
-        let value = context.apply(12.5, &regression, &inputs, &faces, &mut report);
+        let mut vertex = VertexBound::default();
+        let value = context.apply(12.5, &regression, &inputs, &faces, &mut vertex);
         assert_eq!(value.to_bits(), 12.5_f32.to_bits());
-        assert_eq!(report.bounded_corner_groups(), 0);
-        assert_eq!(report.groups_evaluated, 1);
+        assert_eq!(total(&vertex).bounded_corner_groups(), 0);
+        assert_eq!(total(&vertex).groups_evaluated, 1);
         // Fewer than three inputs are never tested.
-        let mut report = CornerBoundReport::default();
-        let value = context.apply(f32::NAN, &regression, &inputs[..2], &faces, &mut report);
+        let mut vertex = VertexBound::default();
+        let value = context.apply(f32::NAN, &regression, &inputs[..2], &faces, &mut vertex);
         assert!(value.is_nan());
-        assert_eq!(report, CornerBoundReport::default());
+        assert_eq!(total(&vertex), CornerBoundReport::default());
+        // A fit within one binary32 step above the exact bound is not flagged:
+        // the interval ends are the binary32 values a bounded corner would take.
+        let tight = BoundContext {
+            bound: bounded(0.01),
+            cells: &cells,
+            wse: &wse,
+            plot_tolerance: 0.001,
+        };
+        let end = (13.0_f64 + f64::from(0.01_f32)) as f32;
+        let mut vertex = VertexBound::default();
+        let value = tight.apply(end, &regression, &inputs, &faces, &mut vertex);
+        assert_eq!(value.to_bits(), end.to_bits());
+        assert_eq!(total(&vertex).bounded_corner_groups(), 0);
+        let above = f32::from_bits(end.to_bits() + 1);
+        let mut vertex = VertexBound::default();
+        let value = tight.apply(above, &regression, &inputs, &faces, &mut vertex);
+        assert_eq!(value.to_bits(), end.to_bits());
+        assert_eq!(total(&vertex).bounded_up, 1);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn native_profile_header_grows_by_sixteen_bytes() {
+        // 0.21.0: five vectors and three one-byte options, 128 bytes. Now the
+        // options carry the bound and the bounded data sit behind one pointer.
+        assert_eq!(std::mem::size_of::<PreparedProfile>(), 144);
+        assert_eq!(std::mem::size_of::<Options>(), 12);
     }
 
     #[test]
@@ -3031,6 +3130,23 @@ mod bounded_corner_tests {
             },
             Options::default()
         );
+        // -0 reads as +0 (one cache key); reports echo the requested decimal.
+        let read: CornerFitBound =
+            serde_json::from_str(r#"{"mode":"input_range","tolerance":-0.0}"#).unwrap();
+        assert_eq!(read.tolerance.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(bounded(-0.0), bounded(0.0));
+        assert_eq!(
+            serde_json::to_string(&bounded(0.1)).unwrap(),
+            r#"{"mode":"input_range","tolerance":0.1}"#
+        );
+        assert_eq!(bounded(0.1).to_json()["tolerance"], 0.1);
+        assert_eq!(
+            serde_json::to_string(&bounded(-0.0)).unwrap(),
+            r#"{"mode":"input_range","tolerance":0.0}"#
+        );
+        // `null` is the same as absent.
+        let null: Options = serde_json::from_str(r#"{"corner_fit_bound":null}"#).unwrap();
+        assert_eq!(null, Options::default());
     }
 
     /// The census of DEPTH-ANOMALY.md, written independently of
@@ -3162,8 +3278,10 @@ mod bounded_corner_tests {
                     plot_tolerance: 0.001,
                 };
                 let (native, _, _) = reconstruct_corner(0, &corner, &faces, &values, None);
-                let (result, _, report) =
+                let (result, _, vertex) =
                     reconstruct_corner(0, &corner, &faces, &values, Some(&context));
+                let mut report = CornerBoundReport::default();
+                report.add_vertex(&vertex);
                 let mut expected_flags = 0;
                 let mut expected_evaluated = 0;
                 for (slots, inputs) in census_groups(&corner, &faces, &values) {
@@ -3193,10 +3311,9 @@ mod bounded_corner_tests {
                             .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &z| {
                                 (a.min(z), b.max(z))
                             });
-                        if !v.is_finite()
-                            || f64::from(v) > f64::from(hi) + f64::from(tolerance)
-                            || f64::from(v) < f64::from(lo) - f64::from(tolerance)
-                        {
+                        let low = (f64::from(lo) - f64::from(tolerance)) as f32;
+                        let high = (f64::from(hi) + f64::from(tolerance)) as f32;
+                        if !v.is_finite() || v > high || v < low {
                             expected_flags += 1;
                         }
                     }
@@ -3227,8 +3344,12 @@ mod bounded_corner_tests {
                 corner_fit_bound: bound,
                 ..Options::default()
             },
-            corner_bound: bound.map(|_| CornerBoundReport::default()),
-            input_max: if bound.is_some() { vec![limit] } else { vec![] },
+            bounded: bound.map(|_| {
+                Box::new(BoundedProfile {
+                    report: CornerBoundReport::default(),
+                    input_max: vec![limit],
+                })
+            }),
         };
         let owner = [1_u32, 1, 0, 1];
         let terrain = [0.0_f32; 4];

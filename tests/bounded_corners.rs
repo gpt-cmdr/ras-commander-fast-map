@@ -569,22 +569,25 @@ fn default_renders() -> Vec<(String, Vec<String>)> {
             )),
         ),
     ] {
-        let (_, bytes) = m.run(&request, name).unwrap();
-        renders.push((name.to_string(), bytes.iter().map(|b| fnv(b)).collect()));
+        let (report, bytes) = m.run(&request, name).unwrap();
+        let mut hashes: Vec<String> = bytes.iter().map(|b| fnv(b)).collect();
+        // The report's method object (no engine identity in it) is pinned too.
+        hashes.push(fnv(&serde_json::to_vec(&report["method"]).unwrap()));
+        renders.push((name.to_string(), hashes));
     }
-    let (_, rasters) = groups(&m, m.request(None, json!({})), "groups");
-    renders.push((
-        "depth-groups".into(),
-        rasters
-            .iter()
-            .map(|r| fnv(&r.iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<_>>()))
-            .collect(),
-    ));
+    let (report, rasters) = groups(&m, m.request(None, json!({})), "groups");
+    let mut hashes: Vec<String> = rasters
+        .iter()
+        .map(|r| fnv(&r.iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<_>>()))
+        .collect();
+    hashes.push(fnv(&serde_json::to_vec(&report["method"]).unwrap()));
+    renders.push(("depth-groups".into(), hashes));
     renders
 }
 
 /// Recorded with this file's fixture at the pre-change commit 85ad9be
-/// (`FAST_MAP_PRINT_GOLDEN=1 cargo test --test bounded_corners golden`).
+/// (`FAST_MAP_PRINT_GOLDEN=1 cargo test --test bounded_corners golden`): the
+/// Depth/WSE files of both profiles and the report's method object.
 const GOLDEN: &[(&str, &[&str])] = &[
     (
         "plain",
@@ -593,6 +596,7 @@ const GOLDEN: &[(&str, &[&str])] = &[
             "1d11b07dbe15eded:5120",
             "d69886a100ac10d7:5120",
             "2a078e6cbb1e3925:5120",
+            "ec5f95f3ada9f201:3566",
         ],
     ),
     (
@@ -602,6 +606,7 @@ const GOLDEN: &[(&str, &[&str])] = &[
             "0003b3ace1be345f:5120",
             "88f95d4f9e7cbb45:5120",
             "c0fdf78f5f3ebf68:5120",
+            "ec5f95f3ada9f201:3566",
         ],
     ),
     (
@@ -611,6 +616,7 @@ const GOLDEN: &[(&str, &[&str])] = &[
             "0003b3ace1be345f:5120",
             "88f95d4f9e7cbb45:5120",
             "c0fdf78f5f3ebf68:5120",
+            "ec5f95f3ada9f201:3566",
         ],
     ),
     (
@@ -620,6 +626,7 @@ const GOLDEN: &[(&str, &[&str])] = &[
             "d41c3764dd87327e:5120",
             "2d9084380f0293ea:5120",
             "eba817a415110196:5120",
+            "f699937ae02d548b:3531",
         ],
     ),
     (
@@ -629,6 +636,7 @@ const GOLDEN: &[(&str, &[&str])] = &[
             "cd1bbc76e460aae3:5120",
             "7fdf67cedc7c9094:5120",
             "a0838780c488aedd:5120",
+            "7abfebfc4c868c95:3544",
         ],
     ),
     (
@@ -637,6 +645,7 @@ const GOLDEN: &[(&str, &[&str])] = &[
             "275f950d49fadf60:2560",
             "e940d9923a48b76d:2560",
             "1bdb457c7e937f86:2304",
+            "a076107e398e76d7:1946",
         ],
     ),
 ];
@@ -742,7 +751,7 @@ fn bound_changes_only_cells_with_a_bounded_corner() {
             .collect::<Vec<_>>()
     };
     let ring = spike_cells();
-    for (tolerance, expected_change) in [(0.0, true), (0.5, true)] {
+    for tolerance in [0.0, 0.5] {
         let name = format!("bounded-{tolerance}");
         let (report, bounded) = m
             .run(&no_aoi(m.request(None, bound(tolerance))), &name)
@@ -782,7 +791,10 @@ fn bound_changes_only_cells_with_a_bounded_corner() {
                 }
             }
         }
-        assert_eq!(changed > 0, expected_change);
+        assert!(
+            changed > 0,
+            "tolerance {tolerance}: the bounded corner changes pixels"
+        );
     }
 }
 
@@ -890,6 +902,9 @@ fn bounded_requests_are_refused_before_any_read() {
     let mut reduced = with(bound(0.0));
     reduced["reduce_max"] = true.into();
     refused(reduced, "velocity, derived products");
+    let mut face_velocity = with(bound(0.0));
+    face_velocity["profiles"][0]["face_velocity_files"] = json!(["velocity.bin"]);
+    refused(face_velocity, "velocity, derived products");
 }
 
 #[test]
@@ -907,6 +922,14 @@ fn depth_groups_carry_the_bound_and_its_records() {
     assert_eq!(summary["out_of_range_pixels"], 0, "{summary}");
     let profiles = summary["profiles"].as_array().unwrap();
     assert_eq!(profiles.len(), 2);
+    for profile in profiles {
+        // Window-specific tests stay on the frames.
+        assert!(
+            profile.get("same_profile_out_of_range").is_none(),
+            "{profile}"
+        );
+    }
+    assert!(summary["out_of_range_scope"].is_string());
     for job in report["jobs"].as_array().unwrap() {
         for group in job["groups"].as_array().unwrap() {
             for frame in group["frames"].as_array().unwrap() {
@@ -936,5 +959,62 @@ fn depth_groups_carry_the_bound_and_its_records() {
     assert!(
         error.to_string().contains("with-faces-bounded-corners"),
         "{error}"
+    );
+}
+
+/// Profile 1 with an upward first-wetting spike at the bowed vertex: both
+/// north cells barely wet, the south cells dry.
+fn upward(m: &Model) -> Vec<f32> {
+    let mut wse = m.profiles[1].clone();
+    let (i, j) = (SPIKE_I, SPIKE_J);
+    for (cell, depth) in [
+        (c(i - 1, j - 1), -0.2_f32),
+        (c(i, j - 1), -0.2),
+        (c(i - 1, j), 0.02),
+        (c(i, j), 0.02),
+    ] {
+        wse[cell] = m.minima[cell] + depth;
+    }
+    wse
+}
+
+#[test]
+fn out_of_range_test_fires_on_an_unbounded_upward_spike_and_not_once_bounded() {
+    let mut m = model_with([0, NX, 0, NY], false, false);
+    let wse = upward(&m);
+    write(m.dir(), "full-1.bin", le_f32(&wse));
+    m.profiles[1] = wse;
+    // f32::MAX bounds nothing, so the frame paints native corners.
+    let (wide, _) = m
+        .run(
+            &no_aoi(m.request(None, bound(f32::MAX as f64))),
+            "upward-wide",
+        )
+        .unwrap();
+    let record = &units(&wide)[1]["corner_fit_bound"];
+    assert_eq!(record["bounded_corner_groups"], 0, "{record}");
+    let fired = record["same_profile_out_of_range"]["out_of_range_pixels"]
+        .as_u64()
+        .unwrap();
+    assert!(fired > 0, "{record}");
+    assert!(
+        record["same_profile_out_of_range"]["max_excess"]
+            .as_f64()
+            .unwrap()
+            > 0.72
+    );
+    let (tight, _) = m
+        .run(&no_aoi(m.request(None, bound(0.0))), "upward-tight")
+        .unwrap();
+    let record = &units(&tight)[1]["corner_fit_bound"];
+    assert_eq!(record["bounded_up"], 1, "{record}");
+    assert_eq!(
+        record["same_profile_out_of_range"]["out_of_range_pixels"],
+        0
+    );
+    // Every other profile and record is unaffected.
+    assert_eq!(
+        units(&tight)[0]["corner_fit_bound"]["bounded_corner_groups"],
+        0
     );
 }

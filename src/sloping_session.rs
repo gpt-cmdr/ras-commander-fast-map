@@ -931,12 +931,6 @@ pub fn method_record() -> Value {
         "native_plot_tolerance":0.001_f32,"extra_depth_cutoff":null,
         "scope":"2D cells; plain cell-corner sloping; optional storage-area level pools; no 1D, slopingPretty or additional rendering options",
         "reuse":"geometry, terrio ownership and terrain prepared once; bounded Rayon pixel and reconstruction workers"});
-    // The opt-in method selected by `options.corner_fit_bound` (its own record:
-    // `sloping_bounded_corners`). This record's numerical contract is unchanged.
-    record["bounded_corners"] = json!({"method_id":sloping::BOUNDED_METHOD_ID,
-        "with_faces_method_id":sloping::BOUNDED_WITH_FACES_METHOD_ID,
-        "request_field":"options.corner_fit_bound","native_parity_qualified":false,
-        "discovery_key":"sloping_bounded_corners"});
     record["staged_cells"] = crate::sloping_binary::STAGED_METHOD.into();
     crate::crs::advertise(&mut record);
     record
@@ -980,7 +974,6 @@ pub fn bounded_method_record() -> Value {
         "derived_max",
         "shear_stress",
         "shear_stress_depth",
-        "bounded_corners",
     ] {
         map.remove(key);
     }
@@ -1013,7 +1006,7 @@ pub fn bounded_method_record() -> Value {
 fn selected_method(options: sloping::Options) -> Value {
     if let Some(bound) = options.corner_fit_bound {
         let mut record = bounded_method_record();
-        record["options"]["CornerFitBound"] = json!(bound);
+        record["options"]["CornerFitBound"] = bound.to_json();
         return record;
     }
     let mut record = method_record();
@@ -1449,6 +1442,10 @@ fn run_internal(
                 .checked_mul(
                     if req.options.render_mode == sloping::RenderMode::WithFaces {
                         20
+                    } else if req.options.corner_fit_bound.is_some() {
+                        // The bound's transient per-vertex records and per-cell
+                        // input maxima, within one more geometry-sized share.
+                        18
                     } else {
                         16
                     },
@@ -1649,6 +1646,10 @@ fn run_internal(
                 .checked_mul(
                     if req.options.render_mode == sloping::RenderMode::WithFaces {
                         20
+                    } else if req.options.corner_fit_bound.is_some() {
+                        // The bound's transient per-vertex records and per-cell
+                        // input maxima, within one more geometry-sized share.
+                        18
                     } else {
                         16
                     },
