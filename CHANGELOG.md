@@ -1,7 +1,51 @@
 # Changelog
 
-## Unreleased
+## 0.22.0 - 2026-11-21
 
+Release summary: an opt-in bounded corner fit for plain sloping maps (#60), the
+standalone native preparation crate `prepare/` (#59), which carries that bound
+(#62), and pull request CI on CLB self-hosted runners only (#58). Requests that 0.21.0 accepts keep their
+output bytes: the default `rasmapper-plain-sloping/1` and every other method ID,
+request schema, cache key and report method object are unchanged. Checked in
+#60: golden Depth/WSE and report method-object hashes recorded at the
+pre-change commit 85ad9be match, `tolerance` = `f32::MAX` renders the default
+bits, 11 retained native gates (HEC-RAS 6.6 RAS Mapper exports of two public
+example models) are 0 mask and 0 bit differences before and after, and 18
+before/after identity cases (slopingPretty options, a bridge plan) are
+byte-identical. The bounded method is new and not native-parity qualified.
+
+- **CI on CLB self-hosted runners only (#58).** `ci.yml` holds the `rust` and
+  `wheels` jobs (`build.yml` is folded in and removed) and runs them on the
+  `clb-ci-linux` and `clb-ci-windows` runner labels, with no GitHub-hosted
+  fallback; pull requests from forks do not run. `release.yml` calls `ci.yml`
+  through `workflow_call` for its build. The Linux wheel is now built without
+  Docker: maturin 1.15.0 links through zig 0.15.2 against glibc 2.28, so the
+  wheel is `manylinux_2_28` and its binary needs at most `GLIBC_2.28`; the SBOM
+  sanitizer accepts it. The tag-triggered publication jobs (`github-release`,
+  `pypi`, `crates`) still run on GitHub-hosted runners.
+- **Native preparation crate `prepare/` (#59).** `fast-map-prepare` writes the
+  `ras-commander-depth-groups-request/1` and every binary input it references
+  from a plan HDF, the mapping terrain, AOI polygons and saved-time groups,
+  byte-identical to ras-commander 0.124.0's Python preparation (commands
+  `prepare`, `worker`, `cells` and `version`; `worker` is a drop-in for
+  fim-commander's grouped-mapper worker). Cell polygons with invalid geometry
+  are repaired with GEOS 3.13.1, the release shapely 2.1.2 carries, through the
+  same GEOS calls in the same order. The crate has its own lock file and
+  `publish = false`: it is not part of the published crate or wheel, which
+  do not depend on GEOS, Python or ras-commander. Its CI (`prepare.yml`: fmt,
+  clippy, tests and a locked release build against GEOS 3.13.1) runs on the CLB
+  Linux runner only, and its artifact is the Linux binary with the GEOS 3.13.1
+  and C++ runtime libraries it was tested against. Parity evidence and the
+  refusals that differ from the Python preparation are in `prepare/README.md`.
+- **`prepare/` carries the bounded corner fit (#62).** The `worker` and
+  `prepare` commands take `controls.corner_fit_bound`, write it to the sloping
+  model as `options.corner_fit_bound` where fim-commander's Python worker
+  writes it, require an engine that advertises
+  `rasmapper-plain-sloping-bounded-corners/1`, and check the bounded record on
+  the engine report and every frame as fim-commander's
+  `check_corner_bound_report` does. Before this, the worker dropped the control
+  and mapped native corner fits under a bounded request. The worker now refuses
+  any control key it does not implement.
 - **Opt-in bounded corner fits: `rasmapper-plain-sloping-bounded-corners/1`.**
   New sloping option `options.corner_fit_bound = {"mode": "input_range",
   "tolerance": t}` (t required, finite, >= 0). A corner plane fit with three or
