@@ -7,6 +7,31 @@ use crate::MapError;
 
 pub const METHOD_ID: &str = "one-d-two-d-coverage-first-diagnostic/1";
 pub const STORAGE_METHOD_ID: &str = "one-d-two-d-storage-coverage-first-diagnostic/1";
+/// Opt-in storage composition in which physical 2D cell ownership precedes
+/// storage-area ownership, as RAS Mapper assigns map pixels.
+pub const STORAGE_TWO_D_PRECEDENCE_METHOD_ID: &str =
+    "one-d-two-d-storage-two-d-precedence-diagnostic/1";
+
+/// Method record of the opt-in `two_d_precedence` storage composition.
+///
+/// RAS Mapper's `RASGeometryMapPoints.ComputeForRaster` (source-verified in
+/// HEC-RAS 6.6, 7.0 and 7.0.1) rasterizes 2D flow-area cells first and marks
+/// each pixel it assigns; `RasterizeStorageAreas` then assigns only pixels that
+/// are still unmarked, and cross-section regions take what remains. A pixel
+/// centre inside both a 2D cell and a storage area therefore belongs to the 2D
+/// cell, wet or dry. This record states that rule; it is not native parity.
+pub fn storage_two_d_precedence_method_record() -> serde_json::Value {
+    serde_json::json!({"native_geotiff_outputs": true, "native_final_format": crate::one_d_delivery::capability(),
+        "method_id": STORAGE_TWO_D_PRECEDENCE_METHOD_ID, "experimental": true,
+        "native_parity_qualified": false,
+        "ownership": "caller-supplied global physical 2D and storage labels; 0 unowned, row index + 1 owned",
+        "precedence": "physical 2D cell ownership, wet or dry, precedes storage ownership; storage coverage then overrides XS before wet/dry filtering",
+        "precedence_source": "RAS Mapper RASGeometryMapPoints ComputeForRaster/ComputeForPoints order 2D -> storage -> XS with one shared assignment mask; source-verified 6.6, 7.0, 7.0.1",
+        "arithmetic": "copy selected Depth/WSE Float32 bits; no interpolation, maximum or wet-only fallback",
+        "scope": "aligned single-profile XS, 2D and storage products; storage pixels also owned by 2D cells are ceded to 2D and counted; no structure overrides",
+        "not_qualified": "native stored-map pixel parity for storage/2D overlap; storage-to-storage overlap ordering",
+        "preparation": "caller preserves global topology, storage polygon source ordering, hydraulic dependencies, terrain layout and CRS"})
+}
 
 pub fn storage_method_record() -> serde_json::Value {
     serde_json::json!({"native_geotiff_outputs": true, "native_final_format": crate::one_d_delivery::capability(),
@@ -60,6 +85,10 @@ pub struct StorageCounts {
     pub base: Counts,
     pub storage_owned_pixels: usize,
     pub dry_storage_suppressed_wet_xs: usize,
+    /// Storage-labelled pixels assigned to a 2D cell under `two_d_precedence`;
+    /// absent from the default composition report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_ceded_to_two_d_pixels: Option<usize>,
 }
 
 /// Explicit storage extension. Physical storage coverage suppresses XS even
@@ -77,6 +106,22 @@ pub fn compose_with_storage_into(
     compose_with_storage_at(0, owners, cell_count, xs, mesh, storage, depth, wse)
 }
 
+/// [`compose_with_storage_into`] with RAS Mapper ownership order: a pixel
+/// labelled by both a 2D cell and a storage area belongs to the 2D cell (see
+/// [`storage_two_d_precedence_method_record`]). Storage products at ceded
+/// pixels are ignored; every other check is unchanged.
+pub fn compose_with_storage_two_d_precedence_into(
+    owners: &[u32],
+    cell_count: usize,
+    xs: Products<'_>,
+    mesh: Products<'_>,
+    storage: Storage<'_>,
+    depth: &mut [f32],
+    wse: &mut [f32],
+) -> Result<StorageCounts, MapError> {
+    compose_storage_impl(0, owners, cell_count, xs, mesh, storage, depth, wse, true)
+}
+
 /// [`compose_with_storage_into`] over a chunk of a larger grid whose first
 /// pixel is `offset`: error messages name pixels of the whole grid.
 #[allow(clippy::too_many_arguments)]
@@ -89,6 +134,23 @@ pub(crate) fn compose_with_storage_at(
     storage: Storage<'_>,
     depth: &mut [f32],
     wse: &mut [f32],
+) -> Result<StorageCounts, MapError> {
+    compose_storage_impl(
+        offset, owners, cell_count, xs, mesh, storage, depth, wse, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compose_storage_impl(
+    offset: usize,
+    owners: &[u32],
+    cell_count: usize,
+    xs: Products<'_>,
+    mesh: Products<'_>,
+    storage: Storage<'_>,
+    depth: &mut [f32],
+    wse: &mut [f32],
+    two_d_precedence: bool,
 ) -> Result<StorageCounts, MapError> {
     let n = owners.len();
     if storage.area_count == 0
@@ -109,7 +171,7 @@ pub(crate) fn compose_with_storage_at(
         if owner as usize > storage.area_count
             || !valid_pair(storage.products.depth[i], storage.products.wse[i])
             || (owner == 0 && storage.products.depth[i].is_finite())
-            || (owner != 0 && owners[i] != 0)
+            || (owner != 0 && owners[i] != 0 && !two_d_precedence)
         {
             return Err(MapError::Invalid(format!(
                 "coupled storage pixel {}: invalid products, ownership or overlapping 2D coverage",
@@ -122,8 +184,16 @@ pub(crate) fn compose_with_storage_at(
         base,
         storage_owned_pixels: 0,
         dry_storage_suppressed_wet_xs: 0,
+        storage_ceded_to_two_d_pixels: two_d_precedence.then_some(0),
     };
     for (i, &owner) in storage.owners.iter().enumerate() {
+        if owner != 0 && owners[i] != 0 {
+            // Only reachable with two_d_precedence: the 2D product stands.
+            if let Some(ceded) = counts.storage_ceded_to_two_d_pixels.as_mut() {
+                *ceded += 1;
+            }
+            continue;
+        }
         if owner != 0 {
             counts.storage_owned_pixels += 1;
             counts.dry_storage_suppressed_wet_xs +=
