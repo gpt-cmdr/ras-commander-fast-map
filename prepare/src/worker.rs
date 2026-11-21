@@ -44,8 +44,35 @@ fn s<'a>(v: &'a Value, what: &str) -> Result<&'a str> {
         .ok_or_else(|| Error::invalid(format!("config {what} must be a string")))
 }
 
+/// Every control `map_depth_groups` writes. Any other key is refused, so a
+/// control added to the Python worker later cannot be dropped here unnoticed.
+const KNOWN_CONTROLS: [&str; 14] = [
+    "threads",
+    "max_memory_mib",
+    "max_working_mib",
+    "max_prepared_mib",
+    "memory_headroom_mib",
+    "max_profiles_per_batch",
+    "max_inflight_profiles",
+    "max_accumulator_mib",
+    "max_scratch_bytes",
+    "window_cache_mib",
+    "depth_cutoff_ft",
+    "compression",
+    "corner_fit_bound",
+    "stage_cell_subsets",
+];
+
 fn controls(config: &Value) -> Result<Controls> {
     let c = &config["controls"];
+    let keys = c
+        .as_object()
+        .ok_or_else(|| Error::invalid("config controls must be an object"))?;
+    if let Some(unknown) = keys.keys().find(|k| !KNOWN_CONTROLS.contains(&k.as_str())) {
+        return Err(Error::unsupported(format!(
+            "the native worker does not implement control {unknown:?}"
+        )));
+    }
     let u = |k: &str| {
         c[k].as_u64()
             .ok_or_else(|| Error::invalid(format!("controls.{k} must be an integer")))
@@ -68,6 +95,7 @@ fn controls(config: &Value) -> Result<Controls> {
         max_accumulator_mib: u("max_accumulator_mib")?,
         max_scratch_bytes: u("max_scratch_bytes")?,
         stage_cell_subsets: c["stage_cell_subsets"].as_bool().unwrap_or(false),
+        corner_fit_bound: crate::bound::validated(c.get("corner_fit_bound"))?,
         depth_cutoff_json: Some(c["depth_cutoff_ft"].clone()),
     })
 }
@@ -112,6 +140,12 @@ fn cohort_input(jobs: &[Value], config: &Value) -> Result<PrepareInput> {
         return Err(Error::engine(
             "Configurable windows require multi_window_cache capability",
         ));
+    }
+    let controls = controls(config)?;
+    if controls.corner_fit_bound.is_some() {
+        // `map_depth_groups` gates the engine before any worker starts; repeated
+        // here so the worker never sends a bounded request to an older engine.
+        crate::bound::require_bounded_engine(&config["engine"]["method"])?;
     }
     let engine_path = PathBuf::from(s(&config["engine"]["engine_path"], "engine.engine_path")?);
     let mut sources = vec![Source {
@@ -177,7 +211,7 @@ fn cohort_input(jobs: &[Value], config: &Value) -> Result<PrepareInput> {
         hdf_path: PathBuf::from(s(&first["hdf_path"], "hdf_path")?),
         terrain_path: PathBuf::from(s(&first["terrain_path"], "terrain_path")?),
         jobs: normal,
-        controls: controls(config)?,
+        controls,
         invalid_cells: s(&options["invalid_cells"], "options.invalid_cells")?.to_string(),
         persistent_session: config["engine"]["method"]["sloping"]["persistent_session"] == true,
         wse_tiles: config.get("wse_tiles").cloned(),
@@ -566,6 +600,7 @@ fn run_prepared(
         &depth_units,
         &input.controls.compression,
     )?;
+    crate::bound::check_report(&report, input.controls.corner_fit_bound.as_ref())?;
     let factor = if depth_units == "metres" { 0.3048 } else { 1.0 };
     let threshold = f64::from((input.controls.depth_cutoff_ft * factor) as f32);
     if report["effective_cutoff"].as_f64() != Some(threshold) {

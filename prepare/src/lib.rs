@@ -10,6 +10,7 @@
 //! 3.13.1, the release shapely 2.1.2 carries.
 
 pub mod aoi;
+pub mod bound;
 pub mod cells;
 pub mod cohort;
 pub mod crs;
