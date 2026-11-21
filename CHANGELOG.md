@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Opt-in storage/2D overlap composition: `one-d-two-d-storage-two-d-precedence-diagnostic/1`.**
+  A coupled schema /2 storage component may set `"two_d_precedence": true`.
+  A pixel labelled by both a 2D cell and a storage area then belongs to the 2D
+  cell, wet or dry, and the report counts it as `storage_ceded_to_two_d_pixels`.
+  This is RAS Mapper's ownership order: `RASGeometryMapPoints.ComputeForRaster`
+  and `ComputeForPoints` assign 2D cells first and storage areas take only
+  unassigned pixels (source-verified in HEC-RAS 6.6, 7.0 and 7.0.1). Without
+  the flag the overlap is still refused, and the requests, reports and
+  Depth/WSE bits match 0.21.0. Discovery key
+  `coupled_storage_two_d_precedence_diagnostic`
+  (`native_parity_qualified: false`). Native stored-map pixel parity for
+  overlap pixels and storage-to-storage overlap stay unqualified.
+
 - **Opt-in bounded corner fits: `rasmapper-plain-sloping-bounded-corners/1`.**
   New sloping option `options.corner_fit_bound = {"mode": "input_range",
   "tolerance": t}` (t required, finite, >= 0). A corner plane fit with three or
