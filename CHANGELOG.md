@@ -49,8 +49,8 @@ byte-identical. The bounded method is new and not native-parity qualified.
   carries a bound under a native request. Before this, the worker dropped the
   control and mapped native corner fits under a bounded request. The worker
   now refuses any control key it does not implement, and a nonzero tolerance
-  below 1e-4 or from 1e16 up (Python would write it with an exponent, so the
-  request bytes would differ).
+  below 1e-4 (Python would write it with an exponent, so the request bytes
+  would differ).
 - **Opt-in bounded corner fits: `rasmapper-plain-sloping-bounded-corners/1`
   (#60).**
   New sloping option `options.corner_fit_bound = {"mode": "input_range",
