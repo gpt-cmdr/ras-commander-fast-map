@@ -22,11 +22,11 @@ const F32_MAX: f64 = f32::MAX as f64;
 /// with finite `0 <= t <= f32::MAX`; `-0` is `+0`, an integer tolerance becomes a
 /// float, as Python's `float(tolerance) + 0.0` writes it.
 ///
-/// One refusal of its own: a nonzero tolerance below 1e-4 or from 1e16 up.
-/// Python writes such floats with an exponent (`1e-05`, `1e+16`) and this
-/// crate's JSON writer writes them differently (`1e-5`, `1e16`), so the request
-/// bytes would differ from the Python worker's. Every decimal-notation value is
-/// written identically (shortest round-trip digits in both).
+/// One refusal of its own: a nonzero tolerance below 1e-4. Python writes such a
+/// float with an exponent (`1e-05`) while this crate's JSON writer writes it in
+/// decimal (`0.00001`), so the request bytes would differ from the Python
+/// worker's. From 1e-4 up both write the same text (shortest round-trip digits;
+/// `1e+16` and `3.4028234663852886e+38` included), pinned by the tests below.
 pub fn validated(value: Option<&Value>) -> Result<Option<Value>> {
     let value = match value {
         None | Some(Value::Null) => return Ok(None),
@@ -52,12 +52,23 @@ pub fn validated(value: Option<&Value>) -> Result<Option<Value>> {
             ));
         }
     };
-    if t != 0.0 && !(1e-4..1e16).contains(&t) {
+    if t != 0.0 && t < 1e-4 {
         return Err(Error::unsupported(
-            "corner_fit_bound tolerance must be 0 or within [1e-4, 1e16) for the native worker",
+            "corner_fit_bound tolerance must be 0 or at least 1e-4 for the native worker",
         ));
     }
     Ok(Some(json!({"mode": "input_range", "tolerance": t})))
+}
+
+/// The sloping model's `options.corner_fit_bound`, as `_cohort` writes it. Called on
+/// the model before `window_cache_bytes` is added, so with `preserve_order` the key
+/// lands where Python's dict puts it: after `max_working_bytes`, before
+/// `window_cache_bytes`. Absent (native): the model, and so the request bytes,
+/// are unchanged.
+pub fn insert_model_option(model: &mut Value, bound: Option<&Value>) {
+    if let Some(bound) = bound {
+        model["options"] = json!({"corner_fit_bound": bound});
+    }
 }
 
 /// `require_bounded_engine`: the engine advertises the bounded method on every
@@ -187,8 +198,8 @@ mod tests {
                 "{bad}"
             );
         }
-        for exponent in [1e-5, 1e16, 3.0e38] {
-            let bound = json!({"mode": "input_range", "tolerance": exponent});
+        for tiny in [1e-5, 9.99e-5, 1e-300, 5e-324] {
+            let bound = json!({"mode": "input_range", "tolerance": tiny});
             assert_eq!(validated(Some(&bound)).unwrap_err().kind, Kind::Unsupported);
         }
     }
@@ -203,12 +214,58 @@ mod tests {
             (1.0, "1.0"),
             (2.5e15, "2500000000000000.0"),
             (9999999999999998.0, "9999999999999998.0"),
+            // Python's exponent form from 1e16 up, which this writer matches.
+            (1e16, "1e+16"),
+            (1.5e20, "1.5e+20"),
+            (f64::from(f32::MAX), "3.4028234663852886e+38"),
         ] {
             let bound = validated(Some(&json!({"mode": "input_range", "tolerance": value})))
                 .unwrap()
                 .unwrap();
             assert_eq!(serde_json::to_string(&bound["tolerance"]).unwrap(), python);
         }
+    }
+
+    #[test]
+    fn the_option_lands_where_python_puts_it() {
+        // `_cohort`'s model keys up to `max_working_bytes`, then `options`, then
+        // `window_cache_bytes` (assigned after `plan_window_cache`).
+        let keys = [
+            "schema",
+            "terrain",
+            "epsg",
+            "crs_identity",
+            "terrain_transform",
+            "window",
+            "geometry_file",
+            "mesh_files",
+            "owner_cells",
+            "staged_cells_files",
+            "profiles",
+            "threads",
+            "max_inflight_profiles",
+            "max_working_bytes",
+        ];
+        let mut model = Value::Object(keys.iter().map(|k| (k.to_string(), json!(0))).collect());
+        let native = serde_json::to_string_pretty(&model).unwrap();
+        let mut unchanged = model.clone();
+        insert_model_option(&mut unchanged, None);
+        assert_eq!(serde_json::to_string_pretty(&unchanged).unwrap(), native);
+        let bound = validated(Some(&json!({"mode": "input_range", "tolerance": 0.0}))).unwrap();
+        insert_model_option(&mut model, bound.as_ref());
+        model["window_cache_bytes"] = json!(0);
+        let order: Vec<&str> = model
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(&order[..14], &keys[..]);
+        assert_eq!(&order[14..], &["options", "window_cache_bytes"]);
+        assert_eq!(
+            serde_json::to_string(&model["options"]).unwrap(),
+            r#"{"corner_fit_bound":{"mode":"input_range","tolerance":0.0}}"#
+        );
     }
 
     fn engine(bounded: bool) -> Value {

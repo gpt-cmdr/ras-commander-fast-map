@@ -77,8 +77,8 @@ optional control), the request carries `model.options.corner_fit_bound`, inserte
 fim-commander's `check_corner_bound_report` checks it: the bounded record on the report and on
 every frame. Without the control (absent or `null`) the request bytes are unchanged and a report
 that carries a bound is refused. The bound is validated as `validated_bound` validates it, with
-one refusal of its own: a nonzero tolerance below 1e-4 or from 1e16 up, which Python writes with
-an exponent and this crate would write differently. A control key the worker does not know is
+one refusal of its own: a nonzero tolerance below 1e-4, which Python writes with an exponent
+(`1e-05`) and this crate would write in decimal. A control key the worker does not know is
 refused (`FimUnsupportedError`), so a control added to the Python worker cannot be dropped here.
 
 `cells` prints the ownership rows and invalid-cell record (`load_cells` + `require_cells`),
