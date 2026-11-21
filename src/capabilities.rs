@@ -26,12 +26,29 @@ pub fn engine_method_record() -> serde_json::Value {
         "horizontal": crate::horizontal::method_record(),
         "sloping": crate::sloping_session::method_record(),
         "sloping_native_grid":crate::sloping_session::native_grid_method_record(),
+        "sloping_bounded_corners":crate::sloping_session::bounded_method_record(),
         "depth_groups": crate::depth_groups::method_record(),
         "boundary": crate::boundary_session::method_record(),
         "native_boundary": crate::boundary_session::native_method_record(),
         "whole_simulation": crate::whole_simulation::method_record(),
         "effective_terrain": crate::effective_terrain::method_record()
     });
+    // Discovery-only pointers to the opt-in bounded corner fits: the default
+    // sloping and depth-groups records (which reports embed) stay unchanged.
+    registry["sloping"]["bounded_corners"] = serde_json::json!({
+        "method_id": crate::sloping::BOUNDED_METHOD_ID,
+        "with_faces_method_id": crate::sloping::BOUNDED_WITH_FACES_METHOD_ID,
+        "request_field": "options.corner_fit_bound",
+        "native_parity_qualified": false,
+        "discovery_key": "sloping_bounded_corners"
+    });
+    registry["depth_groups"]["sloping_methods"] = serde_json::json!([
+        "rasmapper-plain-sloping/1",
+        crate::sloping::BOUNDED_METHOD_ID
+    ]);
+    registry["depth_groups"]["corner_fit_bound"] = serde_json::json!(
+        "model.options.corner_fit_bound selects the bounded method; each frame and the report carry its corner_fit_bound record"
+    );
     // Methods whose own outputs are CRS-free raw arrays or whose terrain and
     // delivery fields already take crs_geokeys: the caller's CRS (any) is
     // carried unchanged (see `crs`).
@@ -151,6 +168,12 @@ pub fn engine_method_record() -> serde_json::Value {
         ),
         (
             "sloping",
+            crate::sloping_session::SCHEMA,
+            "sloping",
+            "mapping",
+        ),
+        (
+            "sloping_bounded_corners",
             crate::sloping_session::SCHEMA,
             "sloping",
             "mapping",

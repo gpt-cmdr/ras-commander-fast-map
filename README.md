@@ -475,6 +475,89 @@ integer-lattice operation and has a distinct clipping contract. Terrain
 modifications, face options, steady encroachment and blocked-obstruction
 polygons remain outside this method's admitted scope.
 
+## Bounded corner fits (opt-in, `rasmapper-plain-sloping-bounded-corners/1`)
+
+Plain sloping fits a least-squares plane through the face values around each
+facepoint and evaluates it at the facepoint. When the application points are
+nearly collinear and the facepoint lies off their line, the fit extrapolates
+far outside its inputs. Native HEC-RAS 6.6 RAS Mapper does the same: on nine
+stored maps of a rain-on-grid model (4,690 wet pixels) its WSE equals this engine's plain-sloping
+arithmetic bit for bit, corner-fit overshoots included (up to 49.75 ft above
+every same-minute input). The default method `rasmapper-plain-sloping/1` keeps
+that native behaviour unchanged.
+
+A sloping request may select an alternative instead:
+
+```json
+"options": {"corner_fit_bound": {"mode": "input_range", "tolerance": 0.0}}
+```
+
+- **Detection** (only the profile being rendered): a corner group with three or
+  more inputs whose fit lies outside [min(inputs) - tolerance, max(inputs) +
+  tolerance], or is not finite. A group is a run of faces around one facepoint
+  between unconnected faces; with one or two inputs native already returns an
+  input or their mean.
+- **Replacement:** the fit is clamped to the nearest end of that interval; a
+  non-finite fit becomes the mean of its inputs (native's zero-determinant
+  fallback). Every other corner keeps its native value exactly.
+- **Tolerance:** required, finite and >= 0, in WSE units; 0 is recommended.
+  Absent (or `null`) `corner_fit_bound` means native. A missing, negative or
+  non-finite tolerance, an unknown mode or field is refused before any read. The
+  interval ends are rounded to binary32 first, so a fit is bounded exactly when
+  clamping changes it; -0 is read as +0, and reports echo the tolerance as its
+  shortest decimal (0.1, not 0.10000000149011612).
+- **Method record:** `ras2fim-batch method` key `sloping_bounded_corners`,
+  `native_parity_qualified: false`, basis "bit-identical to
+  rasmapper-plain-sloping/1 at every corner whose plane fit lies within its
+  inputs' range ± tolerance; flagged corners clamped". The slopingPretty
+  variant `rasmapper-sloping-with-faces-bounded-corners/1` is reserved and
+  refused until it is qualified, as are velocity, derived products,
+  `reduce_max`, shear stress, boundary requests and the stored tile grid.
+- **Reports:** each profile record carries `corner_fit_bound`:
+  `corner_groups_evaluated`, `bounded_corner_groups` (= `bounded_up` +
+  `bounded_down` + `bounded_nonfinite`), `max_removed_overshoot`, and two
+  diagnostics of the bounded groups that never gate them:
+  `bounded_groups_min_wet_input_depth_lt_0p1` (first wetting) and
+  `bounded_groups_L_ge_3` (L = sum of the absolute fit weights; overshoot is at
+  most (L - 1)/2 of the input range). Counts cover every corner group the
+  profile reconstructs (the staged closure, or the whole mesh).
+- **Same-profile out-of-range test:** under the bounded method each profile
+  record also has `same_profile_out_of_range` for the rendered window,
+  a same-minute screen: wet pixels whose painted WSE exceeds, by more than 0.72
+  (0.5 plus the largest measured face-over-cell rebuild excess, 0.22; WSE units,
+  calibrated in ft), the highest WSE at that profile of the owning cell and of
+  every physical cell on a face at any of its stencil vertices, wet or dry. A
+  painted value is a convex combination of its cell's corners, so such a pixel
+  can only come from an out-of-range fit; under the bound with a tolerance of at
+  most 0.5 the count is expected to be 0 (a larger tolerance can legitimately
+  lift a corner past the margin). The first-wet diagnostic uses the census definition instead: the wet
+  cells on either side of the group's input faces.
+- **Depth groups** accept the option in `model.options`; each frame carries the
+  profile record and the report adds `sloping_method_id` and a
+  `corner_fit_bound` summary (profile-level counts once per source index;
+  out-of-range pixels summed over frames, so overlapping job windows count a
+  pixel once per window).
+- The option is part of the sloping options, so it enters the retained
+  hydraulic cache key: native and bounded requests in one session never share a
+  reconstruction (`tests/bounded_corners.rs`). A bounded request plans two more
+  geometry-sized shares of working memory (18 instead of 16) for its transient
+  per-vertex records and per-cell input maxima.
+- Native requests keep their Depth/WSE bits and their report method objects
+  (both pinned against the pre-change commit). The only native difference is
+  bookkeeping: a prepared profile is 16 bytes larger on 64-bit (144 instead of
+  128), so a retained hydraulic entry is charged 32 more bytes per mesh.
+
+Default-path evidence: `tests/bounded_corners.rs` renders the synthetic
+fixtures (plain, AOI, staged, slopingPretty with and without shallow reduction
+and depth weighting, depth groups) with hashes recorded at the pre-change
+commit; a bounded request with tolerance `f32::MAX` renders the default bits.
+The unit tests in `src/sloping.rs` use two recorded rings of that model, in
+facepoint-relative coordinates: a first-wetting output time (native
+2060.02587890625 ft from inputs 1994.41-2014.03 ft; bounded 2014.02734375 ft)
+and the summary Max profile (native
+1486.1566 ft, 266.1 ft below inputs 1752.26-1759.68 ft; bounded
+1752.2613525390625 ft).
+
 ## Velocity (sloping requests)
 
 Add per-mesh `velocity_normals_files` (HDF `Faces NormalUnitVector and Length`

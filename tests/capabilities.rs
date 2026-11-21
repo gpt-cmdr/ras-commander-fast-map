@@ -65,6 +65,10 @@ fn discovery_preserves_existing_registry_keys_and_method_ids() {
         ("one_d_clipped_diagnostic", "one-d-xs-surface-diagnostic/5"),
         ("horizontal", "horizontal-cell-constant/2"),
         ("sloping", "rasmapper-plain-sloping/1"),
+        (
+            "sloping_bounded_corners",
+            "rasmapper-plain-sloping-bounded-corners/1",
+        ),
         ("depth_groups", "masked-float32-depth-group-maximum/1"),
         ("whole_simulation", "native-whole-simulation-horizontal/1"),
         ("effective_terrain", "rasmapper-effective-terrain/2"),
@@ -174,6 +178,13 @@ fn capabilities_preserve_dispatch_schemas_flags_and_qualification_limits() {
             "scoped",
         ),
         (
+            "sloping_bounded_corners",
+            "ras-commander-sloping-request/1",
+            "sloping",
+            "mapping",
+            "unqualified",
+        ),
+        (
             "depth_groups",
             "ras-commander-depth-groups-request/1",
             "depth-groups",
@@ -250,6 +261,25 @@ fn capabilities_preserve_dispatch_schemas_flags_and_qualification_limits() {
         "7.0.1"
     );
     assert_eq!(sloping["flags"]["experimental"], true);
+    // The opt-in bounded method sits next to the unchanged default.
+    assert_eq!(
+        sloping["flags"]["bounded_corners"]["method_id"],
+        "rasmapper-plain-sloping-bounded-corners/1"
+    );
+    let bounded = entries
+        .iter()
+        .find(|entry| entry["key"] == "sloping_bounded_corners")
+        .unwrap();
+    assert_eq!(bounded["flags"]["native_parity_qualified"], false);
+    assert_eq!(
+        bounded["flags"]["basis"],
+        "bit-identical to rasmapper-plain-sloping/1 at every corner whose plane fit lies within its inputs' range \u{b1} tolerance; flagged corners clamped"
+    );
+    assert_eq!(
+        bounded["flags"]["with_faces_method_id"],
+        "rasmapper-sloping-with-faces-bounded-corners/1"
+    );
+    assert!(bounded["numerical_qualification"]["native_version"].is_null());
     let boundary = entries
         .iter()
         .find(|entry| entry["key"] == "boundary")
