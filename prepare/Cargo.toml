@@ -1,0 +1,40 @@
+[package]
+name = "ras-commander-fast-map-prepare"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+authors = ["CLB Engineering Corporation"]
+description = "Native preparation of HEC-RAS 2D plain-sloping depth-group requests for Fast-Map, value-identical to ras-commander 0.124.0"
+repository = "https://github.com/gpt-cmdr/ras-commander-fast-map"
+publish = false
+
+# Standalone: its own lock file, so the published fast-map crate and wheel are
+# unchanged. GEOS (C++, LGPL-2.1) is linked through geos-sys from a GEOS 3.13.1
+# build named by GEOS_LIB_DIR and GEOS_VERSION, the release shapely 2.1.2 carries.
+[workspace]
+
+[lib]
+name = "fast_map_prepare"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fast-map-prepare"
+path = "src/main.rs"
+
+[dependencies]
+ras-commander-fast-map = { path = ".." }
+ras-commander-fast-hdf = { version = "=0.5.0", default-features = false, features = ["hdf", "mesh", "results"] }
+geos = { version = "=11.3.1", features = ["v3_13_0"] }
+ndarray = "0.17"
+rstar = "=0.13.0"
+terrio = { version = "=0.8.0", default-features = false, features = ["geotiff"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+roxmltree = "0.21"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[profile.release]
+overflow-checks = true
