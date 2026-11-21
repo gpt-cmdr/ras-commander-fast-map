@@ -2,14 +2,14 @@
 
 ## 0.22.0 - 2026-11-21
 
-Release summary: an opt-in bounded corner fit for plain sloping maps (#60), the
-standalone native preparation crate `prepare/` (#59), which carries that bound
-(#62), and pull request CI on CLB self-hosted runners only (#58). Requests that 0.21.0 accepts keep their
-output bytes: the default `rasmapper-plain-sloping/1` and every other method ID,
+Release summary: an opt-in bounded corner fit for plain sloping maps (#60),
+the standalone native preparation crate `prepare/` (#59), which carries that
+bound (#62), and pull request CI on CLB self-hosted runners only (#58).
+Requests that 0.21.0 accepts keep their output bytes: the default `rasmapper-plain-sloping/1` and every other method ID,
 request schema, cache key and report method object are unchanged. Checked in
 #60: golden Depth/WSE and report method-object hashes recorded at the
 pre-change commit 85ad9be match, `tolerance` = `f32::MAX` renders the default
-bits, 11 retained native gates (HEC-RAS 6.6 RAS Mapper exports of two public
+bits, 11 retained native gates (HEC-RAS 7.0.1 stored maps of two public
 example models) are 0 mask and 0 bit differences before and after, and 18
 before/after identity cases (slopingPretty options, a bridge plan) are
 byte-identical. The bounded method is new and not native-parity qualified.
@@ -25,8 +25,10 @@ byte-identical. The bounded method is new and not native-parity qualified.
   `pypi`, `crates`) still run on GitHub-hosted runners.
 - **Native preparation crate `prepare/` (#59).** `fast-map-prepare` writes the
   `ras-commander-depth-groups-request/1` and every binary input it references
-  from a plan HDF, the mapping terrain, AOI polygons and saved-time groups,
-  byte-identical to ras-commander 0.124.0's Python preparation (commands
+  from a plan HDF, the mapping terrain, AOI polygons and saved-time groups, as
+  ras-commander 0.124.0's Python preparation writes them: the binary inputs
+  byte-identical, the request equal apart from absolute paths and the
+  path-length-dependent `window_cache_bytes` (`prepare/README.md`, Parity) (commands
   `prepare`, `worker`, `cells` and `version`; `worker` is a drop-in for
   fim-commander's grouped-mapper worker). Cell polygons with invalid geometry
   are repaired with GEOS 3.13.1, the release shapely 2.1.2 carries, through the
@@ -40,13 +42,17 @@ byte-identical. The bounded method is new and not native-parity qualified.
 - **`prepare/` carries the bounded corner fit (#62).** The `worker` and
   `prepare` commands take `controls.corner_fit_bound`, write it to the sloping
   model as `options.corner_fit_bound` where fim-commander's Python worker
-  writes it, require an engine that advertises
-  `rasmapper-plain-sloping-bounded-corners/1`, and check the bounded record on
-  the engine report and every frame as fim-commander's
-  `check_corner_bound_report` does. Before this, the worker dropped the control
-  and mapped native corner fits under a bounded request. The worker now refuses
-  any control key it does not implement.
-- **Opt-in bounded corner fits: `rasmapper-plain-sloping-bounded-corners/1`.**
+  writes it, and require an engine that advertises
+  `rasmapper-plain-sloping-bounded-corners/1`. `worker`, which runs the engine,
+  also checks the bounded record on the report and on every frame as
+  fim-commander's `check_corner_bound_report` does, and refuses a report that
+  carries a bound under a native request. Before this, the worker dropped the
+  control and mapped native corner fits under a bounded request. The worker
+  now refuses any control key it does not implement, and a nonzero tolerance
+  below 1e-4 or from 1e16 up (Python would write it with an exponent, so the
+  request bytes would differ).
+- **Opt-in bounded corner fits: `rasmapper-plain-sloping-bounded-corners/1`
+  (#60).**
   New sloping option `options.corner_fit_bound = {"mode": "input_range",
   "tolerance": t}` (t required, finite, >= 0). A corner plane fit with three or
   more inputs outside [min - t, max + t] of its inputs, or not finite, is
