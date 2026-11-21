@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+- **Opt-in bounded corner fits: `rasmapper-plain-sloping-bounded-corners/1`.**
+  New sloping option `options.corner_fit_bound = {"mode": "input_range",
+  "tolerance": t}` (t required, finite, >= 0). A corner plane fit with three or
+  more inputs outside [min - t, max + t] of its inputs, or not finite, is
+  clamped to that interval (a non-finite fit becomes the mean of its inputs);
+  every other corner keeps its native value. Native HEC-RAS 6.6 RAS Mapper
+  paints these overshoots itself, so the default `rasmapper-plain-sloping/1` is
+  unchanged: without the option, requests, cache keys, report method objects
+  and Depth/WSE bits are those of 0.21.0 (golden hashes recorded at 85ad9be in
+  `tests/bounded_corners.rs`). Native bookkeeping only: a prepared profile is
+  16 bytes larger on 64-bit, so retained hydraulic entries are charged 32 more
+  bytes per mesh.
+  - Discovery key `sloping_bounded_corners` (`native_parity_qualified: false`);
+    in `ras2fim-batch method` only, `sloping.bounded_corners` points to it and
+    `depth_groups.sloping_methods` lists both methods (the method objects that
+    reports embed are unchanged).
+  - Refused under the bounded method: slopingPretty (reserved id
+    `rasmapper-sloping-with-faces-bounded-corners/1`), velocity, derived
+    products, `reduce_max`, shear stress, boundary requests and the stored tile
+    grid.
+  - Per-profile report `corner_fit_bound` (bounded group counts up, down and
+    non-finite, largest removed overshoot, first-wet and L >= 3 diagnostics) and
+    the same-profile out-of-range test `same_profile_out_of_range`
+    (0.72 margin) for the rendered window; depth groups carry them per frame and
+    summarise them in the report. Tolerances are echoed as their shortest
+    decimal; -0 is read as +0; `"corner_fit_bound": null` is native.
+  - New public items: `sloping::{CornerFitBound, CornerFitBoundMode,
+    CornerBoundReport, BoundedCorners, InputExcess, input_excess,
+    INPUT_EXCESS_MARGIN, BOUNDED_METHOD_ID, BOUNDED_WITH_FACES_METHOD_ID,
+    BOUNDED_BASIS}`, `Mesh::reconstruct_with_bound`,
+    `PreparedProfile::corner_bound_report` and
+    `sloping_session::bounded_method_record`. `sloping::Options` gains the
+    public field `corner_fit_bound`: Rust struct-literal callers must supply it
+    (`..Options::default()`); JSON requests need no change.
+
 ## 0.21.0 - 2026-11-13
 
 Release summary: staged-session follow-ups (#50), duration with storage-area
