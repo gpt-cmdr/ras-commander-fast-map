@@ -69,6 +69,18 @@ engine's `sloping-server`, validates the report and the GeoTIFF headers, deliver
 `<output>/<job_id>/<group_id>.tif` and writes `<control>/result.json`. The supervisor (memory
 sampling, timeout, receipt) is unchanged.
 
+Bounded corner fits: with `controls.corner_fit_bound = {"mode": "input_range", "tolerance": t}`
+(fim-commander `map_depth_groups(corner_fit_bound=...)`; the `prepare` request takes the same
+optional control), the request carries `model.options.corner_fit_bound`, inserted where Python's
+`_cohort` inserts it, and the engine must advertise
+`rasmapper-plain-sloping-bounded-corners/1`. The engine's report is then checked as
+fim-commander's `check_corner_bound_report` checks it: the bounded record on the report and on
+every frame. Without the control (absent or `null`) the request bytes are unchanged and a report
+that carries a bound is refused. The bound is validated as `validated_bound` validates it, with
+one refusal of its own: a nonzero tolerance below 1e-4, which Python writes with an exponent
+(`1e-05`) and this crate would write in decimal. A control key the worker does not know is
+refused (`FimUnsupportedError`), so a control added to the Python worker cannot be dropped here.
+
 `cells` prints the ownership rows and invalid-cell record (`load_cells` + `require_cells`),
 for parity checks. `version` prints the name, version and build commit.
 

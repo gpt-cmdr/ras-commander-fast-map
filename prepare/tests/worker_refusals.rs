@@ -123,3 +123,70 @@ fn a_missing_plan_hdf_is_a_file_error_not_a_panic() {
     let error = result["error"].as_str().unwrap();
     assert!(!error.contains("panic"), "{error}");
 }
+
+#[test]
+fn an_unknown_control_is_refused_not_dropped() {
+    // A control the native worker does not implement must never be ignored:
+    // that is how `corner_fit_bound` was once dropped (native corner fits under
+    // a bounded request).
+    let mut c = controls();
+    c["future_control"] = json!(true);
+    let result = run(
+        json!({"tag": "unknown", "engine": engine_record(), "controls": c,
+        "jobs": [job(json!([0]))]}),
+    );
+    assert_eq!(result["status"], "aborted");
+    assert_eq!(
+        result["error"],
+        "FimUnsupportedError: the native worker does not implement control \"future_control\""
+    );
+}
+
+#[test]
+fn a_bounded_request_needs_an_engine_with_the_bounded_method() {
+    let mut c = controls();
+    c["corner_fit_bound"] = json!({"mode": "input_range", "tolerance": 0.0});
+    let result = run(
+        json!({"tag": "bounded-engine", "engine": engine_record(), "controls": c,
+        "jobs": [job(json!([0]))]}),
+    );
+    assert_eq!(result["status"], "aborted");
+    assert_eq!(
+        result["error"],
+        "FimUnsupportedError: Engine lacks the opt-in sloping method \
+         rasmapper-plain-sloping-bounded-corners/1"
+    );
+}
+
+#[test]
+fn a_malformed_bound_is_refused_as_python_refuses_it() {
+    let mut c = controls();
+    c["corner_fit_bound"] = json!({"mode": "input_range", "tolerance": -1.0});
+    let result = run(
+        json!({"tag": "bounded-malformed", "engine": engine_record(), "controls": c,
+        "jobs": [job(json!([0]))]}),
+    );
+    assert_eq!(result["status"], "aborted");
+    assert_eq!(
+        result["error"],
+        "ValueError: corner_fit_bound tolerance must be finite and nonnegative (WSE units)"
+    );
+}
+
+#[test]
+fn a_null_bound_is_native() {
+    // `"corner_fit_bound": null` is the native method: the refusal reached is the
+    // missing plan HDF, after every control and engine gate.
+    let mut c = controls();
+    c["corner_fit_bound"] = Value::Null;
+    let result = run(
+        json!({"tag": "bounded-null", "engine": engine_record(), "controls": c,
+        "jobs": [job(json!([0]))]}),
+    );
+    assert_eq!(result["status"], "aborted");
+    let error = result["error"].as_str().unwrap();
+    assert!(
+        !error.contains("corner_fit_bound") && !error.contains("bounded"),
+        "{error}"
+    );
+}

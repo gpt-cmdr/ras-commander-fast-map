@@ -609,6 +609,7 @@ pub fn prepare(req: &PrepareInput, control: &Path, ordinal: usize) -> Result<Pre
         "max_inflight_profiles": controls.max_inflight_profiles,
         "max_working_bytes": max_working,
     });
+    crate::bound::insert_model_option(&mut model, controls.corner_fit_bound.as_ref());
     let cache = plan_window_cache(
         &terrain_path,
         &crs_identity,

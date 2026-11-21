@@ -26,6 +26,10 @@ pub struct Controls {
     pub max_accumulator_mib: u64,
     pub max_scratch_bytes: u64,
     pub stage_cell_subsets: bool,
+    /// Fast-Map's opt-in bounded corner fits (`bound::validated`); absent or
+    /// null maps native corner fits and leaves the request bytes unchanged.
+    #[serde(default)]
+    pub corner_fit_bound: Option<Value>,
     /// The caller's `depth_cutoff_ft` JSON number as given (an int stays an int
     /// in the request, as Python writes it).
     #[serde(skip)]
@@ -215,7 +219,9 @@ pub fn engine_method(engine: &Path) -> Result<Value> {
 impl PrepareIn {
     /// Validate against the engine's advertised depth-group capabilities, as
     /// `map_depth_groups` and `prepare_sloping_model` do.
-    pub fn validate(self) -> Result<(crate::cohort::PrepareInput, Value)> {
+    pub fn validate(mut self) -> Result<(crate::cohort::PrepareInput, Value)> {
+        self.controls.corner_fit_bound =
+            crate::bound::validated(self.controls.corner_fit_bound.as_ref())?;
         if self.schema != SCHEMA {
             return Err(Error::invalid(format!("schema must be {SCHEMA}")));
         }
@@ -281,6 +287,9 @@ impl PrepareIn {
             return Err(Error::engine(
                 "Configurable windows require multi_window_cache capability",
             ));
+        }
+        if c.corner_fit_bound.is_some() {
+            crate::bound::require_bounded_engine(&method)?;
         }
         if c.stage_cell_subsets && groups["staged_cells"] != crate::cohort::STAGED_CELLS_METHOD {
             return Err(Error::unsupported(
