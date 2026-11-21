@@ -26,6 +26,7 @@ fn discovery_preserves_existing_registry_keys_and_method_ids() {
         "engine",
         "coupled_diagnostic",
         "coupled_storage_diagnostic",
+        "coupled_storage_two_d_precedence_diagnostic",
         "one_d_diagnostic",
         "one_d_native_diagnostic",
         "one_d_clipped_diagnostic",
@@ -59,6 +60,10 @@ fn discovery_preserves_existing_registry_keys_and_method_ids() {
         (
             "coupled_storage_diagnostic",
             "one-d-two-d-storage-coverage-first-diagnostic/1",
+        ),
+        (
+            "coupled_storage_two_d_precedence_diagnostic",
+            "one-d-two-d-storage-two-d-precedence-diagnostic/1",
         ),
         ("one_d_diagnostic", "one-d-xs-surface-diagnostic/3"),
         ("one_d_native_diagnostic", "one-d-xs-surface-diagnostic/4"),
@@ -123,6 +128,13 @@ fn capabilities_preserve_dispatch_schemas_flags_and_qualification_limits() {
         ),
         (
             "coupled_storage_diagnostic",
+            "fast-map-coupled-diagnostic/2",
+            "coupled-diagnostic",
+            "diagnostic",
+            "unqualified",
+        ),
+        (
+            "coupled_storage_two_d_precedence_diagnostic",
             "fast-map-coupled-diagnostic/2",
             "coupled-diagnostic",
             "diagnostic",

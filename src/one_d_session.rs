@@ -985,6 +985,7 @@ impl Inline {
             },
             storage_owned_pixels: 0,
             dry_storage_suppressed_wet_xs: 0,
+            storage_ceded_to_two_d_pixels: None,
         };
         for part in parts {
             let part = part?;

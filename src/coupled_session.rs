@@ -1,7 +1,10 @@
 //! Bounded file transport for the experimental coverage-first compositor.
 use crate::{
     MapError,
-    coupled::{Products, Storage, compose_into, compose_with_storage_into},
+    coupled::{
+        Products, Storage, compose_into, compose_with_storage_into,
+        compose_with_storage_two_d_precedence_into,
+    },
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -70,6 +73,10 @@ pub struct StorageComponent {
     pub component: Component,
     pub owners_file: PathBuf,
     pub area_count: usize,
+    /// Opt-in RAS Mapper ownership order: storage pixels also owned by a 2D
+    /// cell belong to the 2D cell. False (default) refuses the overlap.
+    #[serde(default)]
+    pub two_d_precedence: bool,
 }
 
 pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError> {
@@ -206,6 +213,7 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
                 read(&s.component.depth_file)?,
                 read(&s.component.wse_file)?,
                 s.area_count,
+                s.two_d_precedence,
             ))
         })
         .transpose()?;
@@ -239,8 +247,13 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
         depth: &md,
         wse: &mw,
     };
-    let counts = if let Some((labels, sd, sw, count)) = &storage {
-        serde_json::to_value(compose_with_storage_into(
+    let counts = if let Some((labels, sd, sw, count, precedence)) = &storage {
+        let compose = if *precedence {
+            compose_with_storage_two_d_precedence_into
+        } else {
+            compose_with_storage_into
+        };
+        serde_json::to_value(compose(
             &owners,
             req.two_d_cell_count,
             xs_products,
@@ -266,6 +279,8 @@ pub fn run(req: &Request, base: &Path, output: &Path) -> Result<Value, MapError>
     .map_err(|e| MapError::Internal(e.to_string()))?;
     let method = if layout.is_some() {
         stored_grid_method_record()
+    } else if storage.as_ref().is_some_and(|s| s.4) {
+        crate::coupled::storage_two_d_precedence_method_record()
     } else if storage.is_some() {
         crate::coupled::storage_method_record()
     } else {

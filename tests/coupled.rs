@@ -598,3 +598,111 @@ fn storage_composition_final_format_writes_composed_bits() {
     assert!(!root.join("bad").exists());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn storage_two_d_overlap_is_refused_by_default_and_ceded_to_2d_on_opt_in() {
+    use ras_commander_fast_map::coupled::{
+        Storage, compose_with_storage_into, compose_with_storage_two_d_precedence_into,
+    };
+    let nan = f32::NAN;
+    // Pixel 0: dry 2D cell over a wet storage pool (RAS Mapper: 2D owns, dry).
+    // Pixel 1: wet 2D cell over a storage pool (2D bits stand).
+    // Pixel 2: storage only. Pixel 3: XS only.
+    let xs = Products {
+        depth: &[5., 7., 8., 9.],
+        wse: &[100., 110., 120., 130.],
+    };
+    let mesh = Products {
+        depth: &[nan, 2.5, nan, nan],
+        wse: &[nan, 104.5, nan, nan],
+    };
+    let (s_owners, s_depth, s_wse) = (
+        [1_u32, 1, 1, 0],
+        [4., 3., 1.25, nan],
+        [105., 105., 105., nan],
+    );
+    let storage = || Storage {
+        owners: &s_owners,
+        area_count: 1,
+        products: Products {
+            depth: &s_depth,
+            wse: &s_wse,
+        },
+    };
+    let owners = [1, 2, 0, 0];
+    let (mut depth, mut wse) = ([123.; 4], [456.; 4]);
+    let err = compose_with_storage_into(&owners, 2, xs, mesh, storage(), &mut depth, &mut wse)
+        .unwrap_err();
+    assert!(err.to_string().contains("overlapping 2D coverage"));
+    assert_eq!(depth, [123.; 4], "refusal must not touch outputs");
+    let counts = compose_with_storage_two_d_precedence_into(
+        &owners,
+        2,
+        xs,
+        mesh,
+        storage(),
+        &mut depth,
+        &mut wse,
+    )
+    .unwrap();
+    assert_eq!(
+        depth.map(f32::to_bits),
+        [
+            nan.to_bits(),
+            2.5_f32.to_bits(),
+            1.25_f32.to_bits(),
+            9_f32.to_bits()
+        ]
+    );
+    assert_eq!(
+        wse.map(f32::to_bits),
+        [
+            nan.to_bits(),
+            104.5_f32.to_bits(),
+            105_f32.to_bits(),
+            130_f32.to_bits()
+        ]
+    );
+    assert_eq!(counts.storage_owned_pixels, 1);
+    assert_eq!(counts.storage_ceded_to_two_d_pixels, Some(2));
+    let report = serde_json::to_value(&counts).unwrap();
+    assert_eq!(report["storage_ceded_to_two_d_pixels"], 2);
+    // The default report keeps its /1 key set.
+    let (mut d1, mut w1) = ([0.; 4], [0.; 4]);
+    let plain = compose_with_storage_into(
+        &[1, 0, 0, 0],
+        1,
+        xs,
+        Products {
+            depth: &[3., nan, nan, nan],
+            wse: &[95., nan, nan, nan],
+        },
+        Storage {
+            owners: &[0, 1, 0, 0],
+            area_count: 1,
+            products: Products {
+                depth: &[nan, 1., nan, nan],
+                wse: &[nan, 111., nan, nan],
+            },
+        },
+        &mut d1,
+        &mut w1,
+    )
+    .unwrap();
+    assert!(
+        serde_json::to_value(&plain)
+            .unwrap()
+            .get("storage_ceded_to_two_d_pixels")
+            .is_none()
+    );
+}
+
+#[test]
+fn capabilities_advertise_two_d_precedence_storage_composition() {
+    let record = ras_commander_fast_map::coupled::storage_two_d_precedence_method_record();
+    assert_eq!(
+        record["method_id"],
+        ras_commander_fast_map::coupled::STORAGE_TWO_D_PRECEDENCE_METHOD_ID
+    );
+    assert_eq!(record["native_parity_qualified"], false);
+}
